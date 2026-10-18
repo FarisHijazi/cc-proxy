@@ -133,6 +133,39 @@ settings for that one session:
 claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://localhost:18766"}}'
 ```
 
+### Keeping account features while routing inference
+
+A custom `ANTHROPIC_BASE_URL` disables Remote Control in current Claude Code,
+even with a claude.ai login. Use the optional
+[account router launcher](scripts/claude-account-router) to keep the API origin
+at Anthropic while forwarding only inference to this router:
+
+```sh
+uv tool install mitmproxy==12.2.3
+scripts/claude-account-router -- --model gpt-5.6-sol --remote-control --chrome
+```
+
+Keep the existing `claude-codex serve` process running. The launcher starts a
+separate loopback forward proxy, gives only its Claude process a private CA,
+and snapshots the existing login into isolated storage outside `~/.claude`.
+It does not edit `~/.claude`, install a system CA, or change system networking.
+`/usage`, account requests and Remote Control stay on Anthropic; only exact
+`POST /v1/messages` and `/v1/messages/count_tokens` use the model router.
+
+Account features require a full `/login` credential with `user:profile` scope.
+`claude setup-token` credentials cannot enable them. To read another profile,
+pass `--login-from /path/to/profile`. If your Python environment has
+`claude-swap` installed, `python scripts/claude-account-router --cswap-account 1
+-- --model gpt-5.6-sol --remote-control --chrome` reads that saved account
+without switching the active account.
+
+Refresh tokens are never copied: relaunch after the access token expires to
+read the source's current token. Hooks and plugins from the source profile are
+not copied. The launcher supports interactive `--remote-control`; Claude's
+`remote-control` server subcommand rejects its required CLI settings.
+See [implementation and validation](docs/devlog/claude_20261018-account-inference-router.md)
+for routing details, tested features and remaining limits.
+
 ### Putting the router's models in the `/model` picker
 
 Typing an exact id works without any setup, but the interactive picker only

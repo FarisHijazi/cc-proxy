@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Launch an isolated Claude session with inference-only mitmproxy routing."""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+
+def proxy_command(router, port, state):
+    url = urlsplit(router)
+    if (
+        url.scheme not in {"http", "https"}
+        or url.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or url.username
+        or url.password
+        or url.query
+        or url.fragment
+        or url.path not in {"", "/"}
+    ):
+        raise ValueError("--router must be an http(s) loopback origin without a path")
+    # This is mitmproxy's built-in URL mapper, not a custom HTTP implementation.
+    # Match exact paths, retaining query parameters and rejecting lookalike paths.
+    rule = (
+        "@~m POST@^https://api\\.anthropic\\.com"
+        "(?=/v1/messages(?:/count_tokens)?(?:\\?|$))@" + router.rstrip("/")
+    )
+    return [
+        "mitmdump",
+        "--listen-host",
+        "127.0.0.1",
+        "--listen-port",
+        str(port),
+        "--set",
+        f"confdir={state / 'ca'}",
+        "--allow-hosts",
+        r"^api\.anthropic\.com:443$",
+        "--set",
+        "connection_strategy=lazy",
+        "--set",
+        "upstream_cert=false",
+        "--scripts",
+        str(Path(__file__).resolve().with_name("account_router_stream.py")),
+        "--set",
+        "flow_detail=0",
+        "--set",
+        "termlog_verbosity=error",
+        "--map-remote",
+        rule,
+    ]
+
+
+def bootstrap_login(source, destination, secure_storage, source_secure_storage=None):
+    """Read the current login without sharing its refresh grant with another CLI."""
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = destination / ".claude.json"
+    original = source / ".claude.json"
+    if source == Path.home() / ".claude":
+        original = Path.home() / ".claude.json"
+    if original.exists():
+        data = json.loads(original.read_text())
+        update_account_metadata(metadata, data)
+    raw = None
+    credential_source = source_secure_storage or source
+    if sys.platform == "darwin":
+        suffix = (
+            ""
+            if credential_source == Path.home() / ".claude"
+            else "-" + hashlib.sha256(str(credential_source).encode()).hexdigest()[:8]
+        )
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials" + suffix,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            raw = result.stdout.strip()
+    original = credential_source / ".credentials.json"
+    if raw is None and original.exists():
+        raw = original.read_text()
+    if raw:
+        data = json.loads(raw)
+        oauth = data.get("claudeAiOauth")
+        if oauth and oauth.get("accessToken"):
+            # A rotating refresh grant must never be consumed by two profiles.
+            # Keep the full scopes: setup-token's narrower scope breaks Chrome.
+            write_access_token(secure_storage, oauth)
+
+
+def update_account_metadata(path, source):
+    data = json.loads(path.read_text()) if path.exists() else {}
+    data.pop("oauthAccount", None)
+    data.update(
+        {
+            k: source[k]
+            for k in ("oauthAccount", "hasCompletedOnboarding", "theme")
+            if k in source
+        }
+    )
+    # Atomic replacement also preserves private mode when reusing a profile.
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        json.dump(data, handle)
+    os.replace(handle.name, path)
+
+
+def write_access_token(destination, oauth):
+    access_only = {k: v for k, v in oauth.items() if k != "refreshToken"}
+    write_private(
+        destination / ".credentials.json", json.dumps({"claudeAiOauth": access_only})
+    )
+
+
+def bootstrap_cswap(slot, destination, secure_storage):
+    """Reuse the switcher's credential owner without constructing a switcher."""
+    try:
+        from claude_swap import oauth
+        from claude_swap.credentials import CredentialStore
+        from claude_swap.models import Platform
+        from claude_swap.paths import get_backup_root
+    except ImportError as error:
+        raise RuntimeError(
+            "--cswap-account needs a Python environment with claude-swap installed"
+        ) from error
+    root = get_backup_root()
+    sequence_path = root / "sequence.json"
+    original = sequence_path.read_bytes()
+    sequence = json.loads(original)
+    account = sequence.get("accounts", {}).get(str(slot))
+    if not account:
+        raise ValueError("selected cswap account does not exist")
+    host = SimpleNamespace(
+        platform=Platform.detect(),
+        _logger=logging.getLogger("account-router"),
+        credentials_dir=root / "credentials",
+    )
+    raw = CredentialStore(host)._read_account_credentials(str(slot), account["email"])
+    token = oauth.extract_oauth_data(raw) or {}
+    if not token.get("accessToken") or "user:profile" not in token.get("scopes", []):
+        raise ValueError(
+            "selected cswap account needs a full claude.ai login with user:profile scope"
+        )
+    if oauth.is_oauth_token_expired(token.get("expiresAt")):
+        raise ValueError(
+            "selected cswap access token has expired; sign in using that account before relaunching"
+        )
+    config = root / "configs" / f".claude-config-{slot}-{account['email']}.json"
+    saved = json.loads(config.read_text()) if config.exists() else {}
+    profile = saved.get("oauthAccount") or {
+        "emailAddress": account["email"],
+        "accountUuid": account["uuid"],
+        "organizationUuid": account.get("organizationUuid"),
+    }
+    if profile.get("emailAddress") != account["email"]:
+        raise ValueError(
+            "cswap saved account metadata does not match selected credentials"
+        )
+    if sequence_path.read_bytes() != original:
+        raise RuntimeError(
+            "cswap accounts changed while taking the login snapshot; retry"
+        )
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    update_account_metadata(
+        destination / ".claude.json",
+        {"oauthAccount": profile, "hasCompletedOnboarding": True},
+    )
+    write_access_token(secure_storage, token)
+
+
+def write_private(path, content):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
+
+
+def client_environment(state, port, secure_storage):
+    env = os.environ.copy()
+    settings_env = {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+        "HTTP_PROXY": f"http://127.0.0.1:{port}",
+        "NO_PROXY": "127.0.0.1,localhost,::1",
+        "NODE_EXTRA_CA_CERTS": str(state / "client-ca.pem"),
+    }
+    for name in (
+        "https_proxy",
+        "http_proxy",
+        "CLAUDE_CODE_HTTPS_PROXY",
+        "CLAUDE_CODE_HTTP_PROXY",
+    ):
+        settings_env[name] = settings_env["HTTPS_PROXY"]
+    settings_env["no_proxy"] = settings_env["NO_PROXY"]
+    # An API credential selects API-key auth even when a subscription is saved.
+    # Empty strings in CLI settings also override project settings for this run.
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_UNIX_SOCKET",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "DISABLE_GROWTHBOOK",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    ):
+        env.pop(key, None)
+        settings_env[key] = ""
+    for key in (
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_HOST_CREDS_FILE",
+        "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    ):
+        env.pop(key, None)
+    env.update(settings_env)
+    env["CLAUDE_CONFIG_DIR"] = str(state / "claude")
+    # Keep secure storage isolated too, including when the parent pinned it.
+    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(secure_storage)
+    return env, json.dumps(
+        {"env": settings_env, "apiKeyHelper": "", "disableAllHooks": True}
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--router", default="http://127.0.0.1:18765")
+    parser.add_argument(
+        "--port", type=int, default=0, help="forward proxy port (default: random)"
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=Path.home() / ".local/state/claude-codex/account-router",
+    )
+    login_source = parser.add_mutually_exclusive_group()
+    login_source.add_argument("--login-from", type=Path)
+    login_source.add_argument(
+        "--cswap-account",
+        type=int,
+        help="read a saved full-scope account using claude-swap (optional dependency)",
+    )
+    parser.add_argument(
+        "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
+    )
+    args = parser.parse_args()
+    state = args.state_dir.expanduser().resolve()
+    protected = (Path.home() / ".claude").resolve()
+    managed_paths = [state, state / "claude", state / "ca", state / "client-ca.pem"]
+    if any(
+        path.resolve() == protected or protected in path.resolve().parents
+        for path in managed_paths
+    ):
+        parser.error("--state-dir must be outside ~/.claude")
+    forwarded = (
+        args.claude_args[1:] if args.claude_args[:1] == ["--"] else args.claude_args
+    )
+    if any(a == "--settings" or a.startswith("--settings=") for a in forwarded):
+        parser.error(
+            "--settings is managed by this launcher; use an isolated settings.json instead"
+        )
+    if forwarded[:1] == ["remote-control"]:
+        parser.error(
+            "use -- --remote-control for an interactive session; server mode cannot carry CLI settings"
+        )
+    os.umask(0o077)
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # A shared CA is fine; each invocation has a separate listener and log.
+    with socket.socket() as candidate:
+        candidate.bind(("127.0.0.1", args.port))
+        port = candidate.getsockname()[1]
+    command = proxy_command(args.router, port, state)
+    login = tempfile.TemporaryDirectory(prefix="login-", dir=state)
+    if args.cswap_account is not None:
+        bootstrap_cswap(args.cswap_account, state / "claude", Path(login.name))
+    else:
+        source = args.login_from or Path(
+            os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+        )
+        secure_source = None
+        if args.login_from is None and "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
+            secure_source = Path(
+                os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+                or str(Path.home() / ".claude")
+            )
+        bootstrap_login(
+            source.expanduser().absolute(),
+            state / "claude",
+            Path(login.name),
+            secure_source,
+        )
+    with (state / f"proxy-{port}.log").open("w") as log:
+        proxy = subprocess.Popen(command, stdout=log, stderr=log)
+        client = None
+        try:
+
+            def stop(_signum, _frame):
+                if client and client.poll() is None:
+                    client.terminate()
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, stop)
+            deadline = time.monotonic() + 15
+            ca = state / "ca/mitmproxy-ca-cert.pem"
+            while True:
+                if proxy.poll() is not None:
+                    raise RuntimeError(f"mitmdump exited; inspect {log.name}")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        if ca.exists():
+                            break
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"mitmdump startup timed out; inspect {log.name}"
+                    )
+                time.sleep(0.05)
+            bundle = ca.read_bytes()
+            ambient = os.environ.get("NODE_EXTRA_CA_CERTS")
+            if ambient:
+                bundle += b"\n" + Path(ambient).read_bytes()
+            (state / "client-ca.pem").write_bytes(bundle)
+            env, settings = client_environment(state, port, Path(login.name))
+            print(
+                f"Inference → {args.router}; account → Anthropic; isolated config: {state / 'claude'}",
+                file=sys.stderr,
+            )
+            client = subprocess.Popen(
+                ["claude", "--settings", settings, *forwarded], env=env
+            )
+            return client.wait()
+        finally:
+            for process in (client, proxy):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            login.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)

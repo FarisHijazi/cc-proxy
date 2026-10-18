@@ -120,3 +120,9 @@ Unit tests did not catch any of the traps above; all four came out of running
 the binary against the real CLI. Exercise both new backends end to end before
 calling a change to them done. The gemini path can be driven deterministically
 by pointing `CCP_GEMINI_BASE_URL` at any OpenAI-compatible mock.
+
+For keeping a claude.ai login and Remote Control while inference uses this
+router, use `scripts/claude-account-router`. Its isolated storage, access-only
+credential snapshots, upstream mitmproxy addon and validation are documented in
+`docs/devlog/claude_20261018-account-inference-router.md` (deliberately a plain
+path, not an `@` include). `src/server.rs` remains the routing owner.
