@@ -131,3 +131,9 @@ Account endpoints now fall through to the existing Anthropic provider's opaque
 relay; inference routes remain model-selected. The endpoint and transport contract,
 ToolSearch and message-thread compatibility fixes, and session-owned launcher mode are recorded in
 `docs/devlog/claude_20261018-account-endpoint-relay.md` (plain path, read on demand).
+
+The launcher also accepts account aliases and a selectable main login. Main owns
+Remote Control and the native Chrome UI; separate MCP adapters aggregate browsers
+and read artifacts across accounts. Credential snapshots remain access-only.
+Read `docs/devlog/claude_20261018-multi-account-tools.md` for boundaries, upstream
+reuse and live validation (deliberately a plain path, not an include).

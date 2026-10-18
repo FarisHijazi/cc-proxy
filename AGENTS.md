@@ -26,3 +26,11 @@
 - Stateless providers must refuse `thread:continue` with the recognized
   `thread_unsupported_request` envelope so Claude resends full history. Keep
   Anthropic threads and token counting untouched; do not accept contextless deltas.
+- Multi-account tools extend this launcher: main owns Remote Control and native
+  `/chrome`; `account-chrome` multiplexes persistent native MCP children and
+  `account-artifacts` reuses the published artifact CLI for read-only access.
+  Never route a failed account's action to another account. Preserve vendor
+  notifications, native permissions, and full platform trust in the session CA
+  bundle. Read `docs/devlog/claude_20261018-multi-account-tools.md` on demand
+  (plain path, not an include). Run all three `tests/account_*_test.py` suites
+  with pinned FastMCP/artifact CLI dependencies documented there.

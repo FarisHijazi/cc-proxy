@@ -206,6 +206,41 @@ message-thread delta to a stateless model backend, the router negotiates a
 full-history resend; Anthropic-bound threads continue unchanged. See the
 [account relay record](docs/devlog/claude_20261018-account-endpoint-relay.md).
 
+### Multiple accounts, one main login
+
+Aggregate native Chrome browsers and read artifacts from several full Claude
+logins while choosing one account for Remote Control and default account features:
+
+```sh
+python scripts/claude-account-router --start-router \
+  --account personal=1 --account work=2 --main-account work -- \
+  --model gpt-5.6-sol --remote-control
+```
+
+This requires `uv`, plus the launcher dependencies above. Account sources may
+also be absolute login directories. To save the selection outside `~/.claude`,
+pass `--accounts-file /path/to/accounts.json` containing:
+
+```json
+{"main":"work","accounts":{"personal":1,"work":2}}
+```
+
+`--main-account personal` overrides that default for a new session. Each main
+account gets separate session state. Remote Control belongs to that account;
+selecting another browser does not change it. The `account-chrome` MCP browser
+list labels each account, and subsequent actions use the selected browser's
+native connection. Ask Claude to use `account-chrome` to list or select a browser
+across accounts. Native `/chrome` remains available for the main account;
+Claude reserves that server name and does not permit replacing its browser picker.
+Native file uploads also require that account to be main; the aggregate server
+rejects uploads because it cannot run Claude's private file-permission preprocessing.
+The `account-artifacts` MCP tools list across accounts and read metadata or files
+with their owning account. They do not publish or share artifacts between accounts.
+
+Expired secondary logins are reported explicitly. Renew the source login and
+relaunch; the launcher never refreshes or switches source credentials.
+[Implementation and tests](docs/devlog/claude_20261018-multi-account-tools.md).
+
 ### Putting the router's models in the `/model` picker
 
 Typing an exact id works without any setup, but the interactive picker only

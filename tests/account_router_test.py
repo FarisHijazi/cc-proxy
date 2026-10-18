@@ -113,6 +113,9 @@ def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/do-not-write")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "123")
     monkeypatch.setenv("CLAUDE_CODE_HOST_CREDS_FILE", "/do-not-read")
+    monkeypatch.setenv("CLAUDE_CODE_ACCOUNT_UUID", "wrong-account")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ACCESS_TOKEN", "wrong-session")
+    monkeypatch.setenv("SESSION_INGRESS_URL", "https://wrong.test")
     env, serialized = launcher["client_environment"](
         tmp_path, 19999, tmp_path / "secure"
     )
@@ -120,11 +123,16 @@ def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
     assert env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     assert env["ANTHROPIC_AUTH_TOKEN"] == ""
     assert env["HTTPS_PROXY"] == "http://127.0.0.1:19999"
+    assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"]
+    assert env["REQUESTS_CA_BUNDLE"] == env["SSL_CERT_FILE"]
     assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(tmp_path / "secure")
     assert settings["env"]["ANTHROPIC_BASE_URL"] == env["ANTHROPIC_BASE_URL"]
     assert settings["disableAllHooks"] is True
     assert "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" not in env
     assert "CLAUDE_CODE_HOST_CREDS_FILE" not in env
+    assert "CLAUDE_CODE_ACCOUNT_UUID" not in env
+    assert "CLAUDE_CODE_SESSION_ACCESS_TOKEN" not in env
+    assert "SESSION_INGRESS_URL" not in env
 
 
 def test_metadata_refreshes_when_source_account_changes(tmp_path):
@@ -442,3 +450,114 @@ print('ACCOUNT_RELAY_OK')
     finally:
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_main_account_selection_and_saved_defaults(tmp_path):
+    saved = tmp_path / "accounts.json"
+    saved.write_text(
+        json.dumps({"main": "work", "accounts": {"personal": 1, "work": 2}})
+    )
+    accounts, main = launcher["account_selection"]([], saved)
+    assert accounts == {"personal": 1, "work": 2}
+    assert main == "work"
+    accounts, main = launcher["account_selection"](["work=3"], saved, "personal")
+    assert accounts["work"] == 3 and main == "personal"
+    for entries, main in (
+        (["../escape=1"], None),
+        (["work=1"], "absent"),
+        (["work=relative"], None),
+        (["work"], None),
+        (["work=1", "Work=2"], None),
+    ):
+        with pytest.raises(ValueError):
+            launcher["account_selection"](entries, main=main)
+    for content in ("{}", "[]", '{"accounts":{}}', '{"accounts":[]}'):
+        saved.write_text(content)
+        with pytest.raises(ValueError, match="nonempty accounts"):
+            launcher["account_selection"]([], saved)
+
+
+def test_account_login_source_preserves_keychain_path_spelling(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    alias = tmp_path / "profile-link"
+    alias.symlink_to(source, target_is_directory=True)
+    accounts, main = launcher["account_selection"]([f"work={alias}"])
+    assert main == "work" and accounts["work"] == alias
+    assert accounts["work"] != source
+
+
+def test_multi_account_snapshots_keep_ownership_and_report_expired(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launcher["sys"], "platform", "linux")
+    sources = {}
+    originals = {}
+    for alias in ("work", "personal", "expired"):
+        source = tmp_path / alias
+        source.mkdir()
+        (source / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"accountUuid": alias}})
+        )
+        credential = source / ".credentials.json"
+        credential.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": alias,
+                        "refreshToken": "never-copy",
+                        "scopes": ["user:profile"],
+                        "expiresAt": 1
+                        if alias == "expired"
+                        else time.time() * 1000 + 60000,
+                    }
+                }
+            )
+        )
+        sources[alias] = source
+        originals[alias] = credential.read_bytes()
+    state = tmp_path / "state"
+    state.mkdir()
+    login = tmp_path / "login"
+    login.mkdir()
+    manifest = launcher["snapshot_accounts"](sources, "personal", state, login)
+    assert manifest["main"] == "personal"
+    assert manifest["accounts"]["personal"]["config_dir"] == str(state / "claude")
+    assert "error" in manifest["accounts"]["expired"]
+    for alias in ("work", "personal"):
+        row = manifest["accounts"][alias]
+        credentials = json.loads(
+            (Path(row["secure_storage_dir"]) / ".credentials.json").read_text()
+        )
+        assert credentials["claudeAiOauth"]["accessToken"] == alias
+        assert "refreshToken" not in credentials["claudeAiOauth"]
+        assert (
+            json.loads((Path(row["config_dir"]) / ".claude.json").read_text())[
+                "oauthAccount"
+            ]["accountUuid"]
+            == alias
+        )
+    assert all(
+        (sources[alias] / ".credentials.json").read_bytes() == original
+        for alias, original in originals.items()
+    )
+
+
+def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
+    manifest = {
+        "main": "work",
+        "accounts": {
+            "work": {"config_dir": "/toy/config", "secure_storage_dir": "/toy/secure"}
+        },
+    }
+    args = launcher["aggregate_mcp"](
+        tmp_path,
+        manifest,
+        ["--chrome", "--model", "gpt-toy", "--mcp-config", "existing.json"],
+    )
+    assert args.count("--chrome") == 1 and "--no-chrome" not in args
+    assert "existing.json" in args
+    config = json.loads((tmp_path / "mcp.json").read_text())
+    assert set(config["mcpServers"]) == {"account-chrome", "account-artifacts"}
+    assert json.loads((tmp_path / "accounts.json").read_text()) == manifest
+    assert (tmp_path / "accounts.json").stat().st_mode & 0o777 == 0o600

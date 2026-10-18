@@ -6,8 +6,11 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -195,6 +198,116 @@ def write_private(path, content):
         handle.write(content)
 
 
+def account_selection(entries, accounts_file=None, main=None):
+    """Resolve friendly account aliases; values are cswap slots or login directories."""
+    saved = json.loads(accounts_file.read_text()) if accounts_file else {}
+    if accounts_file and (
+        not isinstance(saved, dict)
+        or not isinstance(saved.get("accounts"), dict)
+        or not saved["accounts"]
+    ):
+        raise ValueError("--accounts-file must contain a nonempty accounts object")
+    accounts = dict(saved.get("accounts", {}))
+    for entry in entries:
+        alias, separator, source = entry.partition("=")
+        if not separator:
+            raise ValueError("--account expects ALIAS=SLOT or ALIAS=/login/directory")
+        accounts[alias] = source
+    normalized = {}
+    for alias, source in accounts.items():
+        if alias.casefold() in {name.casefold() for name in normalized}:
+            raise ValueError("account aliases must differ beyond letter case")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,23}", alias):
+            raise ValueError(
+                "account aliases need 1-24 letters, digits, underscores or hyphens"
+            )
+        if isinstance(source, bool) or not isinstance(source, (int, str)):
+            raise TypeError(
+                "account sources must be a cswap slot or an absolute login directory"
+            )
+        if str(source).isdigit() and int(source) > 0:
+            normalized[alias] = int(source)
+        elif isinstance(source, str) and Path(source).expanduser().is_absolute():
+            # Claude hashes the exported spelling for its Keychain service.
+            # Resolve destinations for safety, but preserve source symlinks.
+            normalized[alias] = Path(source).expanduser().absolute()
+        else:
+            raise ValueError(
+                "account sources must be a positive cswap slot or an absolute login directory"
+            )
+    selected = main or saved.get("main") or next(iter(normalized), None)
+    if selected is not None and selected not in normalized:
+        raise ValueError("--main-account must name a configured account alias")
+    return normalized, selected
+
+
+def snapshot_accounts(accounts, main, state, login):
+    """Snapshot main first; unavailable secondary accounts remain explicit."""
+    manifest = {
+        "main": main,
+        "accounts": {},
+        "claude": shutil.which("claude") or "claude",
+    }
+    for alias in [main, *(name for name in accounts if name != main)]:
+        root = login / alias
+        secure = root / "secure"
+        secure.mkdir(mode=0o700, parents=True)
+        config = state / "claude" if alias == main else root / "config"
+        try:
+            source = accounts[alias]
+            if isinstance(source, int):
+                bootstrap_cswap(source, config, secure)
+            else:
+                bootstrap_login(source, config, secure)
+                credential = json.loads((secure / ".credentials.json").read_text())
+                token = credential.get("claudeAiOauth", {})
+                if "user:profile" not in token.get("scopes", []):
+                    raise ValueError("login needs user:profile scope")
+                if token.get("expiresAt", 0) <= time.time() * 1000:
+                    raise ValueError("access token expired; renew the source login")
+            manifest["accounts"][alias] = {
+                "config_dir": str(config),
+                "secure_storage_dir": str(secure),
+            }
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+            if alias == main:
+                raise
+            message = "source login unavailable, expired, or missing full account scopes; renew it and relaunch"
+            manifest["accounts"][alias] = {"error": message}
+            print(f"Account {alias}: {message}", file=sys.stderr)
+    return manifest
+
+
+def aggregate_mcp(login, manifest, forwarded):
+    """Add shared tools while retaining the main account's native Chrome UI."""
+    manifest_path = login / "accounts.json"
+    write_private(manifest_path, json.dumps(manifest))
+    servers = {}
+    for name, script in (
+        ("account-chrome", "account_chrome.py"),
+        ("account-artifacts", "account_artifacts.py"),
+    ):
+        servers[name] = {
+            "type": "stdio",
+            "command": shutil.which("uv") or "uv",
+            "args": [
+                "run",
+                "--script",
+                str(Path(__file__).resolve().with_name(script)),
+                "--manifest",
+                str(manifest_path),
+            ],
+        }
+    config_path = login / "mcp.json"
+    write_private(config_path, json.dumps({"mcpServers": servers}))
+    # Claude reserves claude-in-chrome for its built-in server. Keep that UI
+    # on main; the additional server exposes cross-account browser tools.
+    args = list(forwarded)
+    if not {"--chrome", "--no-chrome"}.intersection(args):
+        args.append("--chrome")
+    return [*args, "--mcp-config", str(config_path)]
+
+
 def client_environment(state, port, secure_storage):
     env = os.environ.copy()
     settings_env = {
@@ -203,6 +316,8 @@ def client_environment(state, port, secure_storage):
         "HTTP_PROXY": f"http://127.0.0.1:{port}",
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "NODE_EXTRA_CA_CERTS": str(state / "client-ca.pem"),
+        "SSL_CERT_FILE": str(state / "client-ca.pem"),
+        "REQUESTS_CA_BUNDLE": str(state / "client-ca.pem"),
     }
     for name in (
         "https_proxy",
@@ -240,6 +355,12 @@ def client_environment(state, port, secure_storage):
         "CLAUDE_CODE_HOST_CREDS_FILE",
         "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
         "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+        "CLAUDE_CODE_ACCOUNT_UUID",
+        "CLAUDE_CODE_ORGANIZATION_UUID",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "CLAUDE_CODE_REMOTE_SESSION_ID",
+        "SESSION_INGRESS_URL",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     ):
         env.pop(key, None)
     env.update(settings_env)
@@ -249,6 +370,22 @@ def client_environment(state, port, secure_storage):
     return env, json.dumps(
         {"env": settings_env, "apiKeyHelper": "", "disableAllHooks": True}
     )
+
+
+def certificate_bundle(ca):
+    """Retain public/custom trust when Python tools inherit our HTTPS proxy."""
+    context = ssl.create_default_context()
+    for name in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"):
+        source = os.environ.get(name)
+        if source:
+            context.load_verify_locations(
+                **{"capath" if Path(source).is_dir() else "cafile": source}
+            )
+    public_roots = b"".join(
+        ssl.DER_cert_to_PEM_cert(cert).encode()
+        for cert in context.get_ca_certs(binary_form=True)
+    )
+    return public_roots + b"\n" + ca.read_bytes()
 
 
 def wait_listener(process, port, log_path, certificate=None):
@@ -296,10 +433,35 @@ def main():
         help="read a saved full-scope account using claude-swap (optional dependency)",
     )
     parser.add_argument(
+        "--account",
+        action="append",
+        default=[],
+        metavar="ALIAS=SOURCE",
+        help="aggregate a cswap slot or absolute login directory (repeatable)",
+    )
+    parser.add_argument(
+        "--accounts-file",
+        type=Path,
+        help='JSON account map: {"main":"work","accounts":{"work":2,"personal":1}}',
+    )
+    parser.add_argument(
+        "--main-account",
+        help="alias owning Remote Control and default account features",
+    )
+    parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
+    accounts, main_account = account_selection(
+        args.account, args.accounts_file, args.main_account
+    )
+    if accounts and (args.cswap_account is not None or args.login_from is not None):
+        parser.error(
+            "--account/--accounts-file replaces --cswap-account and --login-from"
+        )
     state = args.state_dir.expanduser().resolve()
+    if accounts:
+        state = state / "accounts" / main_account
     protected = (Path.home() / ".claude").resolve()
     managed_paths = [state, state / "claude", state / "ca", state / "client-ca.pem"]
     if any(
@@ -333,7 +495,16 @@ def main():
         args.all_endpoints = True
     command = proxy_command(args.router, port, state, args.all_endpoints)
     login = tempfile.TemporaryDirectory(prefix="login-", dir=state)
-    if args.cswap_account is not None:
+    main_secure = Path(login.name)
+    if accounts:
+        manifest = snapshot_accounts(accounts, main_account, state, Path(login.name))
+        main_secure = Path(manifest["accounts"][main_account]["secure_storage_dir"])
+        forwarded = aggregate_mcp(Path(login.name), manifest, forwarded)
+        print(
+            f"Main account: {main_account} (Remote Control and default account features)",
+            file=sys.stderr,
+        )
+    elif args.cswap_account is not None:
         bootstrap_cswap(args.cswap_account, state / "claude", Path(login.name))
     else:
         source = args.login_from or Path(
@@ -382,12 +553,8 @@ def main():
                 wait_listener(model_router, router_port, log.name)
             ca = state / "ca/mitmproxy-ca-cert.pem"
             wait_listener(proxy, port, log.name, ca)
-            bundle = ca.read_bytes()
-            ambient = os.environ.get("NODE_EXTRA_CA_CERTS")
-            if ambient:
-                bundle += b"\n" + Path(ambient).read_bytes()
-            (state / "client-ca.pem").write_bytes(bundle)
-            env, settings = client_environment(state, port, Path(login.name))
+            (state / "client-ca.pem").write_bytes(certificate_bundle(ca))
+            env, settings = client_environment(state, port, main_secure)
             print(
                 f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; isolated config: {state / 'claude'}",
                 file=sys.stderr,
@@ -413,6 +580,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-    except (OSError, ValueError, RuntimeError) as error:
+    except (OSError, ValueError, TypeError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(1)
