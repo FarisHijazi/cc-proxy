@@ -145,6 +145,11 @@ of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
+Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
+(appears only from a config dir's second launch) and the fact that 2.1.302 keeps
+computer-use approvals terminal-only are in
+`docs/devlog/claude_20261018-personal-full-login-live-checks.md` (plain path).
+
 Self-hosted native Remote Control is an optional launcher route to HQ. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
 Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).
