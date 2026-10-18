@@ -9,8 +9,8 @@
 //! Anthropic credentials and never touches the cache-keyed request prefix.
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::StatusCode;
+use axum::body::{Body, HttpBody};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
@@ -128,11 +128,7 @@ fn detect_hosted_web_search_regression(obj: &serde_json::Map<String, Value>, req
     }
 }
 
-/// Request headers that must not be forwarded to the upstream. Hop-by-hop headers are
-/// connection-scoped; `content-length` is recomputed by the client from the body; and
-/// `accept-encoding` is dropped so the upstream answers with an identity encoding
-/// (this build of reqwest does not decompress, so forwarding a compressed body under a
-/// stale `content-encoding` would corrupt it).
+/// Transport framing and the proxy's own credential never cross the upstream boundary.
 fn is_stripped_request_header(name: &str) -> bool {
     matches!(
         name,
@@ -146,13 +142,14 @@ fn is_stripped_request_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "content-length"
-            | "accept-encoding"
+            | "proxy-connection"
+            | crate::inbound_auth::PROXY_KEY_HEADER
     )
 }
 
 /// Response headers that must not be relayed back to Claude Code. Hop-by-hop and
-/// framing headers are re-derived by axum for the streamed body; `content-encoding`
-/// is dropped for symmetry with the identity request above.
+/// framing headers are re-derived by axum for the streamed body. Encoding and
+/// repeated end-to-end headers survive because bytes are never decompressed.
 fn is_stripped_response_header(name: &str) -> bool {
     matches!(
         name,
@@ -164,9 +161,52 @@ fn is_stripped_response_header(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "content-length"
-            | "content-encoding"
+            | "proxy-connection"
     )
+}
+
+fn relay_headers(source: &HeaderMap, request: bool, websocket: bool) -> HeaderMap {
+    let connection_fields: Vec<_> = source
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    let mut headers = HeaderMap::with_capacity(source.len());
+    for (name, value) in source {
+        if websocket && matches!(name.as_str(), "connection" | "upgrade") {
+            continue; // Set the two negotiated transport headers explicitly below.
+        }
+        if (if request {
+            is_stripped_request_header(name.as_str())
+        } else {
+            is_stripped_response_header(name.as_str())
+        }) || connection_fields.iter().any(|field| field == name.as_str())
+        {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+    if websocket {
+        headers.insert("connection", http::HeaderValue::from_static("upgrade"));
+        headers.insert("upgrade", http::HeaderValue::from_static("websocket"));
+    }
+    // Preserve trailer frames and negotiate TE explicitly for this transport hop.
+    if let Some(trailer) = source.get("trailer") {
+        headers.insert("trailer", trailer.clone());
+    }
+    if request
+        && source
+            .get_all("te")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|value| value.trim().eq_ignore_ascii_case("trailers"))
+    {
+        headers.insert("te", http::HeaderValue::from_static("trailers"));
+    }
+    headers
 }
 
 pub struct AnthropicProvider {
@@ -176,13 +216,22 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
+        Self::with_base_url(crate::config::anthropic_base_url())
+    }
+
+    /// Select the fixed account origin (also used by integration tests).
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .build()
             .expect("failed to build anthropic passthrough client");
         Self {
             client,
-            base_url: crate::config::anthropic_base_url(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
 
@@ -201,15 +250,6 @@ impl AnthropicProvider {
             );
         };
 
-        let url = format!("{}{}", self.base_url, passthrough.path_and_query);
-        let mut headers = axum::http::HeaderMap::with_capacity(passthrough.headers.len());
-        for (name, value) in passthrough.headers.iter() {
-            if is_stripped_request_header(name.as_str()) {
-                continue;
-            }
-            headers.append(name.clone(), value.clone());
-        }
-
         if let Some(monitor) = monitor.as_ref() {
             monitor.upstream_started(&req_id);
         }
@@ -217,40 +257,101 @@ impl AnthropicProvider {
         // Rehydrate signature-less codex `thinking` blocks so a mid-conversation switch
         // to Anthropic does not 400. Unchanged bodies are forwarded verbatim.
         let outgoing = match sanitize_anthropic_request(&passthrough.raw_body, &req_id) {
-            Some(bytes) => reqwest::Body::from(bytes),
-            None => reqwest::Body::from(passthrough.raw_body),
+            Some(bytes) => Body::from(bytes),
+            None => Body::from(passthrough.raw_body),
         };
+        let mut request = Request::new(outgoing);
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = passthrough
+            .path_and_query
+            .parse()
+            .expect("original request URI");
+        *request.headers_mut() = passthrough.headers;
+        self.forward(request).await
+    }
 
-        let upstream = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(outgoing)
+    async fn forward(&self, mut request: Request<Body>) -> Response {
+        if request.method() == Method::CONNECT {
+            return json_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                "CONNECT is not an account endpoint",
+            );
+        }
+        let websocket = request.method() == Method::GET
+            && request
+                .headers()
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+            && request
+                .headers()
+                .get_all("connection")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|v| v.trim().eq_ignore_ascii_case("upgrade"));
+        let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
+        // Never use the incoming Host or an absolute-form target as the destination.
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/");
+        let url = format!("{}{path}", self.base_url);
+        let headers = relay_headers(request.headers(), true, websocket);
+        let (parts, body) = request.into_parts();
+        let mut outgoing = self.client.request(parts.method, url).headers(headers);
+        if let Some(length) = body.size_hint().exact() {
+            outgoing = outgoing.header(http::header::CONTENT_LENGTH, length);
+        }
+        if websocket {
+            outgoing = outgoing.version(http::Version::HTTP_11);
+        }
+        let upstream = match outgoing
+            .body(reqwest::Body::wrap(http_body_util::StreamBody::new(
+                sync_wrapper::SyncStream::new(http_body_util::BodyStream::new(body)),
+            )))
             .send()
-            .await;
-
-        match upstream {
-            Ok(upstream) => {
-                let status = upstream.status();
-                let mut out_headers =
-                    axum::http::HeaderMap::with_capacity(upstream.headers().len());
-                for (name, value) in upstream.headers() {
-                    if is_stripped_response_header(name.as_str()) {
-                        continue;
-                    }
-                    out_headers.append(name.clone(), value.clone());
-                }
-                let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
-                *response.status_mut() = status;
-                *response.headers_mut() = out_headers;
-                response
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Anthropic upstream connection failed",
+                );
             }
-            Err(err) => json_error(
+        };
+        let status = upstream.status();
+        let upgraded = status == StatusCode::SWITCHING_PROTOCOLS;
+        if upgraded && !websocket {
+            return json_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                format!("anthropic upstream request failed: {err}"),
-            ),
+                "Unexpected upstream upgrade",
+            );
         }
+        let headers = relay_headers(upstream.headers(), false, upgraded);
+        let mut response = if upgraded {
+            let downstream_upgrade = downstream_upgrade.expect("requested websocket upgrade");
+            tokio::spawn(async move {
+                if let (Ok(client), Ok(mut server)) =
+                    tokio::join!(downstream_upgrade, upstream.upgrade())
+                {
+                    let mut client = hyper_util::rt::TokioIo::new(client);
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+            Response::new(Body::empty())
+        } else {
+            let upstream: http::Response<reqwest::Body> = upstream.into();
+            Response::new(Body::new(upstream.into_body()))
+        };
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
     }
 }
 
@@ -264,6 +365,14 @@ impl Default for AnthropicProvider {
 impl Provider for AnthropicProvider {
     fn name(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn supports_message_threads(&self) -> bool {
+        true
+    }
+
+    async fn handle_account_request(&self, request: Request<Body>) -> Response {
+        self.forward(request).await
     }
 
     fn supported_models(&self) -> Vec<String> {
@@ -320,7 +429,10 @@ mod tests {
     fn strips_hop_by_hop_and_encoding_from_request() {
         assert!(is_stripped_request_header("host"));
         assert!(is_stripped_request_header("content-length"));
-        assert!(is_stripped_request_header("accept-encoding"));
+        assert!(!is_stripped_request_header("accept-encoding"));
+        assert!(is_stripped_request_header(
+            crate::inbound_auth::PROXY_KEY_HEADER
+        ));
         assert!(is_stripped_request_header("connection"));
         // credentials and cache-relevant headers must survive
         assert!(!is_stripped_request_header("authorization"));
@@ -331,8 +443,8 @@ mod tests {
 
     #[test]
     fn strips_framing_from_response() {
-        assert!(is_stripped_response_header("content-length"));
-        assert!(is_stripped_response_header("content-encoding"));
+        assert!(!is_stripped_response_header("content-length"));
+        assert!(!is_stripped_response_header("content-encoding"));
         assert!(is_stripped_response_header("transfer-encoding"));
         // rate-limit and request-id headers must reach Claude Code
         assert!(!is_stripped_response_header("content-type"));

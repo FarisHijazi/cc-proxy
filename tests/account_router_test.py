@@ -215,7 +215,8 @@ def test_cswap_selector_reads_without_switching_or_refreshing(tmp_path, monkeypa
     )
 
 
-def test_real_forward_proxy_routes_and_streams(tmp_path):
+@pytest.mark.parametrize("all_endpoints", [False, True])
+def test_real_forward_proxy_routes_and_streams(tmp_path, all_endpoints):
     if not shutil.which("mitmdump"):
         pytest.skip("install mitmproxy to exercise the real forward proxy")
     records = []
@@ -264,7 +265,7 @@ def test_real_forward_proxy_routes_and_streams(tmp_path):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     command = launcher["proxy_command"](
-        f"http://127.0.0.1:{router.server_port}", port, tmp_path
+        f"http://127.0.0.1:{router.server_port}", port, tmp_path, all_endpoints
     )
     # After the production rule, replace the remaining real host with the account
     # mock. Inference must already have left that host and cannot hit this rule.
@@ -309,6 +310,8 @@ def test_real_forward_proxy_routes_and_streams(tmp_path):
                 ("POST", "/v1/messages/lookalike", "account"),
                 ("GET", "/v1/messages", "account"),
             ):
+                if all_endpoints:
+                    label = "router"
                 result = subprocess.run(
                     [
                         *curl,
@@ -360,3 +363,82 @@ def test_real_forward_proxy_routes_and_streams(tmp_path):
             for server in (router, account):
                 server.shutdown()
                 server.server_close()
+
+
+def test_session_owned_router_relays_account_requests_and_exits(tmp_path):
+    import os
+    import sys
+
+    binary = Path(__file__).parents[1] / "target/debug/claude-codex"
+    if not shutil.which("mitmdump") or not binary.exists():
+        pytest.skip("build claude-codex and install mitmproxy for launcher integration")
+
+    class AccountHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == "/api/oauth/usage"
+            assert self.headers["Authorization"] == "Bearer toy-access"
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ACCOUNT_RELAY_OK")
+
+        def log_message(self, *_args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), AccountHandler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "toy-access"}})
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text(
+        f"#!{sys.executable}\n"
+        + """import os, subprocess
+result = subprocess.run(['curl', '--silent', '--show-error', '--fail', '--max-time', '10', '--noproxy', '', '--proxy', os.environ['HTTPS_PROXY'], '--cacert', os.environ['NODE_EXTRA_CA_CERTS'], '-H', 'Authorization: Bearer toy-access', 'https://api.anthropic.com/api/oauth/usage'], check=True, capture_output=True)
+assert result.stdout == b'ACCOUNT_RELAY_OK', result.stdout
+print('ACCOUNT_RELAY_OK')
+"""
+    )
+    fake_claude.chmod(0o700)
+    state = tmp_path / "state"
+    env = os.environ.copy()
+    env["PATH"] = (
+        str(fake_bin) + os.pathsep + str(binary.parent) + os.pathsep + env["PATH"]
+    )
+    env["CCP_ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{upstream.server_port}"
+    env.pop("CCP_AUTH_TOKEN", None)
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).parents[1] / "scripts/claude-account-router"),
+                "--start-router",
+                "--login-from",
+                str(source),
+                "--state-dir",
+                str(state),
+                "--",
+                "--version",
+            ],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ACCOUNT_RELAY_OK" in result.stdout
+        assert not list(state.glob("login-*"))
+        match = re.search(
+            r"Proxy listening on http://127\.0\.0\.1:(\d+)",
+            next(state.glob("proxy-*.log")).read_text(),
+        )
+        assert match
+        with socket.socket() as check:
+            assert check.connect_ex(("127.0.0.1", int(match.group(1)))) != 0
+    finally:
+        upstream.shutdown()
+        upstream.server_close()

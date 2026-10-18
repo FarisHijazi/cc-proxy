@@ -35,7 +35,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use http_body_util::{BodyExt, StreamBody};
@@ -290,7 +290,10 @@ pub fn app_with_features(
     } else {
         router
     };
-    let router = router.fallback(fallback_handler).with_state(state);
+    let router = router
+        .fallback(fallback_handler)
+        .method_not_allowed_fallback(fallback_handler)
+        .with_state(state);
     apply_inbound_auth(router, InboundAuth::from_config())
 }
 
@@ -1671,6 +1674,32 @@ async fn dispatch_request(
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
 
+    if !count_tokens
+        && !provider.supports_message_threads()
+        && body
+            .extra
+            .get("thread")
+            .and_then(|thread| thread.get("type"))
+            == Some(&json!("continue"))
+    {
+        // Claude Code recognizes this capability refusal and resends the entire
+        // conversation, then stops threading this model for the session. Accepting
+        // the delta would lose the task and produce orphan function outputs.
+        return (
+            StatusCode::BAD_REQUEST,
+            [("x-should-retry", "false")],
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "thread: this upstream does not keep thread state; resend the conversation",
+                    "details": {"error_code": "thread_unsupported_request"}
+                }
+            })),
+        )
+            .into_response();
+    }
+
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
             "auto-review route selected",
@@ -2147,12 +2176,39 @@ where
     })
 }
 
-async fn fallback_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
-    json_error(
-        StatusCode::NOT_FOUND,
-        "not_found",
-        format!("No route for {method} {}", uri.path()),
-    )
+async fn fallback_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    if req.uri().path() == "/healthz" {
+        return json_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+            "Health checks require GET or HEAD",
+        );
+    }
+    // Disabled local OpenAI surfaces must not accidentally forward user payloads
+    // to Anthropic. Every other unclaimed path belongs to the account relay,
+    // including new vendor endpoints that this version doesn't know about yet.
+    if matches!(
+        req.uri().path(),
+        "/v1/responses"
+            | "/v1/chat/completions"
+            | "/v1/images/generations"
+            | "/v1/images/edits"
+            | "/v1/audio/transcriptions"
+    ) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Local API route unavailable",
+        );
+    }
+    match state.registry.provider("anthropic") {
+        Some(provider) => provider.handle_account_request(req).await,
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Account relay unavailable",
+        ),
+    }
 }
 
 fn current_millis() -> u64 {

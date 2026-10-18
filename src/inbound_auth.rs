@@ -114,11 +114,26 @@ fn constant_time_eq(candidate: &str, expected: &str) -> bool {
 /// unauthenticated path costs nothing.
 pub async fn require_auth(
     axum::extract::State(auth): axum::extract::State<InboundAuth>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
     if auth.authorize(&path, request.headers()) {
+        // The dedicated key and an Authorization value used as the proxy key
+        // authenticate this hop only. A distinct account bearer must survive.
+        request.headers_mut().remove(PROXY_KEY_HEADER);
+        if let Some(expected) = auth.token.as_deref()
+            && request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(strip_bearer)
+                .is_some_and(|value| constant_time_eq(value.trim(), expected))
+        {
+            request
+                .headers_mut()
+                .remove(axum::http::header::AUTHORIZATION);
+        }
         return next.run(request).await;
     }
     json_error(

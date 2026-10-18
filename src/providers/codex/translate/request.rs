@@ -1049,6 +1049,21 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
         Some("image") => render_tool_result_image(block),
+        // Claude Code's ToolSearch returns references to schemas that are already
+        // registered in `tools`. Dropping these tells Codex that discovery failed,
+        // making native Chrome and other deferred MCP tools unusable.
+        Some("tool_reference") => block
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                RenderedToolResultPart::Text(format!(
+                    "Tool available: {name}. Use its registered function schema."
+                ))
+            })
+            .unwrap_or_else(|| {
+                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
+            }),
         Some(other) => {
             RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
         }
@@ -1149,6 +1164,50 @@ mod tests {
             service_tier: None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
+        }
+    }
+
+    #[test]
+    fn tool_search_references_preserve_discovered_tools_and_function_schemas() {
+        let name = "mcp__browser__navigate";
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol", "messages":[
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"search-1", "name":"ToolSearch", "input":{"query":"browser"}}]},
+            {"role":"user", "content":[{
+                "type":"tool_result", "tool_use_id":"search-1", "content":[
+                    {"type":"tool_reference", "tool_name":name}
+                ]
+            }]}], "tools":[{"name":name, "defer_loading":true,
+                "input_schema":{"type":"object", "properties":{"url":{"type":"string"}}, "required":["url"]}}]
+        })).unwrap();
+        for lite in [false, true] {
+            let out = translate_request(
+                &req,
+                TranslateOptions {
+                    use_responses_lite: lite,
+                    ..opts()
+                },
+            )
+            .unwrap();
+            let output = out
+                .input
+                .iter()
+                .find_map(|item| match item {
+                    ResponsesInputItem::FunctionCallOutput { output, .. } => Some(output),
+                    _ => None,
+                })
+                .unwrap();
+            let output = serde_json::to_string(output).unwrap();
+            assert!(output.contains(name));
+            assert!(!output.contains("unsupported content block"));
+            let serialized = serde_json::to_value(out).unwrap();
+            let tools = if lite {
+                &serialized["input"][0]["tools"]
+            } else {
+                &serialized["tools"]
+            };
+            assert_eq!(tools[0]["name"], name);
+            assert_eq!(tools[0]["parameters"]["required"], json!(["url"]));
         }
     }
 

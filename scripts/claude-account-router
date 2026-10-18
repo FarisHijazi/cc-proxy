@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch an isolated Claude session with inference-only mitmproxy routing."""
+"""Launch an isolated Claude session with account-aware mitmproxy routing."""
 
 import argparse
 import hashlib
@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 
-def proxy_command(router, port, state):
+def proxy_command(router, port, state, all_endpoints=False):
     url = urlsplit(router)
     if (
         url.scheme not in {"http", "https"}
@@ -35,6 +35,12 @@ def proxy_command(router, port, state):
         "@~m POST@^https://api\\.anthropic\\.com"
         "(?=/v1/messages(?:/count_tokens)?(?:\\?|$))@" + router.rstrip("/")
     )
+    if all_endpoints:
+        # CONNECT establishes the local TLS tunnel and must never be rewritten.
+        # The router's fixed-origin account relay handles every non-model path.
+        rule = "@!~m CONNECT@^https://api\\.anthropic\\.com(?=/|$)@" + router.rstrip(
+            "/"
+        )
     return [
         "mitmdump",
         "--listen-host",
@@ -245,9 +251,35 @@ def client_environment(state, port, secure_storage):
     )
 
 
+def wait_listener(process, port, log_path, certificate=None):
+    deadline = time.monotonic() + 15
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError(f"process exited; inspect {log_path}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                if certificate is None or certificate.exists():
+                    return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"listener startup timed out; inspect {log_path}")
+        time.sleep(0.05)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router", default="http://127.0.0.1:18765")
+    parser.add_argument(
+        "--start-router",
+        action="store_true",
+        help="start a private claude-codex server for this session and proxy all endpoints",
+    )
+    parser.add_argument(
+        "--all-endpoints",
+        action="store_true",
+        help="send all api.anthropic.com endpoints through a router with account-relay support",
+    )
     parser.add_argument(
         "--port", type=int, default=0, help="forward proxy port (default: random)"
     )
@@ -292,7 +324,14 @@ def main():
     with socket.socket() as candidate:
         candidate.bind(("127.0.0.1", args.port))
         port = candidate.getsockname()[1]
-    command = proxy_command(args.router, port, state)
+    router_port = None
+    if args.start_router:
+        with socket.socket() as candidate:
+            candidate.bind(("127.0.0.1", 0))
+            router_port = candidate.getsockname()[1]
+        args.router = f"http://127.0.0.1:{router_port}"
+        args.all_endpoints = True
+    command = proxy_command(args.router, port, state, args.all_endpoints)
     login = tempfile.TemporaryDirectory(prefix="login-", dir=state)
     if args.cswap_account is not None:
         bootstrap_cswap(args.cswap_account, state / "claude", Path(login.name))
@@ -315,6 +354,7 @@ def main():
     with (state / f"proxy-{port}.log").open("w") as log:
         proxy = subprocess.Popen(command, stdout=log, stderr=log)
         client = None
+        model_router = None
         try:
 
             def stop(_signum, _frame):
@@ -323,22 +363,25 @@ def main():
                 raise KeyboardInterrupt
 
             signal.signal(signal.SIGTERM, stop)
-            deadline = time.monotonic() + 15
+            if args.start_router:
+                router_env = os.environ.copy()
+                router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
+                router_env["CCP_TRAFFIC_LOG"] = "0"
+                model_router = subprocess.Popen(
+                    [
+                        "claude-codex",
+                        "serve",
+                        "--no-monitor",
+                        "--port",
+                        str(router_port),
+                    ],
+                    env=router_env,
+                    stdout=log,
+                    stderr=log,
+                )
+                wait_listener(model_router, router_port, log.name)
             ca = state / "ca/mitmproxy-ca-cert.pem"
-            while True:
-                if proxy.poll() is not None:
-                    raise RuntimeError(f"mitmdump exited; inspect {log.name}")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                        if ca.exists():
-                            break
-                except OSError:
-                    pass
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        f"mitmdump startup timed out; inspect {log.name}"
-                    )
-                time.sleep(0.05)
+            wait_listener(proxy, port, log.name, ca)
             bundle = ca.read_bytes()
             ambient = os.environ.get("NODE_EXTRA_CA_CERTS")
             if ambient:
@@ -346,7 +389,7 @@ def main():
             (state / "client-ca.pem").write_bytes(bundle)
             env, settings = client_environment(state, port, Path(login.name))
             print(
-                f"Inference → {args.router}; account → Anthropic; isolated config: {state / 'claude'}",
+                f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; isolated config: {state / 'claude'}",
                 file=sys.stderr,
             )
             client = subprocess.Popen(
@@ -354,7 +397,7 @@ def main():
             )
             return client.wait()
         finally:
-            for process in (client, proxy):
+            for process in (client, proxy, model_router):
                 if process is not None and process.poll() is None:
                     process.terminate()
                     try:

@@ -259,6 +259,71 @@ fn routed_registry() -> Arc<Registry> {
     ))
 }
 
+#[tokio::test]
+async fn stateless_provider_negotiates_full_history_before_accepting_thread_deltas() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [Arc::new(IdentityCaptureProvider {
+            captured: captured.clone(),
+        }) as Arc<dyn Provider>],
+    )));
+    let request = |path: &str, thread: Value| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.5", "max_tokens":16,
+                    "messages":[{"role":"user", "content":"original task"}],
+                    "thread":thread
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/v1/messages",
+            json!({"type":"continue", "previous_message_id":"msg_toy"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["details"]["error_code"],
+        "thread_unsupported_request"
+    );
+    assert!(captured.lock().unwrap().is_empty());
+    for thread in [Value::Null, json!({"type":"create"})] {
+        let response = app
+            .clone()
+            .oneshot(request("/v1/messages", thread))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(captured.lock().unwrap().len(), 2);
+    let response = app
+        .oneshot(request(
+            "/v1/messages/count_tokens",
+            json!({"type":"continue", "previous_message_id":"msg_toy"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 async fn call_identity_ingress(
     app: &axum::Router,
     path: &str,
@@ -1201,7 +1266,12 @@ async fn chat_completions_validation_returns_openai_parameter_errors() {
 
 #[tokio::test]
 async fn unknown_routes_use_anthropic_not_found_error() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    // A registry without an Anthropic provider has no account relay. Production
+    // registries forward unknown endpoints to that fixed upstream instead.
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        [],
+    )));
     let response = app
         .oneshot(
             Request::builder()

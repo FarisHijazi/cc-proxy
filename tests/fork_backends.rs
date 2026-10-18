@@ -46,12 +46,19 @@ fn model_ids(payload: &Value) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn gemini_models_are_advertised() {
+async fn gemini_models_are_advertised_when_available() {
     let ids = model_ids(&models_payload().await);
+    let visible = claude_codex::config::show_all_models()
+        || registry()
+            .provider("gemini")
+            .unwrap()
+            .availability()
+            .is_ready();
     for expected in ["gemini-3-pro", "gemini-3-flash", "gemini-3-flash-advanced"] {
-        assert!(
+        assert_eq!(
             ids.contains(&expected.to_string()),
-            "missing {expected}: {ids:?}"
+            visible,
+            "{expected}: {ids:?}"
         );
     }
     // The `-thinking` tier is not offered: gemini-webapi 2.1 removed it upstream,
@@ -64,9 +71,15 @@ async fn gemini_models_are_advertised() {
 }
 
 #[tokio::test]
-async fn cursor_cli_models_are_advertised() {
+async fn cursor_cli_models_are_advertised_when_available() {
     let ids = model_ids(&models_payload().await);
-    assert!(ids.contains(&"cursor-cli".to_string()), "{ids:?}");
+    let visible = claude_codex::config::show_all_models()
+        || registry()
+            .provider("cursor-cli")
+            .unwrap()
+            .availability()
+            .is_ready();
+    assert_eq!(ids.contains(&"cursor-cli".to_string()), visible, "{ids:?}");
 }
 
 /// Write-capable ids must not appear in `/model` unless write access is on,

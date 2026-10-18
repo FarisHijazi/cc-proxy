@@ -126,3 +126,8 @@ router, use `scripts/claude-account-router`. Its isolated storage, access-only
 credential snapshots, upstream mitmproxy addon and validation are documented in
 `docs/devlog/claude_20261018-account-inference-router.md` (deliberately a plain
 path, not an `@` include). `src/server.rs` remains the routing owner.
+
+Account endpoints now fall through to the existing Anthropic provider's opaque
+relay; inference routes remain model-selected. The endpoint and transport contract,
+ToolSearch and message-thread compatibility fixes, and session-owned launcher mode are recorded in
+`docs/devlog/claude_20261018-account-endpoint-relay.md` (plain path, read on demand).

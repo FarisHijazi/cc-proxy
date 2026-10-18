@@ -59,6 +59,22 @@ pub trait Provider: Send + Sync {
     fn supported_models(&self) -> Vec<String>;
     fn cli(&self) -> &'static dyn CliHandlers;
 
+    /// Whether the upstream retains Anthropic message-thread history. Stateless
+    /// translators must negotiate full-history requests before accepting deltas.
+    fn supports_message_threads(&self) -> bool {
+        false
+    }
+
+    /// Account/control-plane traffic is separate from model dispatch. Only the
+    /// Anthropic provider implements this; credentials never go to another model backend.
+    async fn handle_account_request(&self, _request: axum::http::Request<Body>) -> Response {
+        crate::anthropic::json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Account relay unavailable",
+        )
+    }
+
     /// Whether this backend can serve a request right now.
     ///
     /// Runs when models are listed, never on the request path, so it must stay

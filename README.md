@@ -119,7 +119,7 @@ Claude Code after changing it so `/model` discovers the router's model list.
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`             | Optionally remap the Opus alias.                                 |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL`           | Optionally remap the Sonnet alias.                               |
 | `ANTHROPIC_MODEL`                          | Optionally force one model for the whole session.                |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Set to `1` to skip Claude Code's non-essential background calls. |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Leave unset for account features; `1` disables feature flags and Remote Control. |
 
 ### Pointing one session somewhere else
 
@@ -165,6 +165,46 @@ not copied. The launcher supports interactive `--remote-control`; Claude's
 `remote-control` server subcommand rejects its required CLI settings.
 See [implementation and validation](docs/devlog/claude_20261018-account-inference-router.md)
 for routing details, tested features and remaining limits.
+
+### Relaying account endpoints through the router
+
+The router now sends every unclaimed endpoint to `api.anthropic.com`, using the
+caller's account credentials. This includes usage, OAuth/account APIs, session
+events, files and artifact APIs, plus future account routes. Requests retain
+their method, path, query and body; the relay supports streaming uploads,
+downloads, SSE, HTTP trailers, and WebSocket upgrades. Redirects, errors,
+compression and repeated response headers pass through unchanged. Proxy-only
+credentials and hop-by-hop headers are removed. The upstream origin is fixed;
+an incoming Host header cannot select another destination.
+
+Model inference/counting and model discovery retain their existing routes.
+Disabled local OpenAI-compatible endpoints remain disabled. Optional inbound
+proxy authentication also protects account endpoints.
+
+To send all Anthropic API traffic through a fresh router without restarting a
+server already in use, run the launcher with `--start-router`:
+
+```sh
+python scripts/claude-account-router --start-router --cswap-account 1 -- \
+  --model gpt-5.6-sol --remote-control --chrome
+```
+
+This requires `claude-codex` and `mitmdump` on PATH, and a Python environment
+with `claude-swap` for the optional account selector. It starts a session-owned
+model router on an unused loopback port, routes all `api.anthropic.com` traffic
+through it, and stops both child proxies when Claude exits. To use an already
+upgraded server, pass `--all-endpoints --router http://localhost:18765` instead.
+The default inference-only mode remains compatible with older router versions.
+
+Claude Code still refuses Remote Control for a custom `ANTHROPIC_BASE_URL`;
+forwarding endpoints cannot change that client check. The launcher retains the
+first-party origin with process-scoped proxy/certificate settings. Full account
+login and organization permissions still apply; source refresh grants are never
+copied. Codex translation preserves ToolSearch references so deferred native
+Chrome and MCP tools remain discoverable. When Claude sends a server-side
+message-thread delta to a stateless model backend, the router negotiates a
+full-history resend; Anthropic-bound threads continue unchanged. See the
+[account relay record](docs/devlog/claude_20261018-account-endpoint-relay.md).
 
 ### Putting the router's models in the `/model` picker
 
