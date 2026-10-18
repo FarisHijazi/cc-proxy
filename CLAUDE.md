@@ -144,3 +144,7 @@ repository; their setup and smoke checks are recorded in that devlog.
 of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
+
+Self-hosted native Remote Control is an optional launcher route to HQ. The account
+proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
+Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).

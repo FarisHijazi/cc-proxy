@@ -468,9 +468,21 @@ def main():
         help="account alias for native /chrome, independent of main (replaces aggregate Chrome tools for this session)",
     )
     parser.add_argument(
+        "--remote-control-backend", help="HQ origin for native Remote Control"
+    )
+    parser.add_argument(
+        "--remote-control-key-file",
+        type=Path,
+        help="Private HQ native registration key (never an Anthropic token)",
+    )
+    parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
+    if bool(args.remote_control_backend) != bool(args.remote_control_key_file):
+        parser.error(
+            "--remote-control-backend and --remote-control-key-file are required together"
+        )
     accounts, main_account = account_selection(
         args.account, args.accounts_file, args.main_account
     )
@@ -560,6 +572,19 @@ def main():
             Path(login.name),
             secure_source,
         )
+    if args.remote_control_backend:
+        command += [
+            "--scripts",
+            str(Path(__file__).resolve().with_name("account_remote_route.py")),
+            "--set",
+            "hq_remote_origin=" + args.remote_control_backend,
+            "--set",
+            "hq_remote_key_file="
+            + str(args.remote_control_key_file.expanduser().resolve()),
+        ]
+        if "--remote-control" not in forwarded:
+            forwarded.append("--remote-control")
+        print("Native Remote Control → " + args.remote_control_backend, file=sys.stderr)
     with (state / f"proxy-{port}.log").open("w") as log:
         proxy = subprocess.Popen(command, stdout=log, stderr=log)
         client = None

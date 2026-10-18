@@ -254,6 +254,23 @@ relaunch; the launcher never refreshes or switches source credentials.
 [Implementation and tests](docs/devlog/claude_20261018-multi-account-tools.md).
 [Native Chrome routing and validation](docs/devlog/claude_20261018-native-chrome-account.md).
 
+To use a self-hosted HQ Remote Control backend, add these launcher arguments
+before `--`:
+
+```sh
+--remote-control-backend http://127.0.0.1:8389 \
+--remote-control-key-file /path/to/private/native-key
+```
+
+The matching HQ backend requires a separate private registration secret. New
+native sessions are registered with HQ, while inference keeps using the model
+router and other account features keep their existing routes. Anthropic OAuth
+credentials are stripped before forwarding to HQ. These sessions are controlled
+in HQ; Claude's hardcoded claude.ai session link is not a usable link to them.
+The launcher enables `--remote-control` and keeps login storage isolated.
+Plain HTTP is allowed only on loopback; use HTTPS or an SSH tunnel remotely.
+See [implementation and validation](docs/devlog/claude_20261018-hq-native-remote.md).
+
 ### Putting the router's models in the `/model` picker
 
 Typing an exact id works without any setup, but the interactive picker only

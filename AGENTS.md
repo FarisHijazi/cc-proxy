@@ -43,3 +43,9 @@
   This mode omits the aggregate Chrome adapter. Read
   `docs/devlog/claude_20261018-native-chrome-account.md` on demand (plain path);
   its route tests need a separate mitmproxy dependency environment.
+- `scripts/account_remote_route.py` optionally routes newly registered native
+  Remote Control sessions to HQ. Track session ownership inside that proxy;
+  never route unknown session IDs or leak Anthropic credentials to HQ. Launch
+  authentication and generated worker tokens are separate. Keep worker SSE
+  streaming and only buffer registration/bridge responses. Read
+  `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).
