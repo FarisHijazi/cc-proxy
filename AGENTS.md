@@ -34,3 +34,5 @@
   bundle. Read `docs/devlog/claude_20261018-multi-account-tools.md` on demand
   (plain path, not an include). Run all three `tests/account_*_test.py` suites
   with pinned FastMCP/artifact CLI dependencies documented there.
+  After installing a local shortcut, smoke-test its own startup and child cleanup;
+  keep machine-specific account maps outside the repository.

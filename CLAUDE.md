@@ -137,3 +137,5 @@ Remote Control and the native Chrome UI; separate MCP adapters aggregate browser
 and read artifacts across accounts. Credential snapshots remain access-only.
 Read `docs/devlog/claude_20261018-multi-account-tools.md` for boundaries, upstream
 reuse and live validation (deliberately a plain path, not an include).
+Local shortcuts and saved account maps are runtime configuration outside this
+repository; their setup and smoke checks are recorded in that devlog.

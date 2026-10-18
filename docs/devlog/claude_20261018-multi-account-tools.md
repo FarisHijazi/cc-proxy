@@ -122,3 +122,11 @@ session's native `/chrome` dialog showed Enabled and Extension Installed after
 aggregate tools had selected and read tab context on both accounts. Remote
 phone/browser-origin turns were not exercised. All test sessions were exited;
 no existing router was restarted.
+
+Local setup installs `~/.local/bin/claude-accounts` as a shortcut to the installed
+account launcher with `--start-router` and
+`--accounts-file ~/.config/claude-codex/accounts.json`. The private account map
+defaults to work; `--main-account personal` overrides it. The installed shortcut
+passed a complete launcher startup/exit smoke test with `-- --version`.
+The expired inactive source login was renewed once through claude-swap's existing
+serialized credential owner during setup; the launcher/adapters never renew it.
