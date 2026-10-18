@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 
-def proxy_command(router, port, state, all_endpoints=False):
+def proxy_command(router, port, state, all_endpoints=False, chrome_manifest=None):
     url = urlsplit(router)
     if (
         url.scheme not in {"http", "https"}
@@ -44,7 +44,7 @@ def proxy_command(router, port, state, all_endpoints=False):
         rule = "@!~m CONNECT@^https://api\\.anthropic\\.com(?=/|$)@" + router.rstrip(
             "/"
         )
-    return [
+    command = [
         "mitmdump",
         "--listen-host",
         "127.0.0.1",
@@ -67,6 +67,17 @@ def proxy_command(router, port, state, all_endpoints=False):
         "--map-remote",
         rule,
     ]
+    if chrome_manifest:
+        command[command.index("--allow-hosts") + 1] = (
+            r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com):443$"
+        )
+        command += [
+            "--scripts",
+            str(Path(__file__).resolve().with_name("account_chrome_route.py")),
+            "--set",
+            f"chrome_account_manifest={chrome_manifest}",
+        ]
+    return command
 
 
 def bootstrap_login(source, destination, secure_storage, source_secure_storage=None):
@@ -287,6 +298,10 @@ def aggregate_mcp(login, manifest, forwarded):
         ("account-chrome", "account_chrome.py"),
         ("account-artifacts", "account_artifacts.py"),
     ):
+        # An explicit native account uses the built-in MCP server end-to-end.
+        # Avoid routing an aggregate child for main into that chosen account.
+        if name == "account-chrome" and manifest.get("chrome_account"):
+            continue
         servers[name] = {
             "type": "stdio",
             "command": shutil.which("uv") or "uv",
@@ -449,12 +464,18 @@ def main():
         help="alias owning Remote Control and default account features",
     )
     parser.add_argument(
+        "--chrome-account",
+        help="account alias for native /chrome, independent of main (replaces aggregate Chrome tools for this session)",
+    )
+    parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
     accounts, main_account = account_selection(
         args.account, args.accounts_file, args.main_account
     )
+    if args.chrome_account and args.chrome_account not in accounts:
+        parser.error("--chrome-account must name a configured account alias")
     if accounts and (args.cswap_account is not None or args.login_from is not None):
         parser.error(
             "--account/--accounts-file replaces --cswap-account and --login-from"
@@ -480,6 +501,8 @@ def main():
         parser.error(
             "use -- --remote-control for an interactive session; server mode cannot carry CLI settings"
         )
+    if args.chrome_account and "--no-chrome" in forwarded:
+        parser.error("--chrome-account cannot be combined with --no-chrome")
     os.umask(0o077)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     # A shared CA is fine; each invocation has a separate listener and log.
@@ -498,8 +521,23 @@ def main():
     main_secure = Path(login.name)
     if accounts:
         manifest = snapshot_accounts(accounts, main_account, state, Path(login.name))
+        if args.chrome_account:
+            if "error" in manifest["accounts"][args.chrome_account]:
+                raise ValueError(
+                    "selected Chrome account is unavailable; renew its full source login"
+                )
+            manifest["chrome_account"] = args.chrome_account
         main_secure = Path(manifest["accounts"][main_account]["secure_storage_dir"])
         forwarded = aggregate_mcp(Path(login.name), manifest, forwarded)
+        if args.chrome_account:
+            command = proxy_command(
+                args.router,
+                port,
+                state,
+                args.all_endpoints,
+                Path(login.name) / "accounts.json",
+            )
+            print(f"Native Chrome account: {args.chrome_account}", file=sys.stderr)
         print(
             f"Main account: {main_account} (Remote Control and default account features)",
             file=sys.stderr,

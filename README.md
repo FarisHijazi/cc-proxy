@@ -230,16 +230,29 @@ account gets separate session state. Remote Control belongs to that account;
 selecting another browser does not change it. The `account-chrome` MCP browser
 list labels each account, and subsequent actions use the selected browser's
 native connection. Ask Claude to use `account-chrome` to list or select a browser
-across accounts. Native `/chrome` remains available for the main account;
-Claude reserves that server name and does not permit replacing its browser picker.
-Native file uploads also require that account to be main; the aggregate server
-rejects uploads because it cannot run Claude's private file-permission preprocessing.
+across accounts. Native `/chrome` uses main by default. To choose a different
+account for the native picker, add `--chrome-account personal` before `--`:
+
+```sh
+python scripts/claude-account-router --start-router \
+  --account personal=1 --account work=2 \
+  --main-account work --chrome-account personal -- \
+  --model gpt-5.6-sol --remote-control
+```
+
+This routes native Chrome's bridge to the selected login while Remote Control
+stays on main. It replaces the aggregate Chrome tools for this session; the
+native picker lists only the selected account's browsers. Both accounts need
+unexpired full logins. Native CLI permissions and file-upload preprocessing stay
+in place; the aggregate adapter still rejects uploads because it cannot run that
+private preprocessing. File uploads were not exercised in the live routing test.
 The `account-artifacts` MCP tools list across accounts and read metadata or files
 with their owning account. They do not publish or share artifacts between accounts.
 
 Expired secondary logins are reported explicitly. Renew the source login and
 relaunch; the launcher never refreshes or switches source credentials.
 [Implementation and tests](docs/devlog/claude_20261018-multi-account-tools.md).
+[Native Chrome routing and validation](docs/devlog/claude_20261018-native-chrome-account.md).
 
 ### Putting the router's models in the `/model` picker
 

@@ -26,8 +26,8 @@
 - Stateless providers must refuse `thread:continue` with the recognized
   `thread_unsupported_request` envelope so Claude resends full history. Keep
   Anthropic threads and token counting untouched; do not accept contextless deltas.
-- Multi-account tools extend this launcher: main owns Remote Control and native
-  `/chrome`; `account-chrome` multiplexes persistent native MCP children and
+- Multi-account tools extend this launcher: main owns Remote Control and, by
+  default, native `/chrome`; `account-chrome` multiplexes persistent native MCP children and
   `account-artifacts` reuses the published artifact CLI for read-only access.
   Never route a failed account's action to another account. Preserve vendor
   notifications, native permissions, and full platform trust in the session CA
@@ -36,3 +36,10 @@
   with pinned FastMCP/artifact CLI dependencies documented there.
   After installing a local shortcut, smoke-test its own startup and child cleanup;
   keep machine-specific account maps outside the repository.
+- `--chrome-account` selects native Chrome independently of main. The existing
+  mitmproxy listener loads `scripts/account_chrome_route.py` to rewrite only
+  the native Chrome bridge path and initial connect token. Keep later traffic
+  opaque and reject invalid/expired snapshots without an account fallback.
+  This mode omits the aggregate Chrome adapter. Read
+  `docs/devlog/claude_20261018-native-chrome-account.md` on demand (plain path);
+  its route tests need a separate mitmproxy dependency environment.

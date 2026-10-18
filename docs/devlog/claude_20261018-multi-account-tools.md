@@ -49,13 +49,17 @@ The launcher registers `account-chrome` and `account-artifacts` through a
 private temporary MCP config, preserving other caller MCP configs. Native
 `--chrome` remains enabled for main unless explicitly disabled. Installed Claude
 rejects `claude-in-chrome` in supplied MCP configs as a reserved name, including
-when `--no-chrome` is passed. Therefore `/chrome` remains main-account-only;
+when `--no-chrome` is passed. The default `/chrome` login is main;
 the aggregate browser list/selection is available through account-chrome tools.
+The subsequent [native bridge selector](claude_20261018-native-chrome-account.md)
+adds `--chrome-account` to change the native login independently without replacing
+the reserved MCP server.
 Native file_upload and uploads inside browser_batch require private CLI-side
 file-permission preprocessing. The aggregate adapter explains this in tool
 descriptions and rejects such calls (including nested batches) before any action.
-Use that account as main for native uploads. Native permission-mode UI updates
-apply to main; aggregate children retain native extension permission enforcement.
+Use native Chrome with the desired main or explicit Chrome account for its
+CLI-side preprocessing. Native permission-mode UI updates apply to the native
+connection; aggregate children retain native extension permission enforcement.
 Chrome retains one native subprocess per account;
 device IDs are namespaced by alias, and native permission updates are forwarded.
 

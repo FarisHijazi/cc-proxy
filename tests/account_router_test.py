@@ -561,3 +561,35 @@ def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
     assert set(config["mcpServers"]) == {"account-chrome", "account-artifacts"}
     assert json.loads((tmp_path / "accounts.json").read_text()) == manifest
     assert (tmp_path / "accounts.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_native_chrome_selector_keeps_native_server_and_artifact_accounts(tmp_path):
+    manifest = {"main": "work", "chrome_account": "personal", "accounts": {}}
+    args = launcher["aggregate_mcp"](tmp_path, manifest, ["--model", "gpt-toy"])
+    assert "--chrome" in args
+    servers = json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
+    assert set(servers) == {"account-artifacts"}
+    command = launcher["proxy_command"](
+        "http://127.0.0.1:18765", 19999, tmp_path, True, tmp_path / "accounts.json"
+    )
+    pattern = command[command.index("--allow-hosts") + 1]
+    assert re.fullmatch(pattern, "bridge.claudeusercontent.com:443")
+    assert not re.fullmatch(pattern, "bridge.claudeusercontent.com.evil.test:443")
+    assert str(Path(__file__).parents[1] / "scripts/account_chrome_route.py") in command
+
+
+def test_native_chrome_selector_rejects_unconfigured_account(tmp_path):
+    result = subprocess.run(
+        [
+            str(Path(__file__).parents[1] / "scripts/claude-account-router"),
+            "--chrome-account",
+            "missing",
+            "--state-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2 and "must name a configured account" in result.stderr
+    assert not list(tmp_path.iterdir())

@@ -133,9 +133,14 @@ ToolSearch and message-thread compatibility fixes, and session-owned launcher mo
 `docs/devlog/claude_20261018-account-endpoint-relay.md` (plain path, read on demand).
 
 The launcher also accepts account aliases and a selectable main login. Main owns
-Remote Control and the native Chrome UI; separate MCP adapters aggregate browsers
+Remote Control and, by default, the native Chrome UI; separate MCP adapters aggregate browsers
 and read artifacts across accounts. Credential snapshots remain access-only.
 Read `docs/devlog/claude_20261018-multi-account-tools.md` for boundaries, upstream
 reuse and live validation (deliberately a plain path, not an include).
 Local shortcuts and saved account maps are runtime configuration outside this
 repository; their setup and smoke checks are recorded in that devlog.
+
+`--chrome-account` routes the native Chrome bridge to a selected login independently
+of main, replacing the aggregate Chrome adapter for that session. The protocol
+boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
+(plain path, read on demand).
