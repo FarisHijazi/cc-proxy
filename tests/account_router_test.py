@@ -223,6 +223,73 @@ def test_cswap_selector_reads_without_switching_or_refreshing(tmp_path, monkeypa
     )
 
 
+def fake_cswap(monkeypatch, tmp_path, live_slot):
+    """Expired slot 1 whose next read, after cswap's gate, is fresh."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    (tmp_path / "configs").mkdir()
+    account = {"email": "user@example.com", "uuid": "toy-account"}
+    (tmp_path / "sequence.json").write_text(json.dumps({"accounts": {"1": account}}))
+    stored = {"accessToken": "toy", "expiresAt": "old", "scopes": ["user:profile"]}
+    consumed = []
+
+    class Switcher:
+        def current_account_number(self):
+            return live_slot
+
+        def consume_backup_grant(self, slot, email, raw):
+            consumed.append((slot, email))
+            stored["expiresAt"] = "new"
+            return SimpleNamespace(error=None)
+
+    modules = {
+        "claude_swap": SimpleNamespace(
+            oauth=SimpleNamespace(
+                extract_oauth_data=lambda raw: dict(raw),
+                is_oauth_token_expired=lambda at: at == "old",
+            )
+        ),
+        "claude_swap.credentials": SimpleNamespace(
+            CredentialStore=lambda _: SimpleNamespace(
+                _read_account_credentials=lambda slot, email: stored
+            )
+        ),
+        "claude_swap.models": SimpleNamespace(
+            Platform=SimpleNamespace(detect=lambda: "toy")
+        ),
+        "claude_swap.paths": SimpleNamespace(get_backup_root=lambda: tmp_path),
+        "claude_swap.switcher": SimpleNamespace(ClaudeAccountSwitcher=Switcher),
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(vars(attrs))
+        monkeypatch.setitem(sys.modules, name, module)
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    return secure, consumed
+
+
+def test_cswap_expired_slot_refreshes_through_cswap_gate(tmp_path, monkeypatch):
+    secure, consumed = fake_cswap(monkeypatch, tmp_path, live_slot="2")
+    launcher["bootstrap_cswap"](1, tmp_path / "isolated", secure)
+    assert consumed == [("1", "user@example.com")]
+    assert (
+        json.loads((secure / ".credentials.json").read_text())["claudeAiOauth"][
+            "expiresAt"
+        ]
+        == "new"
+    )
+
+
+def test_cswap_expired_live_login_is_never_consumed(tmp_path, monkeypatch):
+    secure, consumed = fake_cswap(monkeypatch, tmp_path, live_slot="1")
+    with pytest.raises(ValueError, match="active default login"):
+        launcher["bootstrap_cswap"](1, tmp_path / "isolated", secure)
+    assert consumed == []
+    assert not (secure / ".credentials.json").exists()
+
+
 @pytest.mark.parametrize("all_endpoints", [False, True])
 def test_real_forward_proxy_routes_and_streams(tmp_path, all_endpoints):
     if not shutil.which("mitmdump"):

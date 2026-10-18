@@ -147,7 +147,23 @@ def write_access_token(destination, oauth):
     )
 
 
-def bootstrap_cswap(slot, destination, secure_storage):
+def refresh_cswap_slot(slot, email, raw):
+    """Spend an expired slot's grant through cswap's own consume gate."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    # The live default login shares its grant with ~/.claude; only claude refreshes it.
+    if switcher.current_account_number() == slot:
+        raise ValueError(
+            "selected cswap account is the active default login and its token has expired; run claude once to refresh it"
+        )
+    if switcher.consume_backup_grant(slot, email, raw).error is not None:
+        raise ValueError(
+            "cswap could not refresh the selected account; re-add it with cswap add"
+        )
+
+
+def bootstrap_cswap(slot, destination, secure_storage, refresh=True):
     """Reuse the switcher's credential owner without constructing a switcher."""
     try:
         from claude_swap import oauth
@@ -177,9 +193,12 @@ def bootstrap_cswap(slot, destination, secure_storage):
             "selected cswap account needs a full claude.ai login with user:profile scope"
         )
     if oauth.is_oauth_token_expired(token.get("expiresAt")):
-        raise ValueError(
-            "selected cswap access token has expired; sign in using that account before relaunching"
-        )
+        if not refresh:
+            raise ValueError(
+                "selected cswap access token has expired; sign in using that account before relaunching"
+            )
+        refresh_cswap_slot(str(slot), account["email"], raw)
+        return bootstrap_cswap(slot, destination, secure_storage, refresh=False)
     config = root / "configs" / f".claude-config-{slot}-{account['email']}.json"
     saved = json.loads(config.read_text()) if config.exists() else {}
     profile = saved.get("oauthAccount") or {

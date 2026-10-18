@@ -145,6 +145,8 @@ of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
+Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
+spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
 (appears only from a config dir's second launch) and the fact that 2.1.302 keeps
 computer-use approvals terminal-only are in

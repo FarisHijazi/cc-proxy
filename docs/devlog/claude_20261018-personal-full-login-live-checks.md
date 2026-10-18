@@ -5,17 +5,29 @@ HQ's computer-use record (`cc-tmux-api/docs/devlog/claude_20261018-native-comput
 both of which stopped because the only Pro/Max account had an inference-only
 setup-token (cswap slot 1: `scopes=[user:inference]`, no refresh grant).
 
-## What changed (runtime only, no code)
+## Account storage: claude-swap owns it
 
-- Full claude.ai login for the personal (Max) account into its own directory:
-  `CLAUDE_CONFIG_DIR=~/.claude-accounts/personal claude auth login --claudeai`.
-  `~/.claude` was not touched.
-- `~/.config/claude-codex/accounts.json` now maps `personal` to that absolute
-  directory instead of cswap slot 1 (backup: `accounts.json.bak-20261018`).
-  `bootstrap_login` already handles the per-directory Keychain suffix.
-- The launcher snapshots an access token only, so when it expires (about 8h) the
-  `personal` alias reports unavailable. Fix it by running any plain
-  `claude` in that directory once, which refreshes the source.
+- Full claude.ai login for the personal (Max) account in a scratch directory
+  (`CLAUDE_CONFIG_DIR=<dir> claude auth login --claudeai`), then stored into
+  its existing cswap slot with `CLAUDE_CONFIG_DIR=<dir> cswap add`, which
+  replaced the setup-token in place. (`cswap export` was taken first.) The fork
+  fix `4674e69` keeps that add from marking slot 1 active while `~/.claude`
+  holds the work login.
+- The scratch directory's credential was then deleted, not logged out, so cswap
+  is the **only** holder of the rotating refresh grant.
+- The account map is unchanged: `{"main":"work","accounts":{"work":2,"personal":1}}`.
+- `bootstrap_cswap` still snapshots access-only. When a slot's access token has
+  expired, it now calls cswap's own `consume_backup_grant` (locked, CAS-persisted)
+  and re-reads the slot once. It refuses when the slot is the live default
+  login, because that grant is shared with `~/.claude` and only claude refreshes
+  it. Live check: forcing the expired path on slot 1 moved its expiry from 7.3h
+  to 8.0h, the snapshot carried no refresh token, and `cswap list` still showed usage.
+- To add another full login, use the same two commands, then delete the scratch
+  directory's credential.
+
+`tests/account_router_test.py` passes 17. Its live
+`test_session_owned_router_relays_account_requests_and_exits` fails with or
+without this change: curl exit 56 through mitmproxy to the real API.
 
 ## Computer use
 
