@@ -14,7 +14,10 @@ Change (`scripts/claude-account-router`):
   symlinked except credentials, `.claude.json`, `sessions/`, `ide/`,
   `statsig/` and `backups/` (cswap's `NEVER_SHARED_NAMES`). History
   (`projects/`, `history.jsonl`) is shared too; an existing per-profile copy is
-  merged into `~/.claude` by cswap once no session uses the profile.
+  merged into `~/.claude` by cswap once no session uses the profile. cswap
+  never replaces a real entry, so the launcher first moves any pre-share copy
+  Claude created in its own profile (e.g. a `settings.json` holding only
+  `remoteControlAtStartup`) to `pre-share-<epoch>/` beside the profile.
 - `update_account_metadata` seeds `.claude.json` from `~/.claude.json` every
   launch, except `ACCOUNT_SCOPED` keys (identity, `cached*`/`*Cache` feature-flag,
   plan and model-access caches), which stay the profile's own — the

@@ -151,9 +151,17 @@ def update_account_metadata(path, source):
 
 def share_user_config(config):
     """Link ~/.claude into the client profile exactly as `cswap env` does."""
-    from claude_swap.session import SessionManager
+    from claude_swap.session import HISTORY_ITEMS, SessionManager, share_all_items
     from claude_swap.switcher import ClaudeAccountSwitcher
 
+    # cswap never replaces a real entry; this profile is ours, so set aside the
+    # copies Claude made before sharing (cswap merges history itself).
+    aside = config.parent / f"pre-share-{int(time.time())}"
+    for name in share_all_items(Path.home() / ".claude"):
+        item = config / name
+        if name not in HISTORY_ITEMS and item.exists() and not item.is_symlink():
+            aside.mkdir(mode=0o700, exist_ok=True)
+            item.rename(aside / name)
     SessionManager(ClaudeAccountSwitcher())._sync_sharing(
         config, share=True, share_all=True
     )

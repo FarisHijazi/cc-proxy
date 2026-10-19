@@ -684,3 +684,18 @@ def test_native_chrome_selector_rejects_unconfigured_account(tmp_path):
     )
     assert result.returncode == 2 and "must name a configured account" in result.stderr
     assert not list(tmp_path.iterdir())
+
+
+def test_shared_profile_sets_aside_pre_share_copies(tmp_path, monkeypatch):
+    pytest.importorskip("claude_swap")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/settings.json").write_text('{"shared": true}')
+    profile = tmp_path / "state/claude"
+    profile.mkdir(parents=True)
+    (profile / "settings.json").write_text('{"own": true}')
+    launcher["share_user_config"](profile)
+    assert (profile / "settings.json").is_symlink()
+    assert json.loads((profile / "settings.json").read_text()) == {"shared": True}
+    (aside,) = (tmp_path / "state").glob("pre-share-*")
+    assert json.loads((aside / "settings.json").read_text()) == {"own": True}
