@@ -124,8 +124,17 @@ def bootstrap_login(source, destination, secure_storage, source_secure_storage=N
             write_access_token(secure_storage, oauth)
 
 
+# Identity and per-account server caches (feature flags, plan, model access).
+ACCOUNT_SCOPED = re.compile(r"^oauthAccount$|cache|subscription|tier|^s1m|penguin", re.I)
+
+
 def update_account_metadata(path, source):
-    data = json.loads(path.read_text()) if path.exists() else {}
+    """Mirror ~/.claude.json preferences; keep this profile's account-scoped keys."""
+    own = json.loads(path.read_text()) if path.exists() else {}
+    home = Path.home() / ".claude.json"
+    prefs = json.loads(home.read_text()) if home.exists() else {}
+    data = {k: v for k, v in prefs.items() if not ACCOUNT_SCOPED.search(k)}
+    data.update({k: v for k, v in own.items() if ACCOUNT_SCOPED.search(k)})
     data.pop("oauthAccount", None)
     data.update(
         {
@@ -138,6 +147,16 @@ def update_account_metadata(path, source):
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
         json.dump(data, handle)
     os.replace(handle.name, path)
+
+
+def share_user_config(config):
+    """Link ~/.claude into the client profile exactly as `cswap env` does."""
+    from claude_swap.session import SessionManager
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    SessionManager(ClaudeAccountSwitcher())._sync_sharing(
+        config, share=True, share_all=True
+    )
 
 
 def write_access_token(destination, oauth):
@@ -402,7 +421,7 @@ def client_environment(state, port, secure_storage):
     # Keep secure storage isolated too, including when the parent pinned it.
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(secure_storage)
     return env, json.dumps(
-        {"env": settings_env, "apiKeyHelper": "", "disableAllHooks": True}
+        {"env": settings_env, "apiKeyHelper": ""}
     )
 
 
@@ -591,6 +610,7 @@ def main():
             Path(login.name),
             secure_source,
         )
+    share_user_config(state / "claude")
     if args.remote_control_backend:
         command += [
             "--scripts",
@@ -638,7 +658,7 @@ def main():
             (state / "client-ca.pem").write_bytes(certificate_bundle(ca))
             env, settings = client_environment(state, port, main_secure)
             print(
-                f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; isolated config: {state / 'claude'}",
+                f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; config: {state / 'claude'} (shares ~/.claude)",
                 file=sys.stderr,
             )
             client = subprocess.Popen(

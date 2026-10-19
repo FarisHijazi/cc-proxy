@@ -152,6 +152,10 @@ Live computer-use and real two-account Chrome checks, the `computer-use` flag ga
 computer-use approvals terminal-only are in
 `docs/devlog/claude_20261018-personal-full-login-live-checks.md` (plain path).
 
+The main client profile shares `~/.claude` through cswap's share-all mirroring and
+mirrors `~/.claude.json` preferences (account caches stay per profile); hooks run.
+See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
+
 Self-hosted native Remote Control is an optional launcher route to HQ. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
 Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).

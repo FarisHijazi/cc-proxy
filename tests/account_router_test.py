@@ -127,7 +127,7 @@ def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
     assert env["REQUESTS_CA_BUNDLE"] == env["SSL_CERT_FILE"]
     assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(tmp_path / "secure")
     assert settings["env"]["ANTHROPIC_BASE_URL"] == env["ANTHROPIC_BASE_URL"]
-    assert settings["disableAllHooks"] is True
+    assert "disableAllHooks" not in settings
     assert "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" not in env
     assert "CLAUDE_CODE_HOST_CREDS_FILE" not in env
     assert "CLAUDE_CODE_ACCOUNT_UUID" not in env
@@ -147,6 +147,30 @@ def test_metadata_refreshes_when_source_account_changes(tmp_path):
         json.loads(metadata.read_text())["oauthAccount"]["accountUuid"] == "account-b"
     )
     assert metadata.stat().st_mode & 0o777 == 0o600
+
+
+def test_metadata_mirrors_home_preferences_but_keeps_account_caches(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "editorMode": "vim",
+                "oauthAccount": {"accountUuid": "home-account"},
+                "cachedGrowthBookFeatures": {"flag": "home"},
+            }
+        )
+    )
+    metadata = tmp_path / "profile.json"
+    metadata.write_text(json.dumps({"cachedGrowthBookFeatures": {"flag": "own"}}))
+    launcher["update_account_metadata"](
+        metadata, {"oauthAccount": {"accountUuid": "account-b"}}
+    )
+    data = json.loads(metadata.read_text())
+    assert data["editorMode"] == "vim"
+    assert data["cachedGrowthBookFeatures"] == {"flag": "own"}
+    assert data["oauthAccount"] == {"accountUuid": "account-b"}
 
 
 def test_protected_state_symlinks_are_rejected(tmp_path):
