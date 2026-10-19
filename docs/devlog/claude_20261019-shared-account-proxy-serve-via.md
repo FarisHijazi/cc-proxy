@@ -34,9 +34,12 @@ there; laptops connect with a fixed key and hold no usable credential.
 - Mac: key and the server CA are in `~/.config/claude-codex/ftower-{proxy-key,ca.pem}`;
   `~/.local/bin/claude-accounts` uses `--via`, the old all-local launcher is
   `claude-accounts-local`.
-- Slot 1 was copied from the Mac with `cswap export --account 1` / `cswap
-  import --force` (user's choice). The rotating grant is now shared, so only ftower
-  may refresh it: on the Mac use it only through `--via`.
+- Logins on ftower are its OWN grants, made there with `CLAUDE_CONFIG_DIR=<scratch>
+  claude auth login --claudeai` + `CLAUDE_CONFIG_DIR=<scratch> cswap add --slot N`, then
+  the scratch credential deleted. Slot 1 was first copied from the Mac (`cswap export
+  --account 1` / `import --force`) and then replaced by a fresh login, so no rotating
+  grant is shared with the Mac. Check "Logged in as" on the consent page: twice
+  the browser's default claude.ai session authorized the wrong account.
 
 ## Verified
 
@@ -46,9 +49,11 @@ Tests: `tests/account_inject_test.py` (4) with the mitmproxy suites, which need
 Python 3.12: `uv run --no-project --python 3.12 --with mitmproxy --with pytest pytest -q
 tests/account_inject_test.py tests/account_chrome_route_test.py` → 17 passed.
 
-## Open
+## Live-slot fallback
 
-`work` on ftower: its `~/.claude.json` names the work account but it holds no
-credential, so nothing to inject. Copying the Mac's work grant would share the
-Mac's live default login's rotating token (one side logs out); a fresh login on
-ftower + `cswap add` avoids that.
+ftower's `~/.claude.json` names the work account but its credentials file holds
+no Claude login, so `account_inject` uses the live store only when it actually
+yields an access token, and otherwise the slot's own cswap login.
+
+Verified after both logins: `work` and `personal` profiles through the proxy, and
+`claude-accounts --main-account work -- -p ...` answered.

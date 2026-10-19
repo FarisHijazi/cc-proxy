@@ -23,9 +23,13 @@ def slot_token(slot):
     from claude_swap.switcher import ClaudeAccountSwitcher
 
     switcher = ClaudeAccountSwitcher()
+    live = {}
     if switcher.current_account_number() == slot:
-        token = oauth.extract_oauth_data(switcher._read_credentials()) or {}
+        live = oauth.extract_oauth_data(switcher._read_credentials()) or {}
+    if live.get("accessToken"):
+        token = live
     else:
+        # Not the live login, or a live identity with no credential to share a grant with.
         email = switcher._get_sequence_data()["accounts"][slot]["email"]
         raw, _ = switcher._read_account_credentials_ex(slot, email)
         token = oauth.extract_oauth_data(raw) or {}
