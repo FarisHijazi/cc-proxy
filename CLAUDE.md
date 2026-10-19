@@ -156,6 +156,10 @@ The main client profile shares `~/.claude` through cswap's share-all mirroring a
 mirrors `~/.claude.json` preferences (account caches stay per profile); hooks run.
 See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 
+`--serve` runs the proxy for other machines with logins injected from that box's cswap
+(`scripts/account_inject.py`); `--via` clients hold placeholder logins only. Live on ftower;
+see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` (plain path).
+
 Self-hosted native Remote Control is an optional launcher route to HQ. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
 Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).

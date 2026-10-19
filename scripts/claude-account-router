@@ -20,7 +20,9 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 
-def proxy_command(router, port, state, all_endpoints=False, chrome_manifest=None):
+def proxy_command(
+    router, port, state, all_endpoints=False, chrome_manifest=None, listen_host="127.0.0.1"
+):
     url = urlsplit(router)
     if (
         url.scheme not in {"http", "https"}
@@ -47,7 +49,7 @@ def proxy_command(router, port, state, all_endpoints=False, chrome_manifest=None
     command = [
         "mitmdump",
         "--listen-host",
-        "127.0.0.1",
+        listen_host,
         "--listen-port",
         str(port),
         "--set",
@@ -190,7 +192,7 @@ def refresh_cswap_slot(slot, email, raw):
         )
 
 
-def bootstrap_cswap(slot, destination, secure_storage, refresh=True):
+def bootstrap_cswap(slot, destination, secure_storage, refresh=True, placeholder=None):
     """Reuse the switcher's credential owner without constructing a switcher."""
     try:
         from claude_swap import oauth
@@ -219,7 +221,10 @@ def bootstrap_cswap(slot, destination, secure_storage, refresh=True):
         raise ValueError(
             "selected cswap account needs a full claude.ai login with user:profile scope"
         )
-    if oauth.is_oauth_token_expired(token.get("expiresAt")):
+    if placeholder:
+        # The serving proxy injects the real token; this client never refreshes.
+        token = {**token, "accessToken": placeholder, "expiresAt": PLACEHOLDER_EXPIRY}
+    elif oauth.is_oauth_token_expired(token.get("expiresAt")):
         if not refresh:
             raise ValueError(
                 "selected cswap access token has expired; sign in using that account before relaunching"
@@ -247,6 +252,9 @@ def bootstrap_cswap(slot, destination, secure_storage, refresh=True):
         {"oauthAccount": profile, "hasCompletedOnboarding": True},
     )
     write_access_token(secure_storage, token)
+
+
+PLACEHOLDER_EXPIRY = 4102444800000  # 2100-01-01: a placeholder must never trigger refresh
 
 
 def write_private(path, content):
@@ -298,7 +306,7 @@ def account_selection(entries, accounts_file=None, main=None):
     return normalized, selected
 
 
-def snapshot_accounts(accounts, main, state, login):
+def snapshot_accounts(accounts, main, state, login, placeholders=False):
     """Snapshot main first; unavailable secondary accounts remain explicit."""
     manifest = {
         "main": main,
@@ -313,7 +321,14 @@ def snapshot_accounts(accounts, main, state, login):
         try:
             source = accounts[alias]
             if isinstance(source, int):
-                bootstrap_cswap(source, config, secure)
+                bootstrap_cswap(
+                    source,
+                    config,
+                    secure,
+                    placeholder=f"proxy-account-{alias}" if placeholders else None,
+                )
+            elif placeholders:
+                raise ValueError("--via needs cswap slots, not login directories")
             else:
                 bootstrap_login(source, config, secure)
                 credential = json.loads((secure / ".credentials.json").read_text())
@@ -369,12 +384,13 @@ def aggregate_mcp(login, manifest, forwarded):
     return [*args, "--mcp-config", str(config_path)]
 
 
-def client_environment(state, port, secure_storage):
+def client_environment(state, port, secure_storage, proxy_url=None):
     env = os.environ.copy()
+    proxy_url = proxy_url or f"http://127.0.0.1:{port}"
     settings_env = {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
-        "HTTP_PROXY": f"http://127.0.0.1:{port}",
+        "HTTPS_PROXY": proxy_url,
+        "HTTP_PROXY": proxy_url,
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "NODE_EXTRA_CA_CERTS": str(state / "client-ca.pem"),
         "SSL_CERT_FILE": str(state / "client-ca.pem"),
@@ -449,13 +465,13 @@ def certificate_bundle(ca):
     return public_roots + b"\n" + ca.read_bytes()
 
 
-def wait_listener(process, port, log_path, certificate=None):
+def wait_listener(process, port, log_path, certificate=None, host="127.0.0.1"):
     deadline = time.monotonic() + 15
     while True:
         if process.poll() is not None:
             raise RuntimeError(f"process exited; inspect {log_path}")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            with socket.create_connection((host, port), timeout=0.2):
                 if certificate is None or certificate.exists():
                     return
         except OSError:
@@ -463,6 +479,95 @@ def wait_listener(process, port, log_path, certificate=None):
         if time.monotonic() >= deadline:
             raise RuntimeError(f"listener startup timed out; inspect {log_path}")
         time.sleep(0.05)
+
+
+def serve(args, state):
+    """Run the shared router and proxy for other machines; no local client."""
+    if not (args.accounts_file and args.proxy_key_file and args.port):
+        raise ValueError("--serve needs --accounts-file, --proxy-key-file and --port")
+    key = args.proxy_key_file.read_text().strip()
+    if len(key) < 32 or not key.isalnum():
+        raise ValueError("--proxy-key-file must hold an alphanumeric key of 32+ characters")
+    (state / "ca").mkdir(mode=0o700, parents=True, exist_ok=True)
+    # mitmproxy loads its confdir's config.yaml; this keeps the key out of argv.
+    (state / "ca/config.yaml").write_text(f"proxyauth: 'claude:{key}'\n")
+    with socket.socket() as candidate:
+        candidate.bind(("127.0.0.1", 0))
+        router_port = candidate.getsockname()[1]
+    command = proxy_command(
+        f"http://127.0.0.1:{router_port}",
+        args.port,
+        state,
+        all_endpoints=True,
+        listen_host=args.listen_host,
+    )
+    # Native Chrome's bridge carries the login in its connect frame.
+    command[command.index("--allow-hosts") + 1] = (
+        r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com):443$"
+    )
+    command += [
+        "--scripts",
+        str(Path(__file__).resolve().with_name("account_inject.py")),
+        "--set",
+        f"proxy_accounts_file={args.accounts_file.expanduser().resolve()}",
+    ]
+    router_env = os.environ.copy()
+    router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
+    router_env["CCP_TRAFFIC_LOG"] = "0"
+    with (state / "serve.log").open("a") as log:
+        processes = [
+            subprocess.Popen(
+                [args.router_bin, "serve", "--no-monitor", "--port", str(router_port)],
+                env=router_env,
+                stdout=log,
+                stderr=log,
+            )
+        ]
+        try:
+            wait_listener(processes[0], router_port, log.name)
+            processes.append(subprocess.Popen(command, stdout=log, stderr=log))
+            wait_listener(processes[1], args.port, log.name, host=args.listen_host)
+            print(f"Serving accounts on {args.listen_host}:{args.port}", file=sys.stderr)
+            while all(process.poll() is None for process in processes):
+                time.sleep(1)
+            return 1
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait()
+
+
+def via(args, accounts, main_account, state, forwarded):
+    """Run claude against a --serve proxy; this machine holds placeholder logins only."""
+    if not (args.proxy_key_file and args.via_ca and accounts):
+        raise ValueError("--via needs --proxy-key-file, --via-ca and an account map")
+    origin = urlsplit(args.via)
+    if origin.scheme != "http" or not origin.hostname or not origin.port:
+        raise ValueError("--via must be http://HOST:PORT")
+    key = args.proxy_key_file.read_text().strip()
+    proxy_url = f"http://claude:{key}@{origin.hostname}:{origin.port}"
+    login = tempfile.TemporaryDirectory(prefix="login-", dir=state)
+    try:
+        manifest = snapshot_accounts(
+            {main_account: accounts[main_account]},
+            main_account,
+            state,
+            Path(login.name),
+            placeholders=True,
+        )
+        row = manifest["accounts"][main_account]
+        if "error" in row:
+            raise ValueError(row["error"])
+        share_user_config(state / "claude")
+        (state / "client-ca.pem").write_bytes(certificate_bundle(args.via_ca))
+        env, settings = client_environment(
+            state, origin.port, Path(row["secure_storage_dir"]), proxy_url
+        )
+        print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
+        return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
+    finally:
+        login.cleanup()
 
 
 def main():
@@ -522,6 +627,18 @@ def main():
         help="Private HQ native registration key (never an Anthropic token)",
     )
     parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="serve the account map to other machines (router + proxy, no client)",
+    )
+    parser.add_argument("--listen-host", default="127.0.0.1", help="--serve bind address")
+    parser.add_argument("--router-bin", default="claude-codex", help="--serve router binary")
+    parser.add_argument(
+        "--proxy-key-file", type=Path, help="fixed proxy key shared by --serve and --via"
+    )
+    parser.add_argument("--via", help="use a --serve proxy at http://HOST:PORT")
+    parser.add_argument("--via-ca", type=Path, help="the --serve proxy's CA certificate")
+    parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
@@ -563,6 +680,10 @@ def main():
         parser.error("--chrome-account cannot be combined with --no-chrome")
     os.umask(0o077)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.serve:
+        return serve(args, state)
+    if args.via:
+        return via(args, accounts, main_account, state, forwarded)
     # A shared CA is fine; each invocation has a separate listener and log.
     with socket.socket() as candidate:
         candidate.bind(("127.0.0.1", args.port))
