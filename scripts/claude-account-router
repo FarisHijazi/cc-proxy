@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -192,7 +193,7 @@ def refresh_cswap_slot(slot, email, raw):
         )
 
 
-def bootstrap_cswap(slot, destination, secure_storage, refresh=True, placeholder=None):
+def bootstrap_cswap(slot, destination, secure_storage, refresh=True):
     """Reuse the switcher's credential owner without constructing a switcher."""
     try:
         from claude_swap import oauth
@@ -221,10 +222,7 @@ def bootstrap_cswap(slot, destination, secure_storage, refresh=True, placeholder
         raise ValueError(
             "selected cswap account needs a full claude.ai login with user:profile scope"
         )
-    if placeholder:
-        # The serving proxy injects the real token; this client never refreshes.
-        token = {**token, "accessToken": placeholder, "expiresAt": PLACEHOLDER_EXPIRY}
-    elif oauth.is_oauth_token_expired(token.get("expiresAt")):
+    if oauth.is_oauth_token_expired(token.get("expiresAt")):
         if not refresh:
             raise ValueError(
                 "selected cswap access token has expired; sign in using that account before relaunching"
@@ -252,9 +250,6 @@ def bootstrap_cswap(slot, destination, secure_storage, refresh=True, placeholder
         {"oauthAccount": profile, "hasCompletedOnboarding": True},
     )
     write_access_token(secure_storage, token)
-
-
-PLACEHOLDER_EXPIRY = 4102444800000  # 2100-01-01: a placeholder must never trigger refresh
 
 
 def write_private(path, content):
@@ -306,7 +301,7 @@ def account_selection(entries, accounts_file=None, main=None):
     return normalized, selected
 
 
-def snapshot_accounts(accounts, main, state, login, placeholders=False):
+def snapshot_accounts(accounts, main, state, login):
     """Snapshot main first; unavailable secondary accounts remain explicit."""
     manifest = {
         "main": main,
@@ -321,14 +316,7 @@ def snapshot_accounts(accounts, main, state, login, placeholders=False):
         try:
             source = accounts[alias]
             if isinstance(source, int):
-                bootstrap_cswap(
-                    source,
-                    config,
-                    secure,
-                    placeholder=f"proxy-account-{alias}" if placeholders else None,
-                )
-            elif placeholders:
-                raise ValueError("--via needs cswap slots, not login directories")
+                bootstrap_cswap(source, config, secure)
             else:
                 bootstrap_login(source, config, secure)
                 credential = json.loads((secure / ".credentials.json").read_text())
@@ -352,6 +340,14 @@ def snapshot_accounts(accounts, main, state, login, placeholders=False):
 
 def aggregate_mcp(login, manifest, forwarded):
     """Add shared tools while retaining the main account's native Chrome UI."""
+    main = manifest["accounts"].get(manifest["main"], {})
+    if "secure_storage_dir" in main:
+        # Claude moves the main login into the OS keychain at startup, so the
+        # main account's Chrome child reads its own plaintext copy.
+        copy = login / f"{manifest['main']}-chrome-secure"
+        shutil.copytree(main["secure_storage_dir"], copy)
+        accounts = {**manifest["accounts"], manifest["main"]: {**main, "secure_storage_dir": str(copy)}}
+        manifest = {**manifest, "accounts": accounts}
     manifest_path = login / "accounts.json"
     write_private(manifest_path, json.dumps(manifest))
     servers = {}
@@ -483,14 +479,9 @@ def wait_listener(process, port, log_path, certificate=None, host="127.0.0.1"):
 
 def serve(args, state):
     """Run the shared router and proxy for other machines; no local client."""
-    if not (args.accounts_file and args.proxy_key_file and args.port):
-        raise ValueError("--serve needs --accounts-file, --proxy-key-file and --port")
-    key = args.proxy_key_file.read_text().strip()
-    if len(key) < 32 or not key.isalnum():
-        raise ValueError("--proxy-key-file must hold an alphanumeric key of 32+ characters")
-    (state / "ca").mkdir(mode=0o700, parents=True, exist_ok=True)
-    # mitmproxy loads its confdir's config.yaml; this keeps the key out of argv.
-    (state / "ca/config.yaml").write_text(f"proxyauth: 'claude:{key}'\n")
+    if not (args.accounts_file and args.port):
+        raise ValueError("--serve needs --accounts-file and --port")
+    # No proxy auth: --listen-host must be a private (tailnet) address.
     with socket.socket() as candidate:
         candidate.bind(("127.0.0.1", 0))
         router_port = candidate.getsockname()[1]
@@ -538,36 +529,87 @@ def serve(args, state):
                     process.wait()
 
 
+PLACEHOLDER_EXPIRY = 4102444800000  # 2100-01-01: a placeholder must never trigger refresh
+CLAUDE_AI_SCOPES = [
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+]
+
+
+def placeholder_login(alias, opener, config, secure):
+    """Write a login whose token the --serve proxy swaps for the real one."""
+    token = f"proxy-account-{alias}"
+    request = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/profile",
+        headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
+    )
+    with opener.open(request, timeout=30) as response:
+        profile = json.load(response)
+    organization = profile["organization"]
+    config.mkdir(mode=0o700, parents=True, exist_ok=True)
+    update_account_metadata(
+        config / ".claude.json",
+        {
+            "oauthAccount": {
+                "emailAddress": profile["account"]["email"],
+                "accountUuid": profile["account"]["uuid"],
+                "organizationUuid": organization["uuid"],
+            },
+            "hasCompletedOnboarding": True,
+        },
+    )
+    write_access_token(
+        secure,
+        {
+            "accessToken": token,
+            "expiresAt": PLACEHOLDER_EXPIRY,
+            "scopes": CLAUDE_AI_SCOPES,
+            "subscriptionType": (organization.get("organization_type") or "").removeprefix("claude_"),
+            "rateLimitTier": organization.get("rate_limit_tier"),
+        },
+    )
+
+
 def via(args, accounts, main_account, state, forwarded):
     """Run claude against a --serve proxy; this machine holds placeholder logins only."""
-    if not (args.proxy_key_file and args.via_ca and accounts):
-        raise ValueError("--via needs --proxy-key-file, --via-ca and an account map")
+    if not (args.via_ca and accounts):
+        raise ValueError("--via needs --via-ca and an account map")
     origin = urlsplit(args.via)
     if origin.scheme != "http" or not origin.hostname or not origin.port:
         raise ValueError("--via must be http://HOST:PORT")
-    key = args.proxy_key_file.read_text().strip()
-    proxy_url = f"http://claude:{key}@{origin.hostname}:{origin.port}"
-    login = tempfile.TemporaryDirectory(prefix="login-", dir=state)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"https": args.via}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=args.via_ca)),
+    )
+    login = Path(tempfile.mkdtemp(prefix="login-", dir=state))
     try:
-        manifest = snapshot_accounts(
-            {main_account: accounts[main_account]},
-            main_account,
-            state,
-            Path(login.name),
-            placeholders=True,
-        )
-        row = manifest["accounts"][main_account]
-        if "error" in row:
-            raise ValueError(row["error"])
+        manifest = {"main": main_account, "accounts": {}, "claude": shutil.which("claude") or "claude"}
+        for alias in [main_account, *(name for name in accounts if name != main_account)]:
+            config = state / "claude" if alias == main_account else login / alias / "config"
+            secure = login / alias / "secure"
+            secure.mkdir(mode=0o700, parents=True)
+            try:
+                placeholder_login(alias, opener, config, secure)
+            except (OSError, ValueError, KeyError) as error:
+                if alias == main_account:
+                    raise ValueError(f"{alias} via {args.via}: {error}") from None
+                manifest["accounts"][alias] = {"error": "unavailable on the proxy"}
+                print(f"Account {alias}: unavailable on the proxy ({error})", file=sys.stderr)
+                continue
+            manifest["accounts"][alias] = {"config_dir": str(config), "secure_storage_dir": str(secure)}
+        forwarded = aggregate_mcp(login, manifest, forwarded)
         share_user_config(state / "claude")
         (state / "client-ca.pem").write_bytes(certificate_bundle(args.via_ca))
         env, settings = client_environment(
-            state, origin.port, Path(row["secure_storage_dir"]), proxy_url
+            state, origin.port, Path(manifest["accounts"][main_account]["secure_storage_dir"]), args.via
         )
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
     finally:
-        login.cleanup()
+        shutil.rmtree(login, ignore_errors=True)
 
 
 def main():
@@ -633,9 +675,6 @@ def main():
     )
     parser.add_argument("--listen-host", default="127.0.0.1", help="--serve bind address")
     parser.add_argument("--router-bin", default="claude-codex", help="--serve router binary")
-    parser.add_argument(
-        "--proxy-key-file", type=Path, help="fixed proxy key shared by --serve and --via"
-    )
     parser.add_argument("--via", help="use a --serve proxy at http://HOST:PORT")
     parser.add_argument("--via-ca", type=Path, help="the --serve proxy's CA certificate")
     parser.add_argument(

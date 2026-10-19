@@ -157,8 +157,10 @@ mirrors `~/.claude.json` preferences (account caches stay per profile); hooks ru
 See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 
 `--serve` runs the proxy for other machines with logins injected from that box's cswap
-(`scripts/account_inject.py`); `--via` clients hold placeholder logins only. Live on ftower;
-see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` (plain path).
+(`scripts/account_inject.py`); `--via` clients hold placeholder logins only, built from the
+proxy's profile endpoint, and aggregate every alias. No proxy auth: bind `--serve` to a tailnet IP.
+Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
+`docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.

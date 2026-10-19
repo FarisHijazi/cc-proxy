@@ -173,6 +173,39 @@ def test_metadata_mirrors_home_preferences_but_keeps_account_caches(
     assert data["oauthAccount"] == {"accountUuid": "account-b"}
 
 
+def test_via_placeholder_login_comes_from_the_proxy_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = []
+
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request.get_header("Authorization"))
+            profile = {
+                "account": {"email": "user@example.com", "uuid": "account-a"},
+                "organization": {
+                    "uuid": "org-a",
+                    "organization_type": "claude_max",
+                    "rate_limit_tier": "tier-a",
+                },
+            }
+            return __import__("io").BytesIO(json.dumps(profile).encode())
+
+    config, secure = tmp_path / "config", tmp_path / "secure"
+    secure.mkdir()
+    launcher["placeholder_login"]("work", Opener(), config, secure)
+    assert seen == ["Bearer proxy-account-work"]
+    account = json.loads((config / ".claude.json").read_text())["oauthAccount"]
+    assert account == {
+        "emailAddress": "user@example.com",
+        "accountUuid": "account-a",
+        "organizationUuid": "org-a",
+    }
+    oauth = json.loads((secure / ".credentials.json").read_text())["claudeAiOauth"]
+    assert oauth["accessToken"] == "proxy-account-work"
+    assert oauth["subscriptionType"] == "max" and "refreshToken" not in oauth
+    assert "user:profile" in oauth["scopes"]
+
+
 def test_protected_state_symlinks_are_rejected(tmp_path):
     protected = Path.home() / ".claude"
     (tmp_path / "claude").symlink_to(protected, target_is_directory=True)
@@ -635,23 +668,33 @@ def test_multi_account_snapshots_keep_ownership_and_report_expired(
 
 
 def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    (secure / ".credentials.json").write_text("{}")
     manifest = {
         "main": "work",
         "accounts": {
-            "work": {"config_dir": "/toy/config", "secure_storage_dir": "/toy/secure"}
+            "work": {"config_dir": "/toy/config", "secure_storage_dir": str(secure)}
         },
     }
+    login = tmp_path / "login"
+    login.mkdir()
     args = launcher["aggregate_mcp"](
-        tmp_path,
+        login,
         manifest,
         ["--chrome", "--model", "gpt-toy", "--mcp-config", "existing.json"],
     )
     assert args.count("--chrome") == 1 and "--no-chrome" not in args
     assert "existing.json" in args
-    config = json.loads((tmp_path / "mcp.json").read_text())
+    config = json.loads((login / "mcp.json").read_text())
     assert set(config["mcpServers"]) == {"account-chrome", "account-artifacts"}
-    assert json.loads((tmp_path / "accounts.json").read_text()) == manifest
-    assert (tmp_path / "accounts.json").stat().st_mode & 0o777 == 0o600
+    # The main client moves its own login into the keychain; Chrome reads a copy.
+    copy = login / "work-chrome-secure"
+    written = json.loads((login / "accounts.json").read_text())
+    assert written["accounts"]["work"]["secure_storage_dir"] == str(copy)
+    assert (copy / ".credentials.json").read_text() == "{}"
+    assert manifest["accounts"]["work"]["secure_storage_dir"] == str(secure)
+    assert (login / "accounts.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_native_chrome_selector_keeps_native_server_and_artifact_accounts(tmp_path):
