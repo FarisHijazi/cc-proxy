@@ -104,3 +104,34 @@ def test_host_lookalike_cannot_use_registration_key(route):
     route.requestheaders(value)
     route.request(value)
     assert "x-hq-native-key" not in value.request.headers
+
+
+def test_restarted_proxy_keeps_routing_known_sessions(tmp_path):
+    from mitmproxy.test import taddons
+
+    key = tmp_path / "key"
+    key.write_text("k" * 40)
+    options = dict(
+        hq_remote_origin="http://127.0.0.1:9000",
+        hq_remote_key_file=str(key),
+        hq_remote_sessions_file=str(tmp_path / "sessions.json"),
+    )
+    before = module.NativeRemoteRoute()
+    with taddons.context(before) as tctx:
+        tctx.configure(before, **options)
+        create = flow(before, "/v1/code/sessions", {"bridge": {}, "title": "Toy"})
+        before.request(create)
+        create.response = http.Response.make(200, b'{"session":{"id":"cse_toy"}}')
+        before.response(create)
+        bridge = flow(before, "/v1/code/sessions/cse_toy/bridge")
+        before.request(bridge)
+        bridge.response = http.Response.make(200, b'{"worker_jwt":"worker-secret"}')
+        before.response(bridge)
+    assert (tmp_path / "sessions.json").stat().st_mode & 0o777 == 0o600
+    after = module.NativeRemoteRoute()
+    with taddons.context(after) as tctx:
+        tctx.configure(after, **options)
+        worker = flow(after, "/v1/code/sessions/cse_toy/worker/events", token="worker-secret")
+        after.request(worker)
+    assert worker.request.url == "http://127.0.0.1:9000/v1/code/sessions/cse_toy/worker/events"
+    assert worker.request.headers["authorization"] == "Bearer worker-secret"

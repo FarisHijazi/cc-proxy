@@ -162,6 +162,12 @@ proxy's profile endpoint, and aggregate every alias. No proxy auth: bind `--serv
 Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
 `docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
 
-Self-hosted native Remote Control is an optional launcher route to HQ. The account
+Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
+`--remote-control-backend` too, so every `--via` client's native session reaches the hub; the
+routed-session map persists in the proxy state dir. The launcher sets
+`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-5.6-sol`) because a proxied session counts as
+first-party and Remote Control `set_model` otherwise rejects non-catalog ids. Folder trust
+accepted inside a profile survives re-mirroring. Record: HQ repo
+`docs/devlog/claude_20261023-native-ui-and-rc-protocol.md`. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
 Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).

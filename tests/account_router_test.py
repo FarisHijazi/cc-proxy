@@ -173,6 +173,25 @@ def test_metadata_mirrors_home_preferences_but_keeps_account_caches(
     assert data["oauthAccount"] == {"accountUuid": "account-b"}
 
 
+def test_folder_trusted_in_profile_survives_the_next_mirror(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"projects": {"/home": {"hasTrustDialogAccepted": True}, "/new": {"allowedTools": []}}})
+    )
+    metadata = tmp_path / "profile.json"
+    metadata.write_text(json.dumps({"projects": {"/new": {"hasTrustDialogAccepted": True}}}))
+    launcher["update_account_metadata"](metadata, {})
+    projects = json.loads(metadata.read_text())["projects"]
+    assert projects["/new"] == {"allowedTools": [], "hasTrustDialogAccepted": True}
+    assert projects["/home"]["hasTrustDialogAccepted"] is True
+
+
+def test_launcher_flags_stay_before_the_prompt_separator():
+    assert launcher["with_flags"](["--model", "x", "--", "-p looks like a flag"], "--chrome") == [
+        "--model", "x", "--chrome", "--", "-p looks like a flag"]
+    assert launcher["with_flags"](["hello"], "--chrome") == ["hello", "--chrome"]
+
+
 def test_via_placeholder_login_comes_from_the_proxy_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     seen = []
