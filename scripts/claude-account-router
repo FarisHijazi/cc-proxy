@@ -139,6 +139,11 @@ def update_account_metadata(path, source):
     data = {k: v for k, v in prefs.items() if not ACCOUNT_SCOPED.search(k)}
     data.update({k: v for k, v in own.items() if ACCOUNT_SCOPED.search(k)})
     data.pop("oauthAccount", None)
+    # A folder trusted inside this profile stays trusted after the next mirror.
+    projects = data.setdefault("projects", {})
+    for folder, entry in own.get("projects", {}).items():
+        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted"):
+            projects[folder] = {**entry, **projects.get(folder, {}), "hasTrustDialogAccepted": True}
     data.update(
         {
             k: source[k]
@@ -338,6 +343,12 @@ def snapshot_accounts(accounts, main, state, login):
     return manifest
 
 
+def with_flags(args, *flags):
+    """Add launcher flags before a `--` that ends Claude's options, never after it."""
+    end = args.index("--") if "--" in args else len(args)
+    return [*args[:end], *flags, *args[end:]]
+
+
 def aggregate_mcp(login, manifest, forwarded):
     """Add shared tools while retaining the main account's native Chrome UI."""
     main = manifest["accounts"].get(manifest["main"], {})
@@ -374,10 +385,8 @@ def aggregate_mcp(login, manifest, forwarded):
     write_private(config_path, json.dumps({"mcpServers": servers}))
     # Claude reserves claude-in-chrome for its built-in server. Keep that UI
     # on main; the additional server exposes cross-account browser tools.
-    args = list(forwarded)
-    if not {"--chrome", "--no-chrome"}.intersection(args):
-        args.append("--chrome")
-    return [*args, "--mcp-config", str(config_path)]
+    chrome = [] if {"--chrome", "--no-chrome"}.intersection(forwarded) else ["--chrome"]
+    return with_flags(forwarded, *chrome, "--mcp-config", str(config_path))
 
 
 def client_environment(state, port, secure_storage, proxy_url=None):
@@ -400,6 +409,11 @@ def client_environment(state, port, secure_storage, proxy_url=None):
     ):
         settings_env[name] = settings_env["HTTPS_PROXY"]
     settings_env["no_proxy"] = settings_env["NO_PROXY"]
+    # The proxy makes this a first-party session, so Remote Control's set_model
+    # (HQ's model picker) accepts only catalog models; this adds the Codex one.
+    settings_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = (
+        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-5.6-sol"
+    )
     # An API credential selects API-key auth even when a subscription is saved.
     # Empty strings in CLI settings also override project settings for this run.
     for key in (
@@ -477,6 +491,20 @@ def wait_listener(process, port, log_path, certificate=None, host="127.0.0.1"):
         time.sleep(0.05)
 
 
+def hq_remote_route(args, state):
+    """mitmdump arguments sending this proxy's native Remote Control sessions to HQ."""
+    return [
+        "--scripts",
+        str(Path(__file__).resolve().with_name("account_remote_route.py")),
+        "--set",
+        "hq_remote_origin=" + args.remote_control_backend,
+        "--set",
+        "hq_remote_key_file=" + str(args.remote_control_key_file.expanduser().resolve()),
+        "--set",
+        "hq_remote_sessions_file=" + str(state / "hq-remote-sessions.json"),
+    ]
+
+
 def serve(args, state):
     """Run the shared router and proxy for other machines; no local client."""
     if not (args.accounts_file and args.port):
@@ -502,6 +530,9 @@ def serve(args, state):
         "--set",
         f"proxy_accounts_file={args.accounts_file.expanduser().resolve()}",
     ]
+    # Every --via client's Remote Control registers through here, so HQ owns them all.
+    if args.remote_control_backend:
+        command += hq_remote_route(args, state)
     router_env = os.environ.copy()
     router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
     router_env["CCP_TRAFFIC_LOG"] = "0"
@@ -722,6 +753,8 @@ def main():
     if args.serve:
         return serve(args, state)
     if args.via:
+        if args.remote_control_backend:
+            raise ValueError("--remote-control-backend belongs on the --serve machine")
         return via(args, accounts, main_account, state, forwarded)
     # A shared CA is fine; each invocation has a separate listener and log.
     with socket.socket() as candidate:
@@ -780,17 +813,9 @@ def main():
         )
     share_user_config(state / "claude")
     if args.remote_control_backend:
-        command += [
-            "--scripts",
-            str(Path(__file__).resolve().with_name("account_remote_route.py")),
-            "--set",
-            "hq_remote_origin=" + args.remote_control_backend,
-            "--set",
-            "hq_remote_key_file="
-            + str(args.remote_control_key_file.expanduser().resolve()),
-        ]
+        command += hq_remote_route(args, state)
         if "--remote-control" not in forwarded:
-            forwarded.append("--remote-control")
+            forwarded = with_flags(forwarded, "--remote-control")
         print("Native Remote Control → " + args.remote_control_backend, file=sys.stderr)
     with (state / f"proxy-{port}.log").open("w") as log:
         proxy = subprocess.Popen(command, stdout=log, stderr=log)

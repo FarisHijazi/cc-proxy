@@ -5,6 +5,7 @@ redirect account sessions that were not registered through this proxy instance.
 """
 
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,6 +22,9 @@ class NativeRemoteRoute:
         )
         loader.add_option(
             "hq_remote_key_file", str, "", "Private HQ registration key file"
+        )
+        loader.add_option(
+            "hq_remote_sessions_file", str, "", "Private file keeping routed sessions across restarts"
         )
 
     def configure(self, updated):
@@ -46,6 +50,11 @@ class NativeRemoteRoute:
             self.key = Path(ctx.options.hq_remote_key_file).read_text().strip()
             if not 32 <= len(self.key) <= 1024 or not self.key.isascii():
                 raise ValueError()
+            # A shared --serve proxy outlives its clients: without this, a restart
+            # would send live sessions' HQ worker tokens to Anthropic.
+            self.store = ctx.options.hq_remote_sessions_file
+            if self.store and Path(self.store).exists():
+                self.sessions = json.loads(Path(self.store).read_text())
         except (OSError, ValueError):
             raise exceptions.OptionsError(
                 "Invalid HQ origin or registration key file"
@@ -118,7 +127,13 @@ class NativeRemoteRoute:
                 if isinstance(value, str) and value:
                     self.sessions[sid] = value
         except (ValueError, TypeError, KeyError):
-            pass  # Native CLI rejects an invalid handshake; no upstream fallback.
+            return  # Native CLI rejects an invalid handshake; no upstream fallback.
+        if getattr(self, "store", ""):
+            self.sessions = dict(list(self.sessions.items())[-1000:])
+            temporary = self.store + ".tmp"
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
+                json.dump(self.sessions, out)
+            os.replace(temporary, self.store)
 
 
 addons = [NativeRemoteRoute()]
