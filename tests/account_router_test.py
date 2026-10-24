@@ -761,3 +761,146 @@ def test_shared_profile_sets_aside_pre_share_copies(tmp_path, monkeypatch):
     assert json.loads((profile / "settings.json").read_text()) == {"shared": True}
     (aside,) = (tmp_path / "state").glob("pre-share-*")
     assert json.loads((aside / "settings.json").read_text()) == {"own": True}
+
+
+def test_caller_settings_merge_under_the_launcher(tmp_path):
+    hooks = tmp_path / "hooks.json"
+    hooks.write_text(
+        json.dumps({"hooks": {"SessionStart": []}, "env": {"HTTPS_PROXY": "http://other:1", "KEEP": "1"}})
+    )
+    rest, extra = launcher["take_settings"](
+        ["--resume", "x", "--settings", str(hooks), '--settings={"permissions": {}}']
+    )
+    assert rest == ["--resume", "x"]
+    _, serialized = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure", extra=extra)
+    settings = json.loads(serialized)
+    assert settings["hooks"] == {"SessionStart": []} and settings["permissions"] == {}
+    assert settings["env"]["HTTPS_PROXY"] == "http://127.0.0.1:19999"
+    assert settings["env"]["KEEP"] == "1" and settings["apiKeyHelper"] == ""
+    with pytest.raises(ValueError):
+        launcher["take_settings"](["--settings"])
+
+
+def test_placeholder_names_the_remote_control_owner(tmp_path):
+    seen = []
+
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request.get_header("Authorization"))
+            profile = {
+                "account": {"email": "user@example.com", "uuid": "account-a"},
+                "organization": {"uuid": "org-a", "organization_type": "claude_max"},
+            }
+            return __import__("io").BytesIO(json.dumps(profile).encode())
+
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    launcher["placeholder_login"]("work", Opener(), tmp_path / "config", secure, "personal")
+    oauth = json.loads((secure / ".credentials.json").read_text())["claudeAiOauth"]
+    assert oauth["accessToken"] == "proxy-account-work+rc=personal"
+    assert seen == ["Bearer proxy-account-work+rc=personal"]
+    (tmp_path / "secure2").mkdir()
+    launcher["placeholder_login"]("work", Opener(), tmp_path / "config2", tmp_path / "secure2", "work")
+    assert seen[-1] == "Bearer proxy-account-work"
+
+
+def test_folder_trusted_in_a_sibling_profile_is_trusted_here(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text(json.dumps({"projects": {}}))
+    accounts = tmp_path / "accounts"
+    mine = accounts / "work" / "claude" / ".claude.json"
+    other = accounts / "personal" / "claude" / ".claude.json"
+    for p in (mine, other):
+        p.parent.mkdir(parents=True)
+    other.write_text(json.dumps({"projects": {"/repo": {"hasTrustDialogAccepted": True}}}))
+    mine.write_text(json.dumps({"projects": {}}))
+    torn = accounts / "client-a" / "claude" / ".claude.json"
+    torn.parent.mkdir(parents=True)
+    torn.write_text('{"projects": {"/half')
+    launcher["update_account_metadata"](mine, {})
+    assert json.loads(mine.read_text())["projects"]["/repo"]["hasTrustDialogAccepted"] is True
+    # Outside the accounts layout there are no siblings, only unrelated state dirs.
+    lone = tmp_path / "state" / "claude" / ".claude.json"
+    lone.parent.mkdir(parents=True)
+    (tmp_path / "other" / "claude").mkdir(parents=True)
+    (tmp_path / "other" / "claude" / ".claude.json").write_text(
+        json.dumps({"projects": {"/elsewhere": {"hasTrustDialogAccepted": True}}})
+    )
+    launcher["update_account_metadata"](lone, {})
+    assert "/elsewhere" not in json.loads(lone.read_text())["projects"]
+
+
+def test_private_flag_is_never_inherited_by_the_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("TCC_PRIVATE", "1")
+    env, _ = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure")
+    assert "TCC_PRIVATE" not in env
+
+
+@pytest.mark.parametrize("flag,env", [(["--private-remote-control"], None), ([], "1")])
+def test_private_without_via_fails_closed(tmp_path, monkeypatch, flag, env):
+    monkeypatch.delenv("TCC_PRIVATE", raising=False)
+    if env:
+        monkeypatch.setenv("TCC_PRIVATE", env)
+    accounts = tmp_path / "accounts.json"
+    accounts.write_text(json.dumps({"main": "work", "accounts": {"work": 2}}))
+    key = tmp_path / "key"
+    key.write_text("k" * 32)
+    names = launcher["main"].__globals__
+    monkeypatch.setattr(
+        names["sys"],
+        "argv",
+        ["claude-account-router", "--accounts-file", str(accounts), "--state-dir", str(tmp_path / "state"),
+         "--remote-control-backend", "http://127.0.0.1:8389", "--remote-control-key-file", str(key),
+         *flag, "--", "--remote-control"],
+    )
+    with pytest.raises(SystemExit) as raised:
+        launcher["main"]()
+    assert raised.value.code == 2
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize(
+    "flag,env,private",
+    [
+        (["--private-remote-control"], None, True),
+        ([], "1", True),
+        ([], None, False),
+        ([], "0", False),
+        (["--no-private-remote-control"], "1", False),
+    ],
+)
+def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, flag, env, private):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text("{}")
+    if env:
+        monkeypatch.setenv("TCC_PRIVATE", env)
+    else:
+        monkeypatch.delenv("TCC_PRIVATE", raising=False)
+    seen, launched = [], []
+
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request.get_header("Authorization"))
+            profile = {
+                "account": {"email": "user@example.com", "uuid": "account-a"},
+                "organization": {"uuid": "org-a", "organization_type": "claude_max"},
+            }
+            return __import__("io").BytesIO(json.dumps(profile).encode())
+
+    names = launcher["main"].__globals__
+    monkeypatch.setitem(names, "share_user_config", lambda config: None)
+    monkeypatch.setitem(names, "certificate_bundle", lambda ca: b"")
+    monkeypatch.setitem(names, "ssl", __import__("types").SimpleNamespace(create_default_context=lambda **k: None))
+    monkeypatch.setattr(names["urllib"].request, "build_opener", lambda *a: Opener())
+    monkeypatch.setattr(names["subprocess"], "call", lambda command, env: launched.append(command) or 0)
+    accounts = tmp_path / "accounts.json"
+    accounts.write_text(json.dumps({"main": "work", "remote_control": "personal", "accounts": {"work": 2, "personal": 1}}))
+    monkeypatch.setattr(
+        names["sys"],
+        "argv",
+        ["claude-account-router", "--accounts-file", str(accounts), "--state-dir", str(tmp_path / "state"),
+         "--via", "http://127.0.0.1:18790", "--via-ca", str(tmp_path / "ca.pem"), *flag],
+    )
+    assert launcher["main"]() == 0 and launched
+    suffix = "+private" if private else ""
+    assert seen == [f"Bearer proxy-account-work+rc=personal{suffix}", "Bearer proxy-account-personal"]

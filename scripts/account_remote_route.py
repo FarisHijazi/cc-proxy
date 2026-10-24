@@ -2,6 +2,8 @@
 
 mitmproxy owns transport. Never send Anthropic credentials to HQ, and never
 redirect account sessions that were not registered through this proxy instance.
+HQ's own upstream mirror marks its requests `x-hq-mirror: 1`; they go to
+Anthropic, or the mirror's registration would loop back into HQ.
 """
 
 import json
@@ -62,8 +64,10 @@ class NativeRemoteRoute:
 
     def requestheaders(self, flow):
         req = flow.request
+        mirror = req.headers.pop("x-hq-mirror", None) == "1"
         if (
-            req.scheme == "https"
+            not mirror
+            and req.scheme == "https"
             and req.host == "api.anthropic.com"
             and req.port == 443
         ):
@@ -94,8 +98,11 @@ class NativeRemoteRoute:
         worker = sid and "/worker" in plain
         supplied = flow.request.headers.get("authorization", "")
         expected = self.sessions.get(sid)
-        for header in ("authorization", "x-api-key", "cookie", "x-hq-native-key"):
+        for header in ("authorization", "x-api-key", "cookie", "x-hq-native-key", "x-hq-private"):
             flow.request.headers.pop(header, None)
+        # account_inject saw `+private` on the placeholder: HQ must not mirror it.
+        if create and flow.metadata.get("account_private"):
+            flow.request.headers["x-hq-private"] = "1"
         if worker:
             if not expected or supplied != "Bearer " + expected:
                 flow.response = http.Response.make(
