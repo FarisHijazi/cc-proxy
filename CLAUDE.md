@@ -167,7 +167,17 @@ Self-hosted native Remote Control is an optional launcher route to HQ. `--serve`
 routed-session map persists in the proxy state dir. The launcher sets
 `ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-5.6-sol`) because a proxied session counts as
 first-party and Remote Control `set_model` otherwise rejects non-catalog ids. Folder trust
-accepted inside a profile survives re-mirroring. Record: HQ repo
+accepted in any account profile carries to every sibling profile. Record: HQ repo
 `docs/devlog/claude_20261023-native-ui-and-rc-protocol.md`. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.
 Read `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).
+
+The placeholder bearer is `proxy-account-<alias>[+rc=<owner>][+private]`, parsed only by
+`account_inject.parse`. `+rc=` puts Remote Control on another login so one claude.ai sees every
+account; `+private` (`--private-remote-control` / `TCC_PRIVATE=1`) makes the route addon mark the
+HQ registration `x-hq-private: 1` so HQ never mirrors it to claude.ai. It fails closed: the
+launcher refuses it without `--via`, and `account_inject` never puts a token on a private
+`/v1/code/sessions*` request, so with no route addon Anthropic refuses it. HQ's own mirror sends
+`x-hq-mirror: 1`; the route addon strips it and lets the request reach Anthropic (else it loops
+into HQ). A caller's `--settings` merges under the launcher's. Read
+`docs/devlog/claude_20261023-rc-owner-private-mirror.md` on demand (plain path).

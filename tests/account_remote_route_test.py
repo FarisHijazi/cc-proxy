@@ -135,3 +135,61 @@ def test_restarted_proxy_keeps_routing_known_sessions(tmp_path):
         after.request(worker)
     assert worker.request.url == "http://127.0.0.1:9000/v1/code/sessions/cse_toy/worker/events"
     assert worker.request.headers["authorization"] == "Bearer worker-secret"
+
+
+inject_spec = importlib.util.spec_from_file_location(
+    "account_inject", Path(__file__).parents[1] / "scripts/account_inject.py"
+)
+inject_module = importlib.util.module_from_spec(inject_spec)
+inject_spec.loader.exec_module(inject_module)
+
+
+def served(route, monkeypatch, placeholder, path="/v1/code/sessions", payload=None, headers=()):
+    """One request through the --serve proxy's addon chain, inject loaded first."""
+    monkeypatch.setattr(inject_module, "slot_token", lambda slot: (f"real-{slot}", 4102444800000))
+    inject = inject_module.AccountInject()
+    inject.accounts = {"personal": "1", "work": "2"}
+    value = tflow.tflow()
+    value.request = http.Request.make(
+        "POST",
+        "https://api.anthropic.com" + path,
+        json.dumps({"bridge": {}, "title": "Toy"} if payload is None else payload).encode(),
+        {"Authorization": "Bearer proxy-account-" + placeholder, **dict(headers)},
+    )
+    inject.requestheaders(value)
+    route.requestheaders(value)
+    route.request(value)
+    return value
+
+
+def test_private_registration_is_marked_for_hq(route, monkeypatch):
+    for placeholder in ("work+rc=personal+private", "work+private"):
+        value = served(route, monkeypatch, placeholder)
+        assert value.request.url == route.origin + "/v1/code/sessions"
+        assert value.request.headers["x-hq-private"] == "1"
+        assert "authorization" not in value.request.headers
+    value = served(route, monkeypatch, "work+rc=personal")
+    assert "x-hq-private" not in value.request.headers
+    forged = served(route, monkeypatch, "work", headers={"x-hq-private": "1"})
+    assert "x-hq-private" not in forged.request.headers
+
+
+def test_private_session_the_route_does_not_claim_reaches_anthropic_without_a_token(route, monkeypatch):
+    for payload in ({"title": "Toy"}, {"bridge": {}}):
+        value = served(route, monkeypatch, "work+rc=personal+private", payload=payload)
+        claimed = value.request.url.startswith(route.origin)
+        assert claimed == ("bridge" in payload)
+        assert "authorization" not in value.request.headers
+
+
+def test_mirror_requests_reach_anthropic_with_the_injected_token(route, monkeypatch):
+    route.sessions["cse_hq"] = "worker-secret"
+    for path in ("/v1/code/sessions", "/v1/code/sessions/cse_hq/bridge"):
+        value = served(route, monkeypatch, "personal", path, headers={"x-hq-mirror": "1"})
+        assert value.request.url == "https://api.anthropic.com" + path
+        assert value.request.headers["authorization"] == "Bearer real-1"
+        assert not {"x-hq-mirror", "x-hq-native-key"} & set(value.request.headers)
+        assert "hq_remote" not in value.metadata
+    routed = served(route, monkeypatch, "personal", headers={"x-hq-mirror": "0"})
+    assert routed.request.url == route.origin + "/v1/code/sessions"
+    assert "x-hq-mirror" not in routed.request.headers

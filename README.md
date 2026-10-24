@@ -269,6 +269,9 @@ credentials are stripped before forwarding to HQ. These sessions are controlled
 in HQ; Claude's hardcoded claude.ai session link is not a usable link to them.
 The launcher enables `--remote-control` and keeps login storage isolated.
 Plain HTTP is allowed only on loopback; use HTTPS or an SSH tunnel remotely.
+With `--via`, `--private-remote-control` (or `TCC_PRIVATE=1`) tells HQ to keep the
+session to itself and not mirror it to claude.ai. Without `--via` it is an error, and
+`--no-private-remote-control` overrides the variable.
 See [implementation and validation](docs/devlog/claude_20261018-hq-native-remote.md).
 
 ### Putting the router's models in the `/model` picker

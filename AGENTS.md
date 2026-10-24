@@ -47,5 +47,7 @@
   Remote Control sessions to HQ. Track session ownership inside that proxy;
   never route unknown session IDs or leak Anthropic credentials to HQ. Launch
   authentication and generated worker tokens are separate. Keep worker SSE
-  streaming and only buffer registration/bridge responses. Read
+  streaming and only buffer registration/bridge responses. `x-hq-mirror: 1`
+  (HQ's own upstream mirror) bypasses the redirect; `x-hq-private` comes only
+  from the placeholder's `+private`. Read
   `docs/devlog/claude_20261018-hq-native-remote.md` on demand (plain path).

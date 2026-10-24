@@ -13,6 +13,8 @@ from pathlib import Path
 from mitmproxy import ctx, exceptions, http
 
 PREFIX = "Bearer proxy-account-"
+REMOTE_CONTROL_PATH = "/v1/code/"
+SESSIONS_PATH = "/v1/code/sessions"
 # Refresh a little early so a token never expires mid-request.
 MARGIN_MS = 5 * 60 * 1000
 
@@ -42,6 +44,18 @@ def slot_token(slot):
     return token["accessToken"], token["expiresAt"]
 
 
+def parse(placeholder):
+    """`proxy-account-<alias>[+rc=<owner>][+private]`, suffixes in any order.
+
+    `+rc=` names the alias that owns Remote Control, so one phone login sees every
+    account's sessions; `+private` keeps the session off that login (HQ only)."""
+    alias, *suffixes = placeholder.removeprefix("proxy-account-").split("+")
+    owners = [s.removeprefix("rc=") for s in suffixes if s.startswith("rc=")]
+    if len(owners) > 1 or any(s != "private" and not s.startswith("rc=") for s in suffixes):
+        raise ValueError(f"malformed account placeholder {placeholder!r}")
+    return alias, (owners or [None])[0], "private" in suffixes
+
+
 class AccountInject:
     def __init__(self):
         self.accounts = {}
@@ -68,8 +82,10 @@ class AccountInject:
         self.cache[alias] = slot_token(self.accounts[alias])
         return self.cache[alias][0]
 
-    def resolve(self, placeholder):
-        alias = placeholder.removeprefix(PREFIX.removeprefix("Bearer "))
+    def resolve(self, placeholder, path=""):
+        alias, owner, _ = parse(placeholder)
+        if owner and path.startswith(REMOTE_CONTROL_PATH):
+            alias = owner
         if alias not in self.accounts:
             raise ValueError(f"unknown account alias {alias!r}")
         return self.token(alias)
@@ -95,10 +111,18 @@ class AccountInject:
         supplied = flow.request.headers.get("authorization", "")
         if not supplied.startswith(PREFIX):
             return
+        placeholder = supplied.removeprefix("Bearer ")
         try:
-            flow.request.headers["authorization"] = "Bearer " + self.resolve(
-                supplied.removeprefix("Bearer ")
-            )
+            token = self.resolve(placeholder, flow.request.path)
+            private = parse(placeholder)[2]
+            # account_remote_route reads this after the placeholder is gone.
+            flow.metadata["account_private"] = private
+            if private and flow.request.path.startswith(SESSIONS_PATH):
+                # HQ's route never needs this token; without the route, Anthropic
+                # must refuse the session rather than show it on claude.ai.
+                del flow.request.headers["authorization"]
+                return
+            flow.request.headers["authorization"] = "Bearer " + token
         except Exception as error:
             # Never forward a placeholder upstream.
             flow.response = http.Response.make(

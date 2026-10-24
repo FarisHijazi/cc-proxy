@@ -139,11 +139,21 @@ def update_account_metadata(path, source):
     data = {k: v for k, v in prefs.items() if not ACCOUNT_SCOPED.search(k)}
     data.update({k: v for k, v in own.items() if ACCOUNT_SCOPED.search(k)})
     data.pop("oauthAccount", None)
-    # A folder trusted inside this profile stays trusted after the next mirror.
+    # A folder trusted inside this profile, or in any sibling account profile, stays
+    # trusted: the trust dialog is answered once per repo, not once per account.
     projects = data.setdefault("projects", {})
-    for folder, entry in own.get("projects", {}).items():
-        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted"):
-            projects[folder] = {**entry, **projects.get(folder, {}), "hasTrustDialogAccepted": True}
+    profiles = [own]
+    accounts_root = path.parents[2]  # <state>/accounts/<alias>/claude/.claude.json
+    if accounts_root.name == "accounts":
+        for sibling in accounts_root.glob("*/claude/.claude.json"):
+            try:
+                profiles.append(json.loads(sibling.read_text()) if sibling != path else {})
+            except (OSError, ValueError):
+                continue  # another account's live CLI may be mid-write
+    for profile in profiles:
+        for folder, entry in profile.get("projects", {}).items():
+            if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted"):
+                projects[folder] = {**entry, **projects.get(folder, {}), "hasTrustDialogAccepted": True}
     data.update(
         {
             k: source[k]
@@ -389,8 +399,35 @@ def aggregate_mcp(login, manifest, forwarded):
     return with_flags(forwarded, *chrome, "--mcp-config", str(config_path))
 
 
-def client_environment(state, port, secure_storage, proxy_url=None):
+def take_settings(forwarded):
+    """Split a caller's --settings (file or JSON) out of the claude arguments.
+
+    The launcher owns the settings flag; a caller's hooks or permissions are merged
+    under it, and the launcher's env wins on conflict."""
+    rest, extra = [], {}
+    args = iter(forwarded)
+    for arg in args:
+        if arg == "--settings":
+            value = next(args, None)
+        elif arg.startswith("--settings="):
+            value = arg.partition("=")[2]
+        else:
+            rest.append(arg)
+            continue
+        if value is None:
+            raise ValueError("--settings needs a file or a JSON object")
+        text = value if value.lstrip().startswith("{") else Path(value).expanduser().read_text()
+        loaded = json.loads(text)
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("env", {}), dict):
+            raise ValueError("--settings must be a JSON object")
+        extra = {**extra, **loaded, "env": {**extra.get("env", {}), **loaded.get("env", {})}}
+    return rest, extra
+
+
+def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
     env = os.environ.copy()
+    # Privacy is per launch: a tcc started from this session's shell must not inherit it.
+    env.pop("TCC_PRIVATE", None)
     proxy_url = proxy_url or f"http://127.0.0.1:{port}"
     settings_env = {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
@@ -454,9 +491,10 @@ def client_environment(state, port, secure_storage, proxy_url=None):
     env["CLAUDE_CONFIG_DIR"] = str(state / "claude")
     # Keep secure storage isolated too, including when the parent pinned it.
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(secure_storage)
-    return env, json.dumps(
-        {"env": settings_env, "apiKeyHelper": ""}
-    )
+    settings = dict(extra or {})
+    settings["env"] = {**settings.get("env", {}), **settings_env}
+    settings["apiKeyHelper"] = ""
+    return env, json.dumps(settings)
 
 
 def certificate_bundle(ca):
@@ -570,9 +608,17 @@ CLAUDE_AI_SCOPES = [
 ]
 
 
-def placeholder_login(alias, opener, config, secure):
-    """Write a login whose token the --serve proxy swaps for the real one."""
+def placeholder_login(alias, opener, config, secure, remote_control=None, private=False):
+    """Write a login whose token the --serve proxy swaps for the real one.
+
+    `remote_control` names another alias whose token the proxy uses on /v1/code/
+    (Remote Control) only, so that login's claude.ai and phone app see the session.
+    `private` tells HQ never to mirror this session to claude.ai."""
     token = f"proxy-account-{alias}"
+    if remote_control and remote_control != alias:
+        token += f"+rc={remote_control}"
+    if private:
+        token += "+private"
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/profile",
         headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
@@ -604,7 +650,7 @@ def placeholder_login(alias, opener, config, secure):
     )
 
 
-def via(args, accounts, main_account, state, forwarded):
+def via(args, accounts, main_account, state, forwarded, extra_settings=None):
     """Run claude against a --serve proxy; this machine holds placeholder logins only."""
     if not (args.via_ca and accounts):
         raise ValueError("--via needs --via-ca and an account map")
@@ -623,7 +669,12 @@ def via(args, accounts, main_account, state, forwarded):
             secure = login / alias / "secure"
             secure.mkdir(mode=0o700, parents=True)
             try:
-                placeholder_login(alias, opener, config, secure)
+                main = alias == main_account
+                placeholder_login(
+                    alias, opener, config, secure,
+                    args.remote_control_account if main else None,
+                    main and args.private_remote_control,
+                )
             except (OSError, ValueError, KeyError) as error:
                 if alias == main_account:
                     raise ValueError(f"{alias} via {args.via}: {error}") from None
@@ -635,7 +686,11 @@ def via(args, accounts, main_account, state, forwarded):
         share_user_config(state / "claude")
         (state / "client-ca.pem").write_bytes(certificate_bundle(args.via_ca))
         env, settings = client_environment(
-            state, origin.port, Path(manifest["accounts"][main_account]["secure_storage_dir"]), args.via
+            state,
+            origin.port,
+            Path(manifest["accounts"][main_account]["secure_storage_dir"]),
+            args.via,
+            extra_settings,
         )
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
@@ -685,7 +740,19 @@ def main():
     )
     parser.add_argument(
         "--main-account",
-        help="alias owning Remote Control and default account features",
+        help="alias running inference and default account features",
+    )
+    parser.add_argument(
+        "--remote-control-account",
+        help="alias that owns Remote Control for this session, so one claude.ai login sees "
+        "every account's sessions (--via only; default: the accounts file's remote_control, else main)",
+    )
+    parser.add_argument(
+        "--private-remote-control",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TCC_PRIVATE") == "1",
+        help="keep this session on HQ only; HQ never mirrors it to claude.ai "
+        "(--via only; also TCC_PRIVATE=1)",
     )
     parser.add_argument(
         "--chrome-account",
@@ -712,6 +779,9 @@ def main():
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
+    if args.private_remote_control and not args.via:
+        # Only the --serve proxy's placeholder carries +private; failing open would mirror it.
+        parser.error("--private-remote-control (or TCC_PRIVATE=1) needs --via")
     if bool(args.remote_control_backend) != bool(args.remote_control_key_file):
         parser.error(
             "--remote-control-backend and --remote-control-key-file are required together"
@@ -719,6 +789,10 @@ def main():
     accounts, main_account = account_selection(
         args.account, args.accounts_file, args.main_account
     )
+    if not args.remote_control_account and args.accounts_file:
+        args.remote_control_account = json.loads(args.accounts_file.read_text()).get("remote_control")
+    if args.remote_control_account and args.remote_control_account not in accounts:
+        parser.error("--remote-control-account must name a configured account alias")
     if args.chrome_account and args.chrome_account not in accounts:
         parser.error("--chrome-account must name a configured account alias")
     if accounts and (args.cswap_account is not None or args.login_from is not None):
@@ -738,10 +812,10 @@ def main():
     forwarded = (
         args.claude_args[1:] if args.claude_args[:1] == ["--"] else args.claude_args
     )
-    if any(a == "--settings" or a.startswith("--settings=") for a in forwarded):
-        parser.error(
-            "--settings is managed by this launcher; use an isolated settings.json instead"
-        )
+    try:
+        forwarded, extra_settings = take_settings(forwarded)
+    except (OSError, ValueError) as error:
+        parser.error(f"--settings: {error}")
     if forwarded[:1] == ["remote-control"]:
         parser.error(
             "use -- --remote-control for an interactive session; server mode cannot carry CLI settings"
@@ -755,7 +829,7 @@ def main():
     if args.via:
         if args.remote_control_backend:
             raise ValueError("--remote-control-backend belongs on the --serve machine")
-        return via(args, accounts, main_account, state, forwarded)
+        return via(args, accounts, main_account, state, forwarded, extra_settings)
     # A shared CA is fine; each invocation has a separate listener and log.
     with socket.socket() as candidate:
         candidate.bind(("127.0.0.1", args.port))
@@ -849,7 +923,7 @@ def main():
             ca = state / "ca/mitmproxy-ca-cert.pem"
             wait_listener(proxy, port, log.name, ca)
             (state / "client-ca.pem").write_bytes(certificate_bundle(ca))
-            env, settings = client_environment(state, port, main_secure)
+            env, settings = client_environment(state, port, main_secure, extra=extra_settings)
             print(
                 f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; config: {state / 'claude'} (shares ~/.claude)",
                 file=sys.stderr,
