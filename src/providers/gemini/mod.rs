@@ -535,11 +535,7 @@ const PROBE_TIMEOUT_MS: u64 = 400;
 
 /// Host and port from a base URL, defaulting the port by scheme.
 fn host_and_port(base_url: &str) -> Option<(String, u16)> {
-    let rest = base_url
-        .split_once("://")
-        .map(|(scheme, rest)| (scheme, rest))
-        .unwrap_or(("http", base_url));
-    let (scheme, rest) = rest;
+    let (scheme, rest) = base_url.split_once("://").unwrap_or(("http", base_url));
     let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority
         .rsplit_once('@')

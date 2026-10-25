@@ -668,7 +668,7 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"model":"gpt-5.6-luna[1m]","messages":[{"role":"user","content":"hello"}]}"#,
+                    r#"{"model":"gpt-6.1-sol[1m]","messages":[{"role":"user","content":"hello"}]}"#,
                 ))
                 .unwrap(),
         )

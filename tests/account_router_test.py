@@ -108,6 +108,7 @@ def test_keychain_precedes_plaintext(tmp_path, monkeypatch):
 
 
 def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_MODEL_OPTION", raising=False)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://old-router:1")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "toy-gateway")
     monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/do-not-write")
@@ -126,13 +127,30 @@ def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
     assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"]
     assert env["REQUESTS_CA_BUNDLE"] == env["SSL_CERT_FILE"]
     assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(tmp_path / "secure")
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "gpt-6.1-sol[1m]"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1000000"
     assert settings["env"]["ANTHROPIC_BASE_URL"] == env["ANTHROPIC_BASE_URL"]
+    assert settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] == env["ANTHROPIC_CUSTOM_MODEL_OPTION"]
+    assert settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1000000"
     assert "disableAllHooks" not in settings
     assert "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" not in env
     assert "CLAUDE_CODE_HOST_CREDS_FILE" not in env
     assert "CLAUDE_CODE_ACCOUNT_UUID" not in env
     assert "CLAUDE_CODE_SESSION_ACCESS_TOKEN" not in env
     assert "SESSION_INGRESS_URL" not in env
+
+
+def test_client_keeps_custom_model_override_but_owns_context_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_MODEL_OPTION", "gpt-6-astra[1m]")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000")
+    env, serialized = launcher["client_environment"](
+        tmp_path, 19999, tmp_path / "secure"
+    )
+    settings = json.loads(serialized)
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "gpt-6-astra[1m]"
+    assert settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "gpt-6-astra[1m]"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1000000"
+    assert settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1000000"
 
 
 def test_metadata_refreshes_when_source_account_changes(tmp_path):
@@ -903,4 +921,55 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
     )
     assert launcher["main"]() == 0 and launched
     suffix = "+private" if private else ""
-    assert seen == [f"Bearer proxy-account-work+rc=personal{suffix}", "Bearer proxy-account-personal"]
+    assert seen == [f"Bearer proxy-account-work+rc=personal{suffix}+chromes", "Bearer proxy-account-personal"]
+
+
+@pytest.mark.parametrize("selected", [None, "personal", "work"])
+def test_via_native_chrome_is_opted_in_without_broadening_mcp_children(tmp_path, monkeypatch, selected):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude.json").write_text("{}")
+    names = launcher["main"].__globals__
+    captured = {}
+
+    class Opener:
+        def open(self, request, timeout):
+            return __import__("io").BytesIO(json.dumps({
+                "account": {"email": "user@example.com", "uuid": "account-a"},
+                "organization": {"uuid": "org-a", "organization_type": "claude_max"},
+            }).encode())
+
+    def launch(command, env):
+        credential = Path(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / ".credentials.json"
+        captured["main"] = json.loads(credential.read_text())["claudeAiOauth"]["accessToken"]
+        mcp_path = Path(command[command.index("--mcp-config") + 1])
+        servers = json.loads(mcp_path.read_text())["mcpServers"]
+        captured["servers"] = set(servers)
+        args = servers["account-artifacts"]["args"]
+        manifest = json.loads(Path(args[args.index("--manifest") + 1]).read_text())
+        captured["children"] = {}
+        for alias, entry in manifest["accounts"].items():
+            path = Path(entry["secure_storage_dir"]) / ".credentials.json"
+            oauth = json.loads(path.read_text())["claudeAiOauth"]
+            captured["children"][alias] = oauth["accessToken"]
+            assert "refreshToken" not in oauth and path.stat().st_mode & 0o777 == 0o600
+        return 0
+
+    monkeypatch.setitem(names, "share_user_config", lambda config: None)
+    monkeypatch.setitem(names, "certificate_bundle", lambda ca: b"")
+    monkeypatch.setitem(names, "ssl", __import__("types").SimpleNamespace(create_default_context=lambda **kwargs: None))
+    monkeypatch.setattr(names["urllib"].request, "build_opener", lambda *args: Opener())
+    monkeypatch.setattr(names["subprocess"], "call", launch)
+    accounts = tmp_path / "accounts.json"
+    accounts.write_text(json.dumps({"main": "work", "remote_control": "personal", "accounts": {"work": 2, "personal": 1}}))
+    selection = ["--chrome-account", selected] if selected is not None else []
+    monkeypatch.setattr(names["sys"], "argv", [
+        "claude-account-router", "--accounts-file", str(accounts), "--state-dir", str(tmp_path / "state"),
+        "--via", "http://127.0.0.1:18790", "--via-ca", str(tmp_path / "ca.pem"), *selection,
+    ])
+    assert launcher["main"]() == 0
+    suffix = "+chromes" if selected is None else f"+chrome={selected}"
+    assert captured["main"] == "proxy-account-work+rc=personal" + suffix
+    assert captured["children"] == {
+        "work": "proxy-account-work+chrome=work", "personal": "proxy-account-personal+chrome=personal",
+    }
+    assert captured["servers"] == ({"account-chrome", "account-artifacts"} if selected is None else {"account-artifacts"})

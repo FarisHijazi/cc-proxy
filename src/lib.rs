@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod fallback;
 pub mod inbound_auth;
 pub mod logging;
 pub mod monitor;

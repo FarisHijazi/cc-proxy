@@ -16,7 +16,28 @@ pub fn should_retry_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+tokio::task_local! {
+    static FAIL_FAST: bool;
+}
+
+/// Run `future` with provider retries disabled when `enabled`: the quota fallback
+/// (`crate::fallback`) has another backend to try, so waiting out a backoff here
+/// would only stall the request it is about to reroute.
+pub async fn fail_fast<F: std::future::Future>(enabled: bool, future: F) -> F::Output {
+    FAIL_FAST.scope(enabled, future).await
+}
+
+pub(crate) fn fail_fast_enabled() -> bool {
+    FAIL_FAST.try_with(|enabled| *enabled).unwrap_or(false)
+}
+
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
+    if fail_fast_enabled() {
+        return BackoffOutcome {
+            wait_ms: 0,
+            exceeds_budget: true,
+        };
+    }
     if let Some(raw) = retry_after
         && let Ok(raw_secs) = raw.parse::<f64>()
     {

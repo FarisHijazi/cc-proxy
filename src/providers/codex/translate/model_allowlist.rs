@@ -14,7 +14,21 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
 ];
+
+pub fn selectable_models() -> Vec<String> {
+    let mut models = Vec::with_capacity(ALLOWED_MODELS.len() * 2);
+    for model in ALLOWED_MODELS {
+        models.push((*model).to_string());
+        models.push(format!("{model}-fast"));
+    }
+    models.sort_unstable();
+    models
+}
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-5.6-luna"),
@@ -197,17 +211,32 @@ mod tests {
 
     #[test]
     fn fast_suffix_adds_priority() {
-        let r = resolve_model_request("gpt-5.6-sol-fast");
-        assert_eq!(r.model, "gpt-5.6-sol");
+        let r = resolve_model_request("gpt-6.1-sol-fast");
+        assert_eq!(r.model, "gpt-6.1-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
     }
 
     #[test]
+    fn new_gpt_6_models_use_the_full_responses_lane() {
+        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(!uses_responses_lite(model), "{model}");
+        }
+    }
+
+    #[test]
     fn allowed_models_accept_base() {
-        assert!(assert_allowed_model("gpt-5.4").is_ok());
-        assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
-        assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
-        assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
+        for model in [
+            "gpt-5.4",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
+            assert!(assert_allowed_model(model).is_ok(), "{model}");
+        }
     }
 
     #[test]

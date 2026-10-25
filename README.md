@@ -14,8 +14,8 @@ the model name:
 
 - Ask for a **Claude** model and it uses your **Claude subscription** (the login
   Claude Code already has). Nothing is translated and no API key is needed.
-- Ask for a **`gpt-5.6-*`** model and it uses your **ChatGPT subscription**
-  through the Codex login.
+- Ask for a **Codex model** such as **`gpt-6.1-sol`** and it uses your
+  **ChatGPT subscription** through the Codex login.
 
 So you can keep Opus on your Claude plan for hard work and run the fast slot on
 your ChatGPT plan, in the same session, and flip between them whenever you want.
@@ -75,7 +75,7 @@ claude-codex serve
 Claude Code now discovers the models exposed by the router. Switch directly:
 
 ```text
-/model gpt-5.6-sol[1m]
+/model gpt-6.1-sol[1m]
 /model claude-opus-5
 ```
 
@@ -84,14 +84,78 @@ the suffix before sending the model name to Codex.
 
 ## Switching models
 
-- **Inside Claude Code.** Run `/model gpt-5.6-sol[1m]` for Codex or
+- **Inside Claude Code.** Run `/model gpt-6.1-sol[1m]` for Codex or
   `/model claude-opus-5` for Claude.
 - **For one new session.** Set `ANTHROPIC_MODEL` when launching Claude Code.
 - **List what is available.** `claude-codex models`.
 
+The Codex catalog includes `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, and
+`gpt-6-luna`, plus the existing model IDs. Each has a `-fast` alias for Priority
+service tier. Upstream account access still determines whether a request succeeds.
+
+Sessions launched with `scripts/claude-account-router` default custom models to a
+1,000,000-token context window, so `/model gpt-6.1-sol` needs no `[1m]` suffix.
+This is a client setting, not a separate upstream model. Existing sessions keep
+their launch environment; use `[1m]` there or start a new launcher process.
+The launcher's default custom picker option is `gpt-6.1-sol[1m]`.
+
 Reasoning is carried across a switch. When you move a conversation from one plan
 to the other, the earlier turn's thinking is kept and shown to the next model as
 plain tagged text, so context is not lost.
+
+## Usage and account selection
+
+Native `/usage` uses the same account as Claude inference, selected by
+`--main-account` or the accounts file's `main`. It does not follow
+`--remote-control-account`. To keep phone control on one account while using
+another subscription for inference, configure the existing split explicitly:
+
+```json
+{
+  "main": "inference",
+  "remote_control": "controller",
+  "accounts": { "inference": 1, "controller": 2 }
+}
+```
+
+`/usage` shows the inference account's actual limits, not an average across
+accounts or another provider's remaining quota.
+
+### Automatic quota fallback (`--serve` / `--via`)
+
+When a request gets a 429 for quota, or a Claude account rejects its credential
+with 401, the shared proxy tries the next option before any output reaches Claude
+Code. Running sessions keep working without a relaunch or `cswap switch`.
+Credential storage and refresh still use `claude-swap`; request selection does not.
+An empty Claude account pool does not block Codex or Cursor inference:
+
+| Requested | Tries, in order |
+| --- | --- |
+| A Claude model | each Claude account in the accounts file, then the Codex model of the same tier, then Cursor |
+| A Codex model | Codex, then the Claude model of the same tier on each account, then Cursor |
+
+The accounts file can choose which account a session starts on. The proxy
+reloads it on the next request:
+
+```json
+"balance": {"strategy": "prefer", "prefer": "personal"}
+```
+
+`session` (the default) starts on the session's own account. `prefer` starts every
+session on one main account. `round-robin` and `least-sessions` spread new
+sessions. Every strategy keeps a session on its account; individual requests
+are never rotated, because prompt caches are per account.
+
+| Tier | Claude | Codex | Cursor |
+| --- | --- | --- | --- |
+| Opus | `claude-opus-5-5` | `gpt-6.1-sol` | `cursor:claude-opus-5` |
+| Fable | `claude-fable-5-1` | `gpt-6-astra` | `cursor:claude-fable-5` |
+| Sonnet, Haiku | `claude-sonnet-5-5` | `gpt-6-luna` | `cursor:claude-sonnet-5` |
+
+The session's own account is tried first, then the rest in accounts-file order.
+An exhausted account is skipped until the reset time Anthropic reports. Adding an
+alias to the accounts file takes effect on the next request. Cursor uses the
+`cursor-agent` login on the proxy host.
 
 ## How it works
 

@@ -1416,7 +1416,8 @@ async fn dispatch_request(
     let req_id = Uuid::new_v4().to_string();
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    let account_pool = crate::fallback::take_pool(&mut headers);
     let conversation_identity = (!count_tokens)
         .then(|| ConversationIdentity::from_headers(&headers))
         .flatten();
@@ -1682,22 +1683,7 @@ async fn dispatch_request(
             .and_then(|thread| thread.get("type"))
             == Some(&json!("continue"))
     {
-        // Claude Code recognizes this capability refusal and resends the entire
-        // conversation, then stops threading this model for the session. Accepting
-        // the delta would lose the task and produce orphan function outputs.
-        return (
-            StatusCode::BAD_REQUEST,
-            [("x-should-retry", "false")],
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "thread: this upstream does not keep thread state; resend the conversation",
-                    "details": {"error_code": "thread_unsupported_request"}
-                }
-            })),
-        )
-            .into_response();
+        return thread_unsupported_response();
     }
 
     if let Some(route) = auto_review_route.as_ref() {
@@ -1790,8 +1776,23 @@ async fn dispatch_request(
         }),
     };
 
+    let fallback_pool = account_pool.filter(|_| {
+        auto_review_route.is_none() && crate::fallback::handles(provider.name(), &normalized_model)
+    });
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
+    } else if let Some(pool) = fallback_pool {
+        crate::fallback::dispatch(
+            &state.registry,
+            provider.clone(),
+            body,
+            context,
+            conversation_identity,
+            pool,
+            &log,
+            thread_unsupported_response,
+        )
+        .await
     } else {
         provider
             .handle_messages_with_conversation_identity(
@@ -1849,6 +1850,25 @@ async fn dispatch_request(
         );
     }
     response
+}
+
+/// Claude Code recognizes this capability refusal and resends the entire
+/// conversation, then stops threading this model for the session. Accepting
+/// the delta would lose the task and produce orphan function outputs.
+fn thread_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [("x-should-retry", "false")],
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "thread: this upstream does not keep thread state; resend the conversation",
+                "details": {"error_code": "thread_unsupported_request"}
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
@@ -2187,14 +2207,12 @@ async fn fallback_handler(State(state): State<Arc<AppState>>, req: Request<Body>
     // Disabled local OpenAI surfaces must not accidentally forward user payloads
     // to Anthropic. Every other unclaimed path belongs to the account relay,
     // including new vendor endpoints that this version doesn't know about yet.
+    let path = req.uri().path();
     if matches!(
-        req.uri().path(),
-        "/v1/responses"
-            | "/v1/chat/completions"
-            | "/v1/images/generations"
-            | "/v1/images/edits"
-            | "/v1/audio/transcriptions"
-    ) {
+        path,
+        "/v1/responses" | "/v1/chat/completions" | "/v1/audio/transcriptions"
+    ) || path.starts_with("/v1/images/")
+    {
         return json_error(
             StatusCode::NOT_FOUND,
             "not_found",

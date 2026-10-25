@@ -145,6 +145,30 @@ of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
+Native `/usage` follows `--main-account`, just like Claude inference; `+rc=` changes
+only Remote Control endpoints. A GPT model does not move Claude subagents to a
+different Claude account. Select a main account with remaining quota and a separate
+RC owner rather than rewriting usage percentages. Live TUI and regression evidence is in
+`docs/devlog/claude_20261024-usage-account-routing.md` (plain path).
+
+Quota fallback: `account_inject` (the credential owner) attaches every usable login,
+session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages`;
+`src/fallback.rs` (the routing owner) strips it and walks the tier chain on 429,
+plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
+still reaches other vendors. The explicit primary-account marker prevents a filtered
+pool from handing thread ownership to a backup; cooldowns belong to each Registry.
+Claude model: accounts, then Codex, then Cursor. Codex model: Codex, then Claude
+accounts, then Cursor. Never relay the pool header upstream, never retry after
+output, and never send a thread delta to another account (refuse so Claude Code
+resends history). Attempts with a fallback after them run inside
+`retry::fail_fast`, including its explicit capture into the spawned HTTP SSE reader,
+or Codex's own 429 backoff stalls the chain for minutes. No `cswap switch` is needed;
+cswap remains the credential owner rather than the request selector. The accounts
+file's `balance` (`session` | `prefer` + `prefer` alias | `round-robin` |
+`least-sessions`) picks only a session's first account, keyed by
+`x-claude-code-session-id`; never rotate individual requests (per-account caches). Read
+`docs/devlog/claude_20261024-quota-fallback.md` on demand (plain path).
+
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
 spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
@@ -165,8 +189,14 @@ Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the
 routed-session map persists in the proxy state dir. The launcher sets
-`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-5.6-sol`) because a proxied session counts as
-first-party and Remote Control `set_model` otherwise rejects non-catalog ids. Folder trust
+`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-6.1-sol[1m]`) because a proxied session counts as
+first-party and Remote Control `set_model` otherwise rejects non-catalog ids. The launcher sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` so bare custom model names also use 1M in new processes.
+Codex model bases and derived fast variants come only from
+`src/providers/codex/translate/model_allowlist.rs`; the registry consumes that catalog.
+The new catalog and live context verification are in
+`docs/devlog/claude_20261024-codex-6-models.md` (plain path).
+Folder trust
 accepted in any account profile carries to every sibling profile. Record: HQ repo
 `docs/devlog/claude_20261023-native-ui-and-rc-protocol.md`. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.

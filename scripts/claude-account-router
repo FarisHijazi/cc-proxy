@@ -361,14 +361,25 @@ def with_flags(args, *flags):
 
 def aggregate_mcp(login, manifest, forwarded):
     """Add shared tools while retaining the main account's native Chrome UI."""
-    main = manifest["accounts"].get(manifest["main"], {})
-    if "secure_storage_dir" in main:
-        # Claude moves the main login into the OS keychain at startup, so the
-        # main account's Chrome child reads its own plaintext copy.
-        copy = login / f"{manifest['main']}-chrome-secure"
-        shutil.copytree(main["secure_storage_dir"], copy)
-        accounts = {**manifest["accounts"], manifest["main"]: {**main, "secure_storage_dir": str(copy)}}
-        manifest = {**manifest, "accounts": accounts}
+    accounts = dict(manifest["accounts"])
+    for alias, account in manifest["accounts"].items():
+        if "secure_storage_dir" not in account:
+            continue
+        credential = Path(account["secure_storage_dir"]) / ".credentials.json"
+        data = json.loads(credential.read_text())
+        oauth = data.get("claudeAiOauth", {})
+        placeholder = str(oauth.get("accessToken", "")).startswith("proxy-account-")
+        if alias != manifest["main"] and not placeholder:
+            continue
+        # Native MCP children stay account-isolated even when the parent opts
+        # into native aggregation. Claude can move the parent's login to Keychain.
+        copy = login / f"{alias}-chrome-secure"
+        shutil.copytree(account["secure_storage_dir"], copy)
+        if placeholder:
+            oauth["accessToken"] = f"proxy-account-{alias}+chrome={alias}"
+            (copy / ".credentials.json").write_text(json.dumps(data))
+        accounts[alias] = {**account, "secure_storage_dir": str(copy)}
+    manifest = {**manifest, "accounts": accounts}
     manifest_path = login / "accounts.json"
     write_private(manifest_path, json.dumps(manifest))
     servers = {}
@@ -447,10 +458,13 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
         settings_env[name] = settings_env["HTTPS_PROXY"]
     settings_env["no_proxy"] = settings_env["NO_PROXY"]
     # The proxy makes this a first-party session, so Remote Control's set_model
-    # (HQ's model picker) accepts only catalog models; this adds the Codex one.
+    # (HQ's model picker) accepts only catalog models; this adds the default Codex
+    # model. Claude Code owns context budgeting before a request reaches the proxy,
+    # so pin custom models to the 1M window even when /model uses a bare name.
     settings_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = (
-        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-5.6-sol"
+        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-6.1-sol[1m]"
     )
+    settings_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "1000000"
     # An API credential selects API-key auth even when a subscription is saved.
     # Empty strings in CLI settings also override project settings for this run.
     for key in (
@@ -608,7 +622,7 @@ CLAUDE_AI_SCOPES = [
 ]
 
 
-def placeholder_login(alias, opener, config, secure, remote_control=None, private=False):
+def placeholder_login(alias, opener, config, secure, remote_control=None, private=False, chrome=None):
     """Write a login whose token the --serve proxy swaps for the real one.
 
     `remote_control` names another alias whose token the proxy uses on /v1/code/
@@ -619,6 +633,8 @@ def placeholder_login(alias, opener, config, secure, remote_control=None, privat
         token += f"+rc={remote_control}"
     if private:
         token += "+private"
+    if chrome is not None:
+        token += "+chromes" if chrome == "*" else f"+chrome={chrome}"
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/profile",
         headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
@@ -674,6 +690,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     alias, opener, config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
+                    chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
                 )
             except (OSError, ValueError, KeyError) as error:
                 if alias == main_account:
@@ -682,6 +699,8 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                 print(f"Account {alias}: unavailable on the proxy ({error})", file=sys.stderr)
                 continue
             manifest["accounts"][alias] = {"config_dir": str(config), "secure_storage_dir": str(secure)}
+        if getattr(args, "chrome_account", None):
+            manifest["chrome_account"] = args.chrome_account
         forwarded = aggregate_mcp(login, manifest, forwarded)
         share_user_config(state / "claude")
         (state / "client-ca.pem").write_bytes(certificate_bundle(args.via_ca))

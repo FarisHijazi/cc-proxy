@@ -23,6 +23,7 @@ def addon(monkeypatch, calls):
     monkeypatch.setattr(module, "slot_token", slot_token)
     inject = module.AccountInject()
     inject.accounts = {"personal": "1"}
+    monkeypatch.setattr(inject, "identity", lambda alias: "11111111-1111-4111-8111-111111111111")
     return inject
 
 
@@ -65,6 +66,10 @@ def test_unknown_alias_is_answered_locally(monkeypatch):
 def test_bridge_connect_frame_gets_the_slot_token(monkeypatch):
     inject = addon(monkeypatch, [])
     flow = tflow.tflow()
+    flow.request = http.Request.make(
+        "GET", "https://bridge.claudeusercontent.com/chrome/11111111-1111-4111-8111-111111111111",
+        headers={"Upgrade": "websocket"},
+    )
     flow.websocket = websocket.WebSocketData()
     frame = {"type": "connect", "client_type": "claude-code", "oauth_token": "proxy-account-personal"}
     flow.websocket.messages.append(
@@ -81,6 +86,8 @@ def test_remote_control_owner_applies_only_to_remote_control_paths(monkeypatch):
     for url, expected in (
         ("https://api.anthropic.com/v1/messages", "Bearer real-2"),
         ("https://api.anthropic.com/api/oauth/profile", "Bearer real-2"),
+        ("https://api.anthropic.com/api/oauth/usage", "Bearer real-2"),
+        ("https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1", "Bearer real-2"),
         ("https://api.anthropic.com/v1/code/sessions", "Bearer real-1"),
         ("https://api.anthropic.com/v1/code/sessions/cse_1/worker/events", "Bearer real-1"),
     ):
@@ -130,3 +137,240 @@ def test_malformed_placeholder_suffix_is_never_forwarded(monkeypatch):
         flow = request("Bearer proxy-account-" + placeholder)
         inject.requestheaders(flow)
         assert flow.response.status_code == 401, placeholder
+
+
+def bridge_frame(inject, token, *, url=None, client_type="claude-code"):
+    flow = tflow.tflow()
+    flow.request = http.Request.make(
+        "GET", url or "https://bridge.claudeusercontent.com/chrome/11111111-1111-4111-8111-111111111111",
+        headers={"Upgrade": "websocket"},
+    )
+    flow.websocket = websocket.WebSocketData()
+    message = websocket.WebSocketMessage(1, True, json.dumps({
+        "type": "connect", "client_type": client_type, "oauth_token": token,
+    }).encode())
+    flow.websocket.messages.append(message)
+    flow.live = True
+    inject.websocket_message(flow)
+    return flow, message
+
+
+def test_native_aggregation_is_opt_in_and_preserves_legacy_clients(monkeypatch):
+    from types import SimpleNamespace
+
+    inject = addon(monkeypatch, [])
+    inject.accounts["work"] = "2"
+    starts = []
+    mux = SimpleNamespace(start=lambda *args: starts.append(args))
+    monkeypatch.setattr(inject, "bridge", lambda: mux)
+    for token in ("own-real-token", "proxy-account-personal", "proxy-account-personal+chrome=personal"):
+        flow, message = bridge_frame(inject, token)
+        assert not message.dropped and not flow.error
+    assert starts == []
+    flow, message = bridge_frame(inject, "proxy-account-personal+rc=work+private+chromes")
+    assert not message.dropped and json.loads(message.text)["oauth_token"] == "real-1"
+    assert starts == [(flow, "personal", None)]
+    starts.clear()
+    flow, message = bridge_frame(inject, "proxy-account-personal+chrome=work")
+    assert starts == [(flow, "personal", "work")]
+    assert json.loads(message.text)["oauth_token"] == "real-1"
+
+
+def test_bad_chrome_authentication_and_path_mismatch_fail_closed(monkeypatch):
+    inject = addon(monkeypatch, [])
+    for token, url, client in (
+        ("proxy-account-personal+chromes", None, "extension"),
+        ("proxy-account-personal+chrome=unknown", None, "claude-code"),
+        ("proxy-account-personal+chromes+chrome=personal", None, "claude-code"),
+        ("proxy-account-personal+chromes", "https://bridge.claudeusercontent.com/chrome/22222222-2222-4222-8222-222222222222", "claude-code"),
+    ):
+        flow, message = bridge_frame(inject, token, url=url, client_type=client)
+        assert message.dropped and flow.error
+        assert inject.chrome is None
+
+
+def test_chrome_tokens_are_not_injected_into_other_endpoints(monkeypatch):
+    inject = addon(monkeypatch, [])
+    for url in (
+        "https://api.anthropic.com/chrome/11111111-1111-4111-8111-111111111111",
+        "https://bridge.claudeusercontent.com.evil.test/chrome/11111111-1111-4111-8111-111111111111",
+        "https://bridge.claudeusercontent.com/devices/11111111-1111-4111-8111-111111111111/bridge",
+        "https://bridge.claudeusercontent.com/chrome/11111111-1111-4111-8111-111111111111?x=1",
+        "https://bridge.claudeusercontent.com:444/chrome/11111111-1111-4111-8111-111111111111",
+    ):
+        flow, message = bridge_frame(inject, "proxy-account-personal+chromes", url=url)
+        assert json.loads(message.text)["oauth_token"] == "proxy-account-personal+chromes"
+        assert not message.dropped and not flow.error and inject.chrome is None
+
+
+def test_chrome_suffix_never_changes_http_or_remote_control_routing(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts["work"] = "2"
+    for suffix in ("+chromes", "+chrome=work"):
+        assert inject.resolve("proxy-account-personal+rc=work" + suffix, "/api/oauth/profile") == "real-1"
+        assert inject.resolve("proxy-account-personal+rc=work" + suffix, "/v1/code/sessions") == "real-2"
+        assert module.parse("proxy-account-personal+rc=work+private" + suffix) == ("personal", "work", True)
+
+
+def test_bridge_helper_loads_from_the_script_directory_without_path_changes(monkeypatch):
+    inject = addon(monkeypatch, [])
+    mux = inject.bridge()
+    assert type(mux).__name__ == "ChromeBridge"
+    assert inject.bridge() is mux
+    inject.done()
+    assert not mux.sessions
+
+
+def test_friendly_chrome_names_use_only_confirmed_account_bound_profiles(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    inject.chrome_profiles_file = tmp_path / "chrome-profiles.json"
+    profile = {
+        "account": "personal", "deviceId": "browser-a", "confirmed": True,
+        "host": "vm-a", "email": "user@example.com",
+    }
+    inject.chrome_profiles_file.write_text(json.dumps({"profiles": [profile]}))
+    assert inject.chrome_label("personal", "browser-a", "Browser 1") == "vm-a - user@example.com"
+    assert inject.chrome_label("work", "browser-a", "Browser 1") == "Unidentified browser browser-"
+    assert inject.chrome_label("personal", "unknown", "Browser 2") == "Unidentified browser unknown"
+    profile["confirmed"] = False
+    inject.chrome_profiles_file.write_text(json.dumps({"profiles": [profile]}))
+    assert inject.chrome_label("personal", "browser-a", "Browser 1") == "Unidentified browser browser-"
+
+
+def test_missing_or_invalid_chrome_identity_map_is_marked_unidentified(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    inject.chrome_profiles_file = tmp_path / "missing.json"
+    assert inject.chrome_label("personal", "browser-a", "Browser 1") == "Unidentified browser browser-"
+    inject.chrome_profiles_file.write_text("{bad-json")
+    assert inject.chrome_label("personal", "browser-a", "Browser 1") == "Unidentified browser browser-"
+
+
+def inference(authorization, path="/v1/messages?beta=true", pool=None):
+    flow = tflow.tflow()
+    headers = {"Authorization": authorization}
+    if pool is not None:
+        headers[module.POOL_HEADER] = pool
+    flow.request = http.Request.make("POST", "https://api.anthropic.com" + path, headers=headers)
+    return flow
+
+
+def test_inference_carries_every_login_with_the_session_account_first(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    flow = inference("Bearer proxy-account-b+rc=a")
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [entry["alias"] for entry in pool] == ["b", "a", "c"]
+    assert flow.request.headers["authorization"] == "Bearer real-2"
+    assert pool[0]["authorization"] == "Bearer real-2"
+    assert [entry["primary"] for entry in pool] == [True, False, False]
+
+
+def test_a_broken_login_is_skipped_and_retried_later(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2"}
+    monkeypatch.setattr(module, "slot_token", lambda slot: (_ for _ in ()).throw(ValueError("gone")) if slot == "1" else ("real-2", time.time() * 1000 + 3_600_000))
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    assert [entry["alias"] for entry in json.loads(flow.request.headers[module.POOL_HEADER])] == ["b"]
+    assert flow.request.headers["authorization"] == "Bearer real-2"
+    assert inject.unusable["a"] > time.time()
+    assert json.loads(flow.request.headers[module.POOL_HEADER])[0]["primary"] is False
+
+
+def test_empty_credential_pool_still_reaches_inference_routing(monkeypatch):
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(module, "slot_token", lambda slot: (_ for _ in ()).throw(ValueError("gone")))
+    flow = inference("Bearer proxy-account-personal")
+    inject.requestheaders(flow)
+    assert flow.response is None
+    assert json.loads(flow.request.headers[module.POOL_HEADER]) == []
+    assert "authorization" not in flow.request.headers
+
+
+def test_pool_is_only_for_inference_and_never_taken_from_the_client(monkeypatch):
+    inject = addon(monkeypatch, [])
+    for path in ("/v1/messages/count_tokens?beta=true", "/api/oauth/usage"):
+        flow = inference("Bearer proxy-account-personal", path)
+        inject.requestheaders(flow)
+        assert module.POOL_HEADER not in flow.request.headers, path
+    for authorization in ("Bearer own-real-token", "Bearer proxy-account-personal"):
+        flow = inference(authorization, "/api/oauth/profile", pool='[{"alias":"x","authorization":"Bearer stolen"}]')
+        inject.requestheaders(flow)
+        assert module.POOL_HEADER not in flow.request.headers
+
+
+def test_unknown_alias_is_refused_for_inference_too(monkeypatch):
+    inject = addon(monkeypatch, [])
+    flow = inference("Bearer proxy-account-other")
+    inject.requestheaders(flow)
+    assert flow.response.status_code == 401
+
+
+def test_new_accounts_join_without_a_restart(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"personal": 1}}))
+    inject.read_accounts(path)
+    path.write_text(json.dumps({"accounts": {"personal": 1, "extra": 5}}))
+    import os
+    os.utime(path, (time.time() + 5, time.time() + 5))
+    flow = inference("Bearer proxy-account-personal")
+    inject.requestheaders(flow)
+    assert [entry["alias"] for entry in json.loads(flow.request.headers[module.POOL_HEADER])] == ["personal", "extra"]
+
+
+def session_pool(inject, session, alias="a"):
+    flow = inference(f"Bearer proxy-account-{alias}")
+    if session:
+        flow.request.headers[module.SESSION_HEADER] = session
+    inject.requestheaders(flow)
+    return [entry["alias"] for entry in json.loads(flow.request.headers[module.POOL_HEADER])]
+
+
+def test_prefer_puts_one_main_account_first_for_every_session(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.strategy, inject.prefer = "prefer", "c"
+    assert session_pool(inject, "s1", "a")[0] == "c"
+    assert session_pool(inject, None, "b") == ["c", "a", "b"]
+
+
+def test_round_robin_spreads_sessions_but_never_requests(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.strategy = "round-robin"
+    first = [session_pool(inject, f"s{i}")[0] for i in range(4)]
+    assert first == ["a", "b", "c", "a"]
+    for _ in range(5):
+        assert session_pool(inject, "s1")[0] == "b", "a session keeps its account"
+
+
+def test_least_sessions_fills_the_emptiest_account(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2"}
+    inject.strategy = "least-sessions"
+    assert [session_pool(inject, s)[0] for s in ("s1", "s2", "s1", "s3")] == ["a", "b", "a", "a"]
+
+
+def test_idle_sessions_are_released(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2"}
+    inject.strategy = "least-sessions"
+    session_pool(inject, "old")
+    inject.sticky["old"] = ("a", time.time() - module.STICKY_IDLE_S - 1)
+    assert session_pool(inject, "new")[0] == "a", "the idle session no longer counts"
+
+
+def test_balance_is_read_from_the_accounts_file(monkeypatch, tmp_path):
+    import pytest
+
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"a": 1, "b": 2}, "balance": {"strategy": "prefer", "prefer": "b"}}))
+    inject.read_accounts(path)
+    assert (inject.strategy, inject.prefer) == ("prefer", "b")
+    for bad in ({"strategy": "per-request"}, {"strategy": "prefer", "prefer": "nobody"}):
+        path.write_text(json.dumps({"accounts": {"a": 1}, "balance": bad}))
+        with pytest.raises(ValueError):
+            inject.read_accounts(path)
