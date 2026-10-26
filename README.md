@@ -167,6 +167,21 @@ An exhausted account is skipped until the reset time Anthropic reports. Adding a
 alias to the accounts file takes effect on the next request. Cursor uses the
 `cursor-agent` login on the proxy host.
 
+### Chaining proxies (`--serve --via`)
+
+A `--serve` proxy can use another `--serve` proxy as its backend. It swaps in the
+logins it holds itself, and passes every other alias on, still a placeholder, to
+the next proxy, which swaps it there:
+
+```sh
+claude-account-router --serve --port 18790 --accounts-file accounts.json \
+  --via http://next-proxy:18790 --via-ca next-proxy-ca.pem
+```
+
+All of this proxy's Anthropic traffic, including the Chrome bridge, goes through
+the next proxy. Each hop runs its own quota fallback over the accounts it holds.
+An alias that no hop holds gets a 401 from the last hop.
+
 ## How it works
 
 Claude Code sends normal Anthropic API requests to the proxy. The proxy reads

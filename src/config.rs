@@ -481,6 +481,14 @@ pub fn anthropic_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
 
+/// A cascaded `--serve` reaches Anthropic through the next account proxy, which
+/// intercepts TLS, so its CA (PEM) must be trusted too.
+pub fn anthropic_upstream_proxy() -> Option<(String, String)> {
+    let proxy = std::env::var("CCP_ANTHROPIC_PROXY").ok()?;
+    let ca = std::env::var("CCP_ANTHROPIC_PROXY_CA").ok()?;
+    Some((proxy, ca))
+}
+
 pub fn kimi_oauth_host() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {

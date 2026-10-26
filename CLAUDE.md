@@ -188,6 +188,10 @@ See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 proxy's profile endpoint, and aggregate every alias. No proxy auth: bind `--serve` to a tailnet IP.
 Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
 `docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
+`--serve --via` chains proxies: `account_inject.cascades()` leaves aliases this hop
+does not hold as placeholders, the router reaches Anthropic through `CCP_ANTHROPIC_PROXY`
+(trusting `CCP_ANTHROPIC_PROXY_CA`), and the Chrome bridge gets `server_conn.via`. See
+`docs/devlog/claude_20261026-cascading-proxies.md` (plain path).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

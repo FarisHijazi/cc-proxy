@@ -401,3 +401,39 @@ def test_email_aliases_and_renamed_old_aliases_resolve(monkeypatch, tmp_path):
     path.write_text(json.dumps({"accounts": {"a": 1}, "renamed": {"old": "missing"}}))
     with pytest.raises(ValueError):
         inject.read_accounts(path)
+
+
+def test_cascade_forwards_aliases_held_by_the_next_proxy(monkeypatch):
+    calls = []
+    inject = addon(monkeypatch, calls)
+    inject.upstream = module.server_spec.parse("http://next.example:18790", "http")
+    for flow in (request("Bearer proxy-account-other"), inference("Bearer proxy-account-other")):
+        inject.requestheaders(flow)
+        assert flow.response is None
+        assert flow.request.headers["authorization"] == "Bearer proxy-account-other"
+        assert module.POOL_HEADER not in flow.request.headers
+    flow = request("Bearer proxy-account-personal")
+    inject.requestheaders(flow)
+    assert flow.request.headers["authorization"] == "Bearer real-1"
+    flow = request("Bearer proxy-account-other+bogus")
+    inject.requestheaders(flow)
+    assert flow.response.status_code == 401
+    assert calls == ["1"]
+
+
+def test_cascade_sends_the_chrome_bridge_through_the_next_proxy(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.upstream = module.server_spec.parse("http://next.example:18790", "http")
+    flow = tflow.tflow()
+    flow.request = http.Request.make(
+        "GET", "https://bridge.claudeusercontent.com/chrome/11111111-1111-4111-8111-111111111111",
+        headers={"Upgrade": "websocket"},
+    )
+    inject.requestheaders(flow)
+    assert flow.server_conn.via == inject.upstream
+    flow.websocket = websocket.WebSocketData()
+    frame = {"type": "connect", "client_type": "claude-code", "oauth_token": "proxy-account-other"}
+    flow.websocket.messages.append(websocket.WebSocketMessage(1, True, json.dumps(frame).encode()))
+    inject.websocket_message(flow)
+    assert json.loads(flow.websocket.messages[-1].text)["oauth_token"] == "proxy-account-other"
+    assert not flow.websocket.messages[-1].dropped

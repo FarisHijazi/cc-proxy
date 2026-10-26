@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import UUID
 
 from mitmproxy import ctx, exceptions, http
+from mitmproxy.net import server_spec
 
 PREFIX = "Bearer proxy-account-"
 REMOTE_CONTROL_PATH = "/v1/code/"
@@ -90,14 +91,20 @@ class AccountInject:
         self.strategy, self.prefer = "session", None
         self.sticky, self.turn = {}, -1
         self.chrome = None
+        self.upstream = None
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
 
     def load(self, loader):
         loader.add_option(
             "proxy_accounts_file", str, "", "Alias→cswap slot map for injected logins"
         )
+        loader.add_option(
+            "proxy_upstream", str, "", "Next account proxy (http://HOST:PORT) for aliases not held here"
+        )
 
     def configure(self, updated):
+        if "proxy_upstream" in updated:
+            self.upstream = ctx.options.proxy_upstream and server_spec.parse(ctx.options.proxy_upstream, "http")
         if "proxy_accounts_file" not in updated:
             return
         try:
@@ -179,6 +186,15 @@ class AccountInject:
                 self.unusable[name] = time.time() + UNUSABLE_RETRY_S
         return pool
 
+    def cascades(self, placeholder, path=""):
+        """True when the next proxy, not this one, holds the login a placeholder names."""
+        if not self.upstream:
+            return False
+        alias, owner, _ = parse(placeholder)
+        if owner and path.startswith(REMOTE_CONTROL_PATH):
+            alias = owner
+        return self.name(alias) not in self.accounts
+
     def resolve(self, placeholder, path=""):
         alias, owner, _ = parse(placeholder)
         if owner and path.startswith(REMOTE_CONTROL_PATH):
@@ -246,7 +262,7 @@ class AccountInject:
         try:
             frame = json.loads(message.text)
             supplied = frame.get("oauth_token") if isinstance(frame, dict) else None
-            if not str(supplied).startswith("proxy-account-"):
+            if not str(supplied).startswith("proxy-account-") or self.cascades(supplied):
                 return
             alias = self.name(parse(supplied)[0])
             selected = chrome_selection(supplied)
@@ -279,12 +295,17 @@ class AccountInject:
     def requestheaders(self, flow):
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
+        if self.upstream and flow.request.host == "bridge.claudeusercontent.com":
+            # The router reaches Anthropic through the next proxy; the Chrome bridge must too.
+            flow.server_conn.via = self.upstream
         supplied = flow.request.headers.get("authorization", "")
         if not supplied.startswith(PREFIX):
             return
         placeholder = supplied.removeprefix("Bearer ")
         self.reload_accounts()
         try:
+            if self.cascades(placeholder, flow.request.path):
+                return  # the next proxy swaps it
             if flow.request.method == "POST" and flow.request.path.split("?")[0] == "/v1/messages":
                 alias, _, private = parse(placeholder)
                 alias = self.name(alias)

@@ -588,6 +588,17 @@ def serve(args, state):
     router_env = os.environ.copy()
     router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
     router_env["CCP_TRAFFIC_LOG"] = "0"
+    if args.via:
+        # Cascade: aliases not held here pass, still placeholders, to the next --serve proxy.
+        if not args.via_ca:
+            raise ValueError("--serve --via needs --via-ca")
+        (state / "upstream-ca.pem").write_bytes(certificate_bundle(args.via_ca))
+        command += [
+            "--set", f"proxy_upstream={args.via}",
+            "--set", f"ssl_verify_upstream_trusted_ca={state / 'upstream-ca.pem'}",
+        ]
+        router_env["CCP_ANTHROPIC_PROXY"] = args.via
+        router_env["CCP_ANTHROPIC_PROXY_CA"] = str(args.via_ca.expanduser().resolve())
     with (state / "serve.log").open("a") as log:
         processes = [
             subprocess.Popen(
@@ -792,7 +803,10 @@ def main():
     )
     parser.add_argument("--listen-host", default="127.0.0.1", help="--serve bind address")
     parser.add_argument("--router-bin", default="claude-codex", help="--serve router binary")
-    parser.add_argument("--via", help="use a --serve proxy at http://HOST:PORT")
+    parser.add_argument(
+        "--via",
+        help="use a --serve proxy at http://HOST:PORT (with --serve: cascade to it)",
+    )
     parser.add_argument("--via-ca", type=Path, help="the --serve proxy's CA certificate")
     parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
