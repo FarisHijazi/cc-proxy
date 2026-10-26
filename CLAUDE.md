@@ -166,7 +166,10 @@ or Codex's own 429 backoff stalls the chain for minutes. No `cswap switch` is ne
 cswap remains the credential owner rather than the request selector. The accounts
 file's `balance` (`session` | `prefer` + `prefer` alias | `round-robin` |
 `least-sessions`) picks only a session's first account, keyed by
-`x-claude-code-session-id`; never rotate individual requests (per-account caches). Read
+`x-claude-code-session-id`; never rotate individual requests (per-account caches). Aliases are
+emails (pattern shared by the three launcher scripts); the proxy file's `renamed` maps old aliases
+that running sessions still send. A client's `main` sets the login claude.ai sees (artifacts,
+Remote Control, `/usage`); `balance.prefer` only picks inference. Read
 `docs/devlog/claude_20261024-quota-fallback.md` on demand (plain path).
 
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher

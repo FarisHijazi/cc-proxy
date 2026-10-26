@@ -63,7 +63,7 @@ def chrome_selection(placeholder):
     targets = [part[7:] for part in suffixes if part.startswith("chrome=")]
     if len(targets) > 1 or (targets and "chromes" in suffixes) or suffixes.count("chromes") > 1:
         raise ValueError("malformed Chrome account selection")
-    if targets and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,23}", targets[0]):
+    if targets and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}", targets[0]):
         raise ValueError("invalid Chrome account alias")
     return "*" if "chromes" in suffixes else (targets or [None])[0]
 
@@ -84,6 +84,7 @@ def parse(placeholder):
 class AccountInject:
     def __init__(self):
         self.accounts = {}
+        self.renamed = {}
         self.cache = {}
         self.unusable = {}
         self.strategy, self.prefer = "session", None
@@ -109,6 +110,10 @@ class AccountInject:
         self.accounts_mtime = path.stat().st_mtime
         data = json.loads(path.read_text())
         self.accounts = {a: str(s) for a, s in data["accounts"].items()}
+        # Old alias -> current alias, so sessions launched before a rename keep working.
+        self.renamed = dict(data.get("renamed", {}))
+        if not set(self.renamed.values()) <= set(self.accounts):
+            raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
         self.strategy = balance.get("strategy", "session")
         self.prefer = balance.get("prefer")
@@ -133,6 +138,9 @@ class AccountInject:
             return cached[0]
         self.cache[alias] = slot_token(self.accounts[alias])
         return self.cache[alias][0]
+
+    def name(self, alias):
+        return self.renamed.get(alias, alias)
 
     def start(self, alias, session):
         """The account a session tries first. Sessions never round-robin per request:
@@ -175,6 +183,7 @@ class AccountInject:
         alias, owner, _ = parse(placeholder)
         if owner and path.startswith(REMOTE_CONTROL_PATH):
             alias = owner
+        alias = self.name(alias)
         if alias not in self.accounts:
             raise ValueError(f"unknown account alias {alias!r}")
         return self.token(alias)
@@ -239,8 +248,9 @@ class AccountInject:
             supplied = frame.get("oauth_token") if isinstance(frame, dict) else None
             if not str(supplied).startswith("proxy-account-"):
                 return
-            alias = parse(supplied)[0]
+            alias = self.name(parse(supplied)[0])
             selected = chrome_selection(supplied)
+            selected = selected if selected in {None, "*"} else self.name(selected)
             if (
                 frame.get("type") != "connect"
                 or frame.get("client_type") != "claude-code"
@@ -277,6 +287,7 @@ class AccountInject:
         try:
             if flow.request.method == "POST" and flow.request.path.split("?")[0] == "/v1/messages":
                 alias, _, private = parse(placeholder)
+                alias = self.name(alias)
                 if alias not in self.accounts:
                     raise ValueError(f"unknown account alias {alias!r}")
                 flow.metadata["account_private"] = private

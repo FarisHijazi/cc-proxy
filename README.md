@@ -146,6 +146,16 @@ session on one main account. `round-robin` and `least-sessions` spread new
 sessions. Every strategy keeps a session on its account; individual requests
 are never rotated, because prompt caches are per account.
 
+Name accounts by their email, so it is obvious which login is which. Aliases may
+use letters, digits, `.`, `@`, `_` and `-`. To rename an alias without breaking
+sessions that are already running, map the old name in the proxy's accounts file;
+those sessions keep sending it:
+
+```json
+"accounts": {"user@example.com": 1},
+"renamed": {"personal": "user@example.com"}
+```
+
 | Tier | Claude | Codex | Cursor |
 | --- | --- | --- | --- |
 | Opus | `claude-opus-5-5` | `gpt-6.1-sol` | `cursor:claude-opus-5` |

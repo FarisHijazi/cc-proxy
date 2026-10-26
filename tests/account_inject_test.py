@@ -374,3 +374,30 @@ def test_balance_is_read_from_the_accounts_file(monkeypatch, tmp_path):
         path.write_text(json.dumps({"accounts": {"a": 1}, "balance": bad}))
         with pytest.raises(ValueError):
             inject.read_accounts(path)
+
+
+def test_email_aliases_and_renamed_old_aliases_resolve(monkeypatch, tmp_path):
+    import pytest
+
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({
+        "accounts": {"user@example.com": 1, "other.user@example.org": 2},
+        "renamed": {"personal": "user@example.com", "work": "other.user@example.org"},
+    }))
+    inject.read_accounts(path)
+    for placeholder, token in [
+        ("proxy-account-user@example.com", "Bearer real-1"),
+        ("proxy-account-personal", "Bearer real-1"),
+        ("proxy-account-work+rc=personal", "Bearer real-2"),
+    ]:
+        flow = request("Bearer " + placeholder)
+        inject.requestheaders(flow)
+        assert flow.request.headers["authorization"] == token
+    flow = inference("Bearer proxy-account-work")
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [entry["alias"] for entry in pool] == ["other.user@example.org", "user@example.com"]
+    path.write_text(json.dumps({"accounts": {"a": 1}, "renamed": {"old": "missing"}}))
+    with pytest.raises(ValueError):
+        inject.read_accounts(path)

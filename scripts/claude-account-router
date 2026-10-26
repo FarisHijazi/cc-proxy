@@ -292,9 +292,9 @@ def account_selection(entries, accounts_file=None, main=None):
     for alias, source in accounts.items():
         if alias.casefold() in {name.casefold() for name in normalized}:
             raise ValueError("account aliases must differ beyond letter case")
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,23}", alias):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}", alias):
             raise ValueError(
-                "account aliases need 1-24 letters, digits, underscores or hyphens"
+                "account aliases need 1-64 letters, digits, dots, @, underscores or hyphens"
             )
         if isinstance(source, bool) or not isinstance(source, (int, str)):
             raise TypeError(

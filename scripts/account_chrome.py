@@ -25,7 +25,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from pydantic import ConfigDict, TypeAdapter
 
-ALIASES = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,23}\Z")
+ALIASES = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}\Z")
 RESULT = TypeAdapter(types.CallToolResult | types.InputRequiredResult)
 UPLOAD_LIMITATION = (
     "File uploads require native Claude-in-Chrome client file-permission preprocessing, "
