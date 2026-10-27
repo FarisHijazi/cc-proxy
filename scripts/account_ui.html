@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc-proxy</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #18181b; --muted: #71717a; --line: #e4e4e7;
+    --accent: #4f46e5; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --track: #f0f0ef;
+    --radius: 12px; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0c0c0e; --panel: #151518; --text: #ececee; --muted: #8b8b94; --line: #26262b;
+            --accent: #818cf8; --track: #222227; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+       margin: 28px 0 10px; font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+          background: var(--panel); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .spacer { flex: 1; }
+  button, select, input { font: inherit; color: inherit; }
+  button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px;
+           cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  select, input[type=number], input[type=search] { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 8px; padding: 5px 8px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+  .seg button:last-child { border-right: 0; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px;
+          display: flex; flex-direction: column; gap: 10px; }
+  .card.off { opacity: .55; }
+  .card.pref { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .card-head { display: flex; align-items: baseline; gap: 8px; }
+  .name { font-weight: 600; word-break: break-all; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--track); color: var(--muted); }
+  .badge.accent { background: var(--accent); color: #fff; }
+  .meter { display: grid; grid-template-columns: 64px 1fr 42px; align-items: center; gap: 8px; font-size: 12px; }
+  .track { height: 7px; background: var(--track); border-radius: 99px; overflow: hidden; }
+  .fill { height: 100%; border-radius: 99px; background: var(--ok); transition: width .4s; }
+  .fill.warn { background: var(--warn); } .fill.bad { background: var(--bad); }
+  .muted { color: var(--muted); } .small { font-size: 12px; } .mono { font-family: var(--mono); font-size: 12px; }
+  .card-foot { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .switch { position: relative; width: 34px; height: 20px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; background: var(--line); border-radius: 99px; cursor: pointer; transition: .2s; }
+  .switch span::after { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px;
+                        background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + span { background: var(--ok); }
+  .switch input:checked + span::after { transform: translateX(14px); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .big { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+  .bars div { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 12px; margin-bottom: 7px; }
+  .bars .track { grid-column: 1 / -1; height: 5px; }
+  .bars .fill { background: var(--accent); }
+  .spark { display: flex; align-items: flex-end; gap: 2px; height: 34px; margin-top: 8px; }
+  .spark i { flex: 1; background: var(--accent); opacity: .7; border-radius: 2px 2px 0 0; min-height: 1px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line);
+       position: sticky; top: 0; background: var(--panel); }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden;
+       text-overflow: ellipsis; max-width: 260px; }
+  tbody tr { cursor: pointer; } tbody tr:hover td { background: var(--track); }
+  .scroll { max-height: 520px; overflow: auto; border-radius: var(--radius); }
+  .status-bad { color: var(--bad); } .status-ok { color: var(--ok); }
+  .skeleton { color: var(--muted); padding: 24px; text-align: center; }
+  .error { background: color-mix(in srgb, var(--bad) 12%, var(--panel)); border: 1px solid var(--bad);
+           color: var(--text); padding: 10px 14px; border-radius: var(--radius); margin-bottom: 12px; }
+  dialog { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text);
+           width: min(1000px, 94vw); max-height: 90vh; padding: 0; }
+  dialog::backdrop { background: rgb(0 0 0 / .45); }
+  dialog header { padding: 12px 16px; border-bottom: 1px solid var(--line); margin: 0; }
+  dialog .body { padding: 12px 16px; overflow: auto; max-height: calc(90vh - 60px); }
+  dl { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; font-size: 12px; margin: 0 0 12px; }
+  dt { color: var(--muted); } dd { margin: 0; word-break: break-all; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12px/1.4 var(--mono);
+        white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow: auto; }
+  details summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>cc-proxy</h1>
+    <span class="pill" id="proxy"><span class="dot"></span>checking proxy…</span>
+    <span class="pill" id="db">database…</span>
+    <span class="spacer"></span>
+    <span class="small muted" id="updated"></span>
+    <button id="refresh">Refresh</button>
+  </header>
+  <div id="error"></div>
+
+  <h2>Routing</h2>
+  <div class="panel" id="routing"><div class="skeleton">Loading settings…</div></div>
+
+  <h2>Accounts <span class="muted" style="text-transform:none;letter-spacing:0">in fallback order</span></h2>
+  <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
+
+  <h2>Activity</h2>
+  <div class="row" style="margin-bottom:10px">
+    <div class="seg" id="range"><button data-h="1">1h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button></div>
+  </div>
+  <div class="stats" id="stats"><div class="panel skeleton">Loading activity…</div></div>
+
+  <h2>Requests</h2>
+  <div class="row" style="margin-bottom:10px">
+    <input type="search" id="q" placeholder="Filter: machine, user, folder, account, model, URL…" style="flex:1;min-width:220px">
+    <label class="small muted"><input type="checkbox" id="inference" checked> model calls only</label>
+  </div>
+  <div class="panel scroll" style="padding:0" id="traffic"><div class="skeleton">Loading requests…</div></div>
+</main>
+
+<dialog id="flow"><header class="row"><strong>Request</strong><span class="spacer"></span><button onclick="flow.close()">Close</button></header><div class="body" id="flow-body"></div></dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const WINDOW = {five_hour: "5 hours", seven_day: "7 days", seven_day_opus: "7d Opus", seven_day_sonnet: "7d Sonnet"};
+let state = null, hours = 24, saving = false;
+
+async function api(path, body) {
+  const res = await fetch(path, body ? {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)} : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+function showError(e) { $("error").innerHTML = e ? `<div class="error">${esc(e.message || e)}</div>` : ""; }
+function bytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
+function until(iso) {
+  if (!iso) return "";
+  const s = (new Date(iso) - Date.now()) / 1000;
+  if (s <= 0) return "resetting";
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return "resets in " + (d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`);
+}
+function ago(t) { const s = Date.now() / 1000 - t; return s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; }
+
+async function save(change) {
+  if (saving) return;
+  saving = true;
+  try { state = await api("/api/config", change); render(); showError(null); }
+  catch (e) { showError(e); }
+  finally { saving = false; }
+}
+
+function renderHeader() {
+  const p = state.proxy;
+  $("proxy").innerHTML = `<span class="dot ${p.up ? "ok" : "bad"}"></span>proxy ${esc(p.address)} ${p.up ? "up" : "down"}`;
+  $("db").textContent = state.db.path ? `traffic ${bytes(state.db.bytes)} · ${bytes(state.db.disk_free)} free` : "traffic recording off";
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+}
+
+function renderRouting() {
+  const b = state.balance, names = state.accounts.map((a) => a.alias);
+  const hint = {session: "each machine starts on its own main account",
+    prefer: "every session starts on one account", "round-robin": "new sessions take turns",
+    "least-sessions": "new sessions go to the least busy account"}[b.strategy];
+  $("routing").innerHTML = `
+    <div class="row">
+      <span class="small muted">New sessions</span>
+      <div class="seg">${state.strategies.map((s) => `<button data-s="${s}" class="${s === b.strategy ? "on" : ""}">${s}</button>`).join("")}</div>
+      ${b.strategy === "prefer" ? `<select id="prefer">${names.map((n) => `<option ${n === b.prefer ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>` : ""}
+      <span class="small muted">${esc(hint)}</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="small muted">Keep recorded traffic for</span>
+      <input type="number" id="days" min="1" style="width:70px" value="${state.traffic_days ?? ""}" placeholder="ever">
+      <span class="small muted">days</span>
+    </div>
+    <p class="small muted" style="margin:10px 0 0">Sessions stick to their account; on a quota limit the proxy moves on down the account list, then to Codex, then Cursor.</p>`;
+  $("routing").querySelectorAll("[data-s]").forEach((btn) => btn.onclick = () =>
+    save({balance: {strategy: btn.dataset.s, prefer: btn.dataset.s === "prefer" ? (b.prefer || names[0]) : undefined}}));
+  const prefer = $("prefer");
+  if (prefer) prefer.onchange = () => save({balance: {strategy: "prefer", prefer: prefer.value}});
+  $("days").onchange = (e) => save({traffic_days: e.target.value ? Number(e.target.value) : null});
+}
+
+function meter(name, w) {
+  const pct = Math.max(0, Math.min(100, w.utilization));
+  const level = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
+  return `<div class="meter"><span class="muted">${esc(WINDOW[name] || name)}</span>
+    <div class="track" title="${esc(until(w.resets_at))}"><div class="fill ${level}" style="width:${pct}%"></div></div>
+    <span>${Math.round(pct)}%</span></div>
+    <div class="small muted" style="margin:-6px 0 0 72px">${esc(until(w.resets_at))}</div>`;
+}
+
+function renderAccounts() {
+  const b = state.balance, list = state.accounts, disabled = list.filter((a) => a.disabled).map((a) => a.alias);
+  $("accounts").innerHTML = list.map((a, i) => {
+    const preferred = b.strategy === "prefer" && b.prefer === a.alias;
+    const windows = Object.entries(a.usage);
+    return `<div class="card ${a.disabled ? "off" : ""} ${preferred ? "pref" : ""}">
+      <div class="card-head">
+        <span class="name">${esc(a.email || a.alias)}</span><span class="spacer"></span>
+        ${preferred ? `<span class="badge accent">preferred</span>` : ""}
+        ${a.plan ? `<span class="badge">${esc(a.plan)}</span>` : ""}
+      </div>
+      ${a.email && a.email !== a.alias ? `<div class="small muted">${esc(a.alias)}</div>` : ""}
+      ${windows.length ? windows.map(([n, w]) => meter(n, w)).join("") : `<div class="small muted">${a.error ? "usage unavailable: " + esc(a.error) : "no usage reported"}</div>`}
+      <div class="card-foot">
+        <span class="small muted">#${i + 1} · slot ${esc(a.slot)}</span><span class="spacer"></span>
+        <button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>
+        <button data-down="${i}" ${i === list.length - 1 ? "disabled" : ""} title="Try later">↓</button>
+        <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>
+      </div></div>`;
+  }).join("");
+  const order = list.map((a) => a.alias);
+  const move = (i, j) => { [order[i], order[j]] = [order[j], order[i]]; save({order}); };
+  $("accounts").querySelectorAll("[data-up]").forEach((x) => x.onclick = () => move(+x.dataset.up, +x.dataset.up - 1));
+  $("accounts").querySelectorAll("[data-down]").forEach((x) => x.onclick = () => move(+x.dataset.down, +x.dataset.down + 1));
+  $("accounts").querySelectorAll("[data-alias]").forEach((x) => x.onchange = () => {
+    const off = new Set(disabled);
+    x.checked ? off.delete(x.dataset.alias) : off.add(x.dataset.alias);
+    save({disabled: [...off]});
+  });
+}
+
+function bars(title, counts) {
+  const items = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const max = Math.max(1, ...items.map((x) => x[1]));
+  return `<div class="panel bars"><div class="small muted" style="margin-bottom:8px">${title}</div>
+    ${items.length ? items.map(([k, v]) => `<div><span>${esc(k)}</span><span class="muted">${v}</span>
+      <div class="track"><div class="fill" style="width:${v / max * 100}%"></div></div></div>`).join("") : `<div class="small muted">none</div>`}</div>`;
+}
+
+async function loadStats() {
+  try {
+    const s = await api(`/api/stats?hours=${hours}`);
+    const series = Object.values(s.series).reduce((sum, row) => sum.map((v, i) => v + row[i]), Array(24).fill(0));
+    const peak = Math.max(1, ...series);
+    $("stats").innerHTML = `
+      <div class="panel"><div class="small muted">Model calls</div><div class="big">${s.total.toLocaleString()}</div>
+        <div class="small ${s.errors ? "status-bad" : "muted"}">${s.errors} failed</div>
+        <div class="spark">${series.map((v) => `<i style="height:${v / peak * 100}%"></i>`).join("")}</div></div>
+      ${bars("Answered by", s.by_account)}${bars("Machine", s.by_host)}${bars("Model", s.by_model)}`;
+  } catch (e) { showError(e); }
+}
+
+async function loadTraffic() {
+  try {
+    const params = new URLSearchParams({q: $("q").value, limit: 200});
+    if ($("inference").checked) params.set("inference", "1");
+    const {rows} = await api(`/api/traffic?${params}`);
+    $("traffic").innerHTML = rows.length ? `<table><thead><tr><th>When</th><th>Machine</th><th>User</th><th>Folder</th>
+      <th>Account</th><th>Answered by</th><th>Status</th><th>Request</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr data-id="${esc(r.id)}"><td title="${esc(new Date(r.started * 1000).toLocaleString())}">${ago(r.started)} ago</td>
+        <td>${esc(r.client_host || r.client_ip || "-")}</td><td>${esc(r.client_user || "-")}</td>
+        <td title="${esc(r.cwd || r.launch_cwd)}">${esc((r.cwd || r.launch_cwd || "-").replace(/^\/(home|Users)\/[^/]+/, "~"))}</td>
+        <td>${esc(r.alias || r.account || "-")}</td><td>${esc(r.served_by || r.model || "-")}</td>
+        <td class="${r.status >= 400 ? "status-bad" : ""}">${esc(r.status ?? "…")}</td>
+        <td class="mono" title="${esc(r.url)}">${esc(r.method)} ${esc(new URL(r.url).pathname)}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="skeleton">No requests match.</div>`;
+    $("traffic").querySelectorAll("tr[data-id]").forEach((tr) => tr.onclick = () => openFlow(tr.dataset.id));
+  } catch (e) { showError(e); }
+}
+
+async function openFlow(id) {
+  $("flow-body").innerHTML = `<div class="skeleton">Loading…</div>`;
+  $("flow").showModal();
+  try {
+    const f = await api(`/api/flow/${encodeURIComponent(id)}`);
+    const meta = ["started", "client_host", "client_user", "client_ip", "cwd", "launch_cwd", "session_id", "account",
+                  "served_by", "model", "method", "url", "status", "error"];
+    const pretty = (t) => { try { return JSON.stringify(JSON.parse(t), null, 1); } catch { return t; } };
+    $("flow-body").innerHTML = `<dl>${meta.filter((k) => f[k] != null && f[k] !== "").map((k) =>
+        `<dt>${esc(k)}</dt><dd>${esc(k === "started" ? new Date(f[k] * 1000).toLocaleString() : f[k])}</dd>`).join("")}</dl>
+      <details open><summary>Request body</summary><pre>${esc(pretty(f.request_body))}</pre></details>
+      <details><summary>Response body</summary><pre>${esc(pretty(f.response_body))}</pre></details>
+      <details><summary>Headers</summary><pre>${esc(f.request_headers)}\n\n${esc(f.response_headers)}</pre></details>`;
+  } catch (e) { $("flow-body").innerHTML = `<div class="error">${esc(e.message)}</div>`; }
+}
+
+function render() { renderHeader(); renderRouting(); renderAccounts(); }
+
+async function loadState() {
+  try { state = await api("/api/state"); render(); showError(null); }
+  catch (e) { showError(e); }
+}
+
+$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); };
+$("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
+  $("range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+  hours = +b.dataset.h; loadStats();
+});
+let typing;
+$("q").oninput = () => { clearTimeout(typing); typing = setTimeout(loadTraffic, 250); };
+$("inference").onchange = loadTraffic;
+loadState(); loadStats(); loadTraffic();
+setInterval(loadState, 60000);
+setInterval(() => { loadStats(); loadTraffic(); }, 15000);
+</script>
+</body>
+</html>

@@ -77,6 +77,10 @@ def traffic():
     run("claude-traffic")
 
 
+def ui():
+    run("account_ui.py")
+
+
 def accounts():
     """claude-accounts: the launcher with ~/.config/claude-codex/accounts.json (or $CC_PROXY_ACCOUNTS)."""
     default = Path.home() / ".config/claude-codex/accounts.json"

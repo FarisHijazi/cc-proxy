@@ -450,3 +450,20 @@ def test_pinned_sessions_start_on_their_own_account_whatever_the_balance(monkeyp
     pool = json.loads(flow.request.headers[module.POOL_HEADER])
     assert [e["alias"] for e in pool] == ["c", "a", "b"]
     assert flow.request.headers["authorization"] == "Bearer real-3"
+
+
+def test_disabled_accounts_are_left_out_of_fallback(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.disabled = {"b"}
+    assert session_pool(inject, "s1", "a") == ["a", "c"]
+
+
+def test_spreading_and_prefer_skip_disabled_accounts(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.disabled = {"b"}
+    inject.strategy = "round-robin"
+    assert [session_pool(inject, s, "a")[0] for s in ("s1", "s2", "s3")] == ["a", "c", "a"]
+    inject.strategy, inject.prefer = "prefer", "b"
+    assert session_pool(inject, "s4", "c")[0] == "c"

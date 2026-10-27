@@ -205,6 +205,9 @@ router from the release matching the package version, so bump `pyproject.toml` a
 Run tests as CI does with an empty `HOME`: tests that read the machine's Codex login pass locally and fail in CI.
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
+Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
+`disabled`, `traffic_days` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
+skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

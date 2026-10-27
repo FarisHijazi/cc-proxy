@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 cc-proxy = "cc_proxy.cli:main"
 cc-proxy-traffic = "cc_proxy.cli:traffic"
+cc-proxy-ui = "cc_proxy.cli:ui"
 claude-account-router = "cc_proxy.cli:main"
 claude-accounts = "cc_proxy.cli:accounts"
 

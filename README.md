@@ -140,6 +140,27 @@ docker compose logs -f
 The CA is in the `cc-proxy-state` volume:
 `docker compose exec cc-proxy cat /home/app/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem`
 
+### Dashboard
+
+`cc-proxy-ui` serves a dashboard for a running server: each account's live 5-hour and
+weekly usage, which account new sessions start on, the fallback order, switching an
+account off, how long to keep traffic, and every recorded request with its machine,
+user and folder. Run it on the server, next to the proxy:
+
+```sh
+cc-proxy-ui --listen-host "$(tailscale ip -4)" --port 18792 \
+  --accounts-file ~/.config/claude-codex/accounts.json \
+  --proxy "http://$(tailscale ip -4):18790" \
+  --proxy-ca ~/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem
+```
+
+Open `http://SERVER_TAILNET_IP:18792`. It changes settings by rewriting the accounts
+file, keeping the previous one as `accounts.json.before-ui`, and the proxy picks the change
+up on its next request. Usage comes through the proxy, so the dashboard never holds a
+Claude token. Like the proxy it has no login and shows full conversations, so bind it to
+a private address only. To keep it running, use the systemd or launchd snippet above with
+this command in place of `cc-proxy --serve`.
+
 ### Connect a client
 
 On every machine that runs Claude Code, save the server's CA and list the server in

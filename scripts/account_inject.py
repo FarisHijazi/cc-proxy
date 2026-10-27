@@ -94,6 +94,7 @@ class AccountInject:
         self.upstream = None
         self.traffic_db = None
         self.traffic_days = None
+        self.disabled = set()
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
 
     def load(self, loader):
@@ -124,6 +125,8 @@ class AccountInject:
         # Where account_traffic.py records every flow; unset records nothing.
         self.traffic_db = data.get("traffic_db")
         self.traffic_days = data.get("traffic_days")
+        # Switched off (in the UI): never tried, unless a session names the alias itself.
+        self.disabled = set(data.get("disabled", []))
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
@@ -158,14 +161,14 @@ class AccountInject:
         """The account a session tries first. Sessions never round-robin per request:
         a session keeps its account, because prompt caches are per account."""
         if self.strategy == "prefer":
-            return self.prefer
+            return alias if self.prefer in self.disabled else self.prefer
         if self.strategy == "session" or not session:
             return alias
         now = time.time()
         self.sticky = {s: e for s, e in self.sticky.items() if e[1] > now - STICKY_IDLE_S}
         entry = self.sticky.get(session)
         if entry is None or entry[0] not in self.accounts:
-            names = list(self.accounts)
+            names = [n for n in self.accounts if n not in self.disabled] or list(self.accounts)
             if self.strategy == "round-robin":
                 self.turn = (self.turn + 1) % len(names)
                 chosen = names[self.turn]
@@ -183,7 +186,7 @@ class AccountInject:
         A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
         alias = alias if pinned else self.start(alias, session)
         pool = []
-        for name in [alias, *(a for a in self.accounts if a != alias)]:
+        for name in [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]:
             if self.unusable.get(name, 0) > time.time():
                 continue
             try:
