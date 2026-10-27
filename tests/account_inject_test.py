@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from mitmproxy import http, websocket
 from mitmproxy.test import tflow
 
@@ -491,3 +492,59 @@ def test_setup_tokens_are_used_as_is_and_never_refreshed(monkeypatch):
     token, expires = module.slot_token("3")
     assert token == "setup-token" and expires > time.time() * 1000
     assert refreshed == []
+
+
+def test_fallback_policy_rides_with_the_pool_and_is_never_taken_from_the_client(monkeypatch):
+    inject = addon(monkeypatch, [])
+    flow = inference("Bearer proxy-account-personal")
+    flow.request.headers[module.POLICY_HEADER] = '{"chains":{"claude":["stolen"]}}'
+    inject.requestheaders(flow)
+    assert module.POLICY_HEADER not in flow.request.headers
+    inject.fallback = {"chains": {"claude": ["accounts", "codex"]}, "on": {"server_error": True}}
+    flow = inference("Bearer proxy-account-personal")
+    inject.requestheaders(flow)
+    assert json.loads(flow.request.headers[module.POLICY_HEADER]) == inject.fallback
+    flow = inference("Bearer proxy-account-personal", "/api/oauth/usage")
+    inject.requestheaders(flow)
+    assert module.POLICY_HEADER not in flow.request.headers
+
+
+def answered(inject, alias, five_hour, reset=None):
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {
+        module.SERVED_BY_HEADER: f"{alias}/claude-opus-5-5",
+        "anthropic-ratelimit-unified-5h-utilization": str(five_hour),
+        "anthropic-ratelimit-unified-5h-reset": str(reset or int(time.time()) + 3600),
+        "anthropic-ratelimit-unified-7d-utilization": "0.1",
+    })
+    inject.responseheaders(flow)
+
+
+def test_accounts_at_the_usage_threshold_are_tried_last(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    answered(inject, "a", 0.95)
+    assert session_pool(inject, None) == ["a", "b", "c"], "no threshold: today's order"
+    inject.fallback = {"threshold": 90}
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [e["alias"] for e in pool] == ["b", "c", "a"]
+    assert [e["primary"] for e in pool] == [False, False, True], "the thread owner never changes"
+    assert flow.request.headers["authorization"] == "Bearer real-2"
+    answered(inject, "a", 0.5)
+    assert session_pool(inject, None) == ["a", "b", "c"]
+    answered(inject, "a", 0.99, reset=int(time.time()) - 1)
+    assert session_pool(inject, None) == ["a", "b", "c"], "a window that already reset is ignored"
+
+
+def test_fallback_section_is_read_and_a_bad_threshold_is_refused(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"a": 1}, "fallback": {"threshold": 80}}))
+    inject.read_accounts(path)
+    assert inject.fallback == {"threshold": 80}
+    path.write_text(json.dumps({"accounts": {"a": 1}, "fallback": {"threshold": 150}}))
+    with pytest.raises(ValueError):
+        inject.read_accounts(path)

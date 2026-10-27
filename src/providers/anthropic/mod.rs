@@ -145,6 +145,7 @@ fn is_stripped_request_header(name: &str) -> bool {
             | "proxy-connection"
             | crate::inbound_auth::PROXY_KEY_HEADER
             | crate::fallback::POOL_HEADER
+            | crate::fallback::POLICY_HEADER
     )
 }
 

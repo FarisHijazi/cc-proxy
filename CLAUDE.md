@@ -162,7 +162,11 @@ plus Claude-account 401 with a bounded credential quarantine. An empty Claude po
 still reaches other vendors. The explicit primary-account marker prevents a filtered
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
 Claude model: accounts, then Codex, then Cursor. Codex model: Codex, then Claude
-accounts, then Cursor. Never relay the pool header upstream, never retry after
+accounts, then Cursor. Both are defaults: the accounts file's `fallback` section (`chains` per family
+`claude`/`codex`/provider name, `on` = `rate_limit`/`auth`/`server_error`, `threshold` %) overrides them.
+`account_inject` attaches it as `x-claude-codex-fallback` beside the pool (stripped the same way) and alone
+applies `threshold`, putting accounts whose last reply reported 5h/7d utilization at or over it last in
+the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`. Never relay the pool header upstream, never retry after
 output, and never send a thread delta to another account (refuse so Claude Code
 resends history). Attempts with a fallback after them run inside
 `retry::fail_fast`, including its explicit capture into the spawned HTTP SSE reader,
@@ -208,7 +212,7 @@ Run tests as CI does with an empty `HOME`: tests that read the machine's Codex l
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 cswap slots may hold `claude setup-token`s (no `expiresAt`, no refresh, inference scope only): `slot_token()` uses them
 as-is; they cannot answer usage/profile, so the dashboard reads their usage from recorded reply headers.

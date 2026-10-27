@@ -1776,8 +1776,9 @@ async fn dispatch_request(
         }),
     };
 
-    let fallback_pool = account_pool.filter(|_| {
-        auto_review_route.is_none() && crate::fallback::handles(provider.name(), &normalized_model)
+    let fallback_pool = account_pool.filter(|pool| {
+        auto_review_route.is_none()
+            && crate::fallback::handles(provider.name(), &normalized_model, &pool.policy)
     });
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await

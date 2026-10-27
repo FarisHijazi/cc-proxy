@@ -90,6 +90,33 @@
   pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12px/1.4 var(--mono);
         white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow: auto; }
   details summary { cursor: pointer; color: var(--muted); margin: 10px 0 6px; }
+  a { color: var(--accent); }
+  .providers { display: flex; gap: 8px; flex-wrap: wrap; }
+  .provider { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 10px;
+              border: 1px solid var(--line); background: var(--panel); font-size: 13px; }
+  .provider.off { opacity: .5; }
+  .failover { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; }
+  @media (max-width: 820px) { .failover { grid-template-columns: minmax(0, 1fr); } }
+  .chain { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 10px; align-items: start;
+           padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .chain:first-child { padding-top: 0; } .chain:last-child { border-bottom: 0; padding-bottom: 0; }
+  @media (max-width: 560px) { .chain { grid-template-columns: minmax(0, 1fr); } }
+  .chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-height: 30px; }
+  .chip { --c: var(--accent); display: inline-flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px;
+          border-radius: 8px; font-size: 12px; cursor: grab; user-select: none; max-width: 100%;
+          background: color-mix(in srgb, var(--c) 13%, var(--panel)); border: 1px solid color-mix(in srgb, var(--c) 40%, var(--line)); }
+  .chip b { font-weight: 600; color: var(--c); font-variant-numeric: tabular-nums; }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip button { border: 0; background: none; padding: 0 3px; color: var(--muted); line-height: 1; }
+  .chip.dragging { opacity: .35; } .chip.over { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .chip.missing { --c: var(--bad); }
+  .arrow { color: var(--muted); font-size: 11px; }
+  .chips select { padding: 3px 6px; font-size: 12px; max-width: 190px; }
+  .p-anthropic { --c: #d97757; } .p-codex { --c: #10a37f; } .p-cursor { --c: #7c3aed; } .p-cursor-cli { --c: #a855f7; }
+  .p-gemini { --c: #3b82f6; } .p-kimi { --c: #0891b2; } .p-grok { --c: #64748b; }
+  .trigger { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+  .trigger div { flex: 1; } .trigger small { display: block; color: var(--muted); font-size: 11px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -106,6 +133,15 @@
 
   <h2>Routing</h2>
   <div class="panel" id="routing"><div class="skeleton">Loading settings…</div></div>
+
+  <h2>Providers</h2>
+  <div class="providers" id="providers"><div class="skeleton">Asking the router which backends are signed in…</div></div>
+
+  <h2>Failover <span class="muted" style="text-transform:none;letter-spacing:0">what each model family tries, in order, before giving up</span></h2>
+  <div class="failover">
+    <div class="panel" id="chains"><div class="skeleton">Loading failover chains…</div></div>
+    <div class="panel" id="triggers"><div class="skeleton">Loading triggers…</div></div>
+  </div>
 
   <h2>Accounts <span class="muted" style="text-transform:none;letter-spacing:0">in fallback order</span></h2>
   <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
@@ -181,7 +217,7 @@ function renderRouting() {
       <input type="number" id="days" min="1" style="width:70px" value="${state.traffic_days ?? ""}" placeholder="ever">
       <span class="small muted">days</span>
     </div>
-    <p class="small muted" style="margin:10px 0 0">Sessions stick to their account; on a quota limit the proxy moves on down the account list, then to Codex, then Cursor.</p>`;
+    <p class="small muted" style="margin:10px 0 0">Sessions stick to their account; when it fails, the request walks the Failover chain below.</p>`;
   $("routing").querySelectorAll("[data-s]").forEach((btn) => btn.onclick = () =>
     save({balance: {strategy: btn.dataset.s, prefer: btn.dataset.s === "prefer" ? (b.prefer || names[0]) : undefined}}));
   const prefer = $("prefer");
@@ -200,6 +236,7 @@ function meter(name, w) {
 
 function renderAccounts() {
   const b = state.balance, list = state.accounts, disabled = list.filter((a) => a.disabled).map((a) => a.alias);
+  const threshold = state.fallback.threshold ?? null;
   $("accounts").innerHTML = list.map((a, i) => {
     const preferred = b.strategy === "prefer" && b.prefer === a.alias;
     const windows = Object.entries(a.usage);
@@ -207,6 +244,7 @@ function renderAccounts() {
       <div class="card-head">
         <span class="name">${esc(a.email || a.alias)}</span><span class="spacer"></span>
         ${preferred ? `<span class="badge accent">preferred</span>` : ""}
+        ${threshold != null && windows.some(([, w]) => w.utilization >= threshold) ? `<span class="badge" style="color:var(--warn)" title="At or above the ${threshold}% usage threshold: tried after every other account">tried last</span>` : ""}
         ${a.plan ? `<span class="badge">${esc(a.plan)}</span>` : ""}
         ${a.token_only ? `<span class="badge" title="claude setup-token: model calls only, no usage or profile API">setup-token</span>` : ""}
       </div>
@@ -286,7 +324,116 @@ async function openFlow(id) {
   } catch (e) { $("flow-body").innerHTML = `<div class="error">${esc(e.message)}</div>`; }
 }
 
-function render() { renderHeader(); renderRouting(); renderAccounts(); }
+const FAMILIES = [["claude", "Claude models"], ["codex", "Codex / GPT models"], ["gemini", "Gemini models"],
+                  ["cursor-cli", "cursor-agent CLI"], ["cursor", "Cursor API"]];
+const PROVIDER = {anthropic: "Claude", codex: "Codex", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI",
+                  gemini: "Gemini", kimi: "Kimi", grok: "Grok"};
+const TRIGGERS = [["rate_limit", "Rate limited (429)", "Quota used up: try the next target, skip this one until it resets"],
+                  ["auth", "Login rejected (401)", "A Claude account's login failed: skip it for a minute"],
+                  ["server_error", "Server error (5xx)", "Backend down or overloaded: try the next target right away"]];
+const TIERED = ["claude", "codex", "cursor"];
+// The target that serves a family's own request untouched ("accounts" for Claude).
+const own = (family) => family === "claude" ? "accounts" : family;
+
+function failover() {
+  const f = state.fallback || {};
+  return {chains: {...(f.chains || {})}, on: {rate_limit: true, auth: true, server_error: false, ...(f.on || {})},
+          threshold: f.threshold ?? null};
+}
+function chainOf(family) {
+  return (state.fallback.chains || {})[family] ?? state.default_chains[family] ?? [own(family)];
+}
+function providerOf(target, family) {
+  if (target === "accounts") return "anthropic";
+  if (target === family) return family;
+  if (target === "codex" || target === "cursor") return target;
+  const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(target));
+  return hit ? hit[0] : target.startsWith("claude-") ? "anthropic" : target.startsWith("gemini-") ? "gemini" : null;
+}
+function targetLabel(target, family) {
+  if (target === "accounts") return family === "claude" ? "Claude accounts · as requested" : "Claude accounts · same tier";
+  if (target === family) return "as requested";
+  return {codex: "Codex · same tier", cursor: "Cursor · same tier"}[target] || target;
+}
+function saveFailover(edit) { const f = failover(); edit(f); save({fallback: f}); }
+
+function renderProviders() {
+  const p = state.providers;
+  // Unreachable is not "unavailable": say so once instead of greying out every backend.
+  if (!p.reachable) {
+    $("providers").innerHTML = `<span class="provider"><span class="dot bad"></span>router unreachable: backend availability unknown</span>`;
+    return;
+  }
+  $("providers").innerHTML = Object.entries(p.models).map(([name, ids]) => `<span class="provider ${ids.length ? "" : "off"}" title="${esc(ids.join("\n") || "not signed in on the proxy host")}">
+      <span class="dot ${ids.length ? "ok" : ""}"></span><strong>${esc(PROVIDER[name] || name)}</strong>
+      <span class="small muted">${ids.length ? `${ids.length} model${ids.length === 1 ? "" : "s"}` : "unavailable"}</span></span>`).join("");
+}
+
+function addOptions(family) {
+  // Only Claude, Codex and Cursor ids have a tier (Opus/Sol, Fable/Astra, Sonnet/Luna); others name a model.
+  const tiered = TIERED.includes(family) ? ["accounts", "codex", "cursor"].filter((t) => t !== family)
+    .map((t) => `<option value="${t}">${esc(targetLabel(t, family))}</option>`) : [];
+  if (family !== "claude") tiered.unshift(`<option value="${esc(family)}">${esc(PROVIDER[family] || family)} · as requested</option>`);
+  return `<optgroup label="Shortcuts">${tiered.join("")}</optgroup>` +
+    Object.entries(state.providers.models).filter(([, ids]) => ids.length).map(([name, ids]) =>
+      `<optgroup label="${esc(PROVIDER[name] || name)}">${ids.map((id) => `<option>${esc(id)}</option>`).join("")}</optgroup>`).join("");
+}
+
+let dragging = null;
+function renderChains() {
+  const custom = state.fallback.chains || {};
+  $("chains").innerHTML = FAMILIES.map(([family, title]) => {
+    const chain = chainOf(family);
+    return `<div class="chain" data-family="${family}">
+      <div><div style="font-weight:600">${esc(title)}</div>
+        <div class="small muted">${custom[family] ? `custom · <a href="#" data-reset>reset</a>` : state.default_chains[family] ? "default" : "no failover"}</div></div>
+      <div class="chips">${chain.map((t, i) => {
+        const provider = providerOf(t, family);
+        const up = !state.providers.reachable || (provider && (state.providers.models[provider] || []).length);
+        return `${i ? `<span class="arrow">→</span>` : ""}<span class="chip p-${esc(provider || "none")} ${up ? "" : "missing"}" draggable="true" data-i="${i}"
+          title="${esc(up ? `${PROVIDER[provider] || provider}: drag to reorder` : "Not available on the router right now: skipped")}">
+          <b>${i + 1}</b><span>${esc(targetLabel(t, family))}</span><button data-rm="${i}" title="Remove">×</button></span>`;
+      }).join("")}<select data-add><option value="">+ add target</option>${addOptions(family)}</select></div></div>`;
+  }).join("") + `<p class="small muted" style="margin:12px 0 0">"Same tier" picks the equivalent model (Opus ↔ Sol ↔ Cursor Opus, Fable ↔ Astra, Sonnet/Haiku ↔ Luna).
+    Nothing is retried once a reply has started streaming.</p>`;
+  $("chains").querySelectorAll(".chain").forEach((row) => {
+    const family = row.dataset.family, chain = chainOf(family);
+    const put = (next) => saveFailover((f) => { f.chains[family] = next; });
+    row.querySelector("[data-reset]")?.addEventListener("click", (e) => { e.preventDefault(); saveFailover((f) => { delete f.chains[family]; }); });
+    row.querySelector("[data-add]").onchange = (e) => e.target.value && put([...chain, e.target.value]);
+    row.querySelectorAll("[data-rm]").forEach((x) => x.onclick = () => put(chain.filter((_, i) => i !== +x.dataset.rm)));
+    row.querySelectorAll(".chip").forEach((chip) => {
+      chip.ondragstart = () => { dragging = {family, from: +chip.dataset.i}; chip.classList.add("dragging"); };
+      chip.ondragend = () => { dragging = null; chip.classList.remove("dragging"); };
+      chip.ondragover = (e) => { if (dragging?.family === family) { e.preventDefault(); chip.classList.add("over"); } };
+      chip.ondragleave = () => chip.classList.remove("over");
+      chip.ondrop = (e) => {
+        e.preventDefault();
+        const next = [...chain], [moved] = next.splice(dragging.from, 1);
+        next.splice(+chip.dataset.i, 0, moved);
+        put(next);
+      };
+    });
+  });
+}
+
+function renderTriggers() {
+  const f = failover(), on = f.threshold != null, pct = f.threshold ?? 90;
+  $("triggers").innerHTML = `<div class="small muted" style="margin-bottom:4px">Move to the next target when…</div>
+    ${TRIGGERS.map(([key, title, hint]) => `<div class="trigger"><div>${title}<small>${hint}</small></div>
+      <label class="switch"><input type="checkbox" data-on="${key}" ${f.on[key] ? "checked" : ""}><span></span></label></div>`).join("")}
+    <div class="trigger" style="border-top:1px solid var(--line);margin-top:6px;padding-top:12px">
+      <div>Usage threshold <strong id="pct">${on ? pct + "%" : "off"}</strong>
+        <small>Claude accounts at or above this share of their 5-hour or 7-day limit go to the end of the list, before they run out</small></div>
+      <label class="switch"><input type="checkbox" id="th-on" ${on ? "checked" : ""}><span></span></label></div>
+    <input type="range" id="th" min="50" max="100" step="5" value="${pct}" ${on ? "" : "disabled"}>`;
+  $("triggers").querySelectorAll("[data-on]").forEach((x) => x.onchange = () => saveFailover((f) => { f.on[x.dataset.on] = x.checked; }));
+  $("th-on").onchange = (e) => saveFailover((f) => { f.threshold = e.target.checked ? pct : null; });
+  $("th").oninput = (e) => { $("pct").textContent = e.target.value + "%"; };
+  $("th").onchange = (e) => saveFailover((f) => { f.threshold = +e.target.value; });
+}
+
+function render() { renderHeader(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); }
 
 async function loadState() {
   try { state = await api("/api/state"); render(); showError(null); }

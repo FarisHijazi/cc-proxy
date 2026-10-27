@@ -20,6 +20,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
 const POOL: &str = "x-claude-codex-account-pool";
+const POLICY: &str = "x-claude-codex-fallback";
 
 struct Upstream {
     base: String,
@@ -42,7 +43,7 @@ async fn anthropic_upstream() -> Upstream {
             let auth = req.headers()["authorization"].to_str().unwrap().to_string();
             log.lock()
                 .unwrap()
-                .push((auth.clone(), req.headers().contains_key(POOL)));
+                .push((auth.clone(), req.headers().contains_key(POOL) || req.headers().contains_key(POLICY)));
             let body = axum::body::to_bytes(req.into_body(), 1_000_000).await.unwrap();
             let model = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
             if auth.starts_with("Bearer invalid") {
@@ -137,6 +138,16 @@ async fn send(
     pool: Option<String>,
     thread: bool,
 ) -> (StatusCode, Value) {
+    send_with(router, model, pool, thread, None).await
+}
+
+async fn send_with(
+    router: Router,
+    model: &str,
+    pool: Option<String>,
+    thread: bool,
+    policy: Option<Value>,
+) -> (StatusCode, Value) {
     let mut payload =
         json!({"model": model, "max_tokens": 1, "messages": [{"role":"user","content":"hi"}]});
     if thread {
@@ -149,6 +160,9 @@ async fn send(
         .header("authorization", "Bearer own-session-token");
     if let Some(pool) = pool {
         request = request.header(POOL, pool);
+    }
+    if let Some(policy) = policy {
+        request = request.header(POLICY, policy.to_string());
     }
     let response = router
         .oneshot(request.body(Body::from(payload.to_string())).unwrap())
@@ -235,6 +249,87 @@ async fn all_accounts_exhausted_uses_codex_tier_then_cursor() {
     assert_eq!(body["servedBy"], "cursor");
     assert_eq!(*codex.seen.lock().unwrap(), ["gpt-6.1-sol"]);
     assert_eq!(*cursor.seen.lock().unwrap(), ["cursor:claude-opus-5"]);
+}
+
+#[tokio::test]
+async fn a_configured_chain_replaces_the_default_order() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let gemini = stub("gemini", "gemini-3-pro", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone(), gemini.clone()]);
+    let policy = json!({"chains": {"claude": ["accounts", "gemini-3-pro", "codex"]}});
+    let (status, body) = send_with(
+        router,
+        "claude-opus-5-5",
+        Some(pool(&[("h1", "dead-h1")])),
+        false,
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "gemini");
+    assert!(codex.seen.lock().unwrap().is_empty());
+    assert!(
+        upstream.seen.lock().unwrap().iter().all(|(_, pool)| !pool),
+        "neither the pool nor the policy reaches the upstream"
+    );
+}
+
+#[tokio::test]
+async fn server_errors_move_on_only_when_enabled() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6-luna", StatusCode::BAD_GATEWAY);
+    let cursor = stub("cursor", "cursor:claude-sonnet-5", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone(), cursor.clone()]);
+    let chains = json!({"codex": ["codex", "cursor"]});
+    let (status, _) = send_with(
+        router.clone(),
+        "gpt-6-luna",
+        Some("[]".into()),
+        false,
+        Some(json!({"chains": chains})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(cursor.seen.lock().unwrap().is_empty());
+    let (status, body) = send_with(
+        router.clone(),
+        "gpt-6-luna",
+        Some("[]".into()),
+        false,
+        Some(json!({"chains": chains, "on": {"server_error": true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "cursor");
+    // A server error is transient, so it never puts Codex on cooldown.
+    send_with(
+        router,
+        "gpt-6-luna",
+        Some("[]".into()),
+        false,
+        Some(json!({"chains": chains})),
+    )
+    .await;
+    assert_eq!(codex.seen.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn quota_fallback_can_be_switched_off() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let (status, _) = send_with(
+        router,
+        "claude-opus-5-5",
+        Some(pool(&[("i1", "dead-i1"), ("i2", "live-i2")])),
+        false,
+        Some(json!({"on": {"rate_limit": false}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    assert!(codex.seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

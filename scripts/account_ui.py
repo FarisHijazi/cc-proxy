@@ -27,6 +27,29 @@ HERE = Path(__file__).resolve().parent
 STRATEGIES = ["session", "prefer", "round-robin", "least-sessions"]
 WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
 CACHE_S = 60
+# The router's chains when the accounts file has no "fallback.chains" entry (src/fallback.rs).
+DEFAULT_CHAINS = {"claude": ["accounts", "codex", "cursor"], "codex": ["codex", "accounts", "cursor"]}
+TRIGGERS = ["rate_limit", "auth", "server_error"]
+PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "grok"]
+
+
+def checked_fallback(fallback):
+    """The accounts file's "fallback" section, validated; None removes it (router defaults)."""
+    if fallback is None:
+        return None
+    chains, on, threshold = fallback.get("chains", {}), fallback.get("on", {}), fallback.get("threshold")
+    if not all(isinstance(f, str) and f and isinstance(t, list) and all(isinstance(x, str) and x.strip() for x in t)
+               for f, t in chains.items()):
+        raise ValueError("fallback.chains maps a model family to a list of targets")
+    if not set(on) <= set(TRIGGERS) or not all(isinstance(v, bool) for v in on.values()):
+        raise ValueError(f"fallback.on takes true/false for {', '.join(TRIGGERS)}")
+    if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                                  or not 0 < threshold <= 100):
+        raise ValueError("fallback.threshold must be a percentage from 1 to 100, or empty")
+    result = {"chains": {f: [x.strip() for x in t] for f, t in chains.items()}, "on": dict(on)}
+    if threshold is not None:
+        result["threshold"] = threshold
+    return result
 COLUMNS = "id, started, client_host, client_ip, client_user, cwd, launch_cwd, account, served_by, model, status, method, url"
 
 
@@ -83,6 +106,23 @@ class Dashboard:
             value = {"error": str(error)[:200]}
         self.cache[(alias, path)] = (time.time(), value)
         return value
+
+    def providers(self):
+        """Each backend and the model ids the router lists for it; it lists only signed-in backends."""
+        hit = self.cache.get("models")
+        if not hit or time.time() - hit[0] >= CACHE_S:
+            try:
+                # The --serve proxy sends every api.anthropic.com path, this one included, to the router.
+                with self.opener.open("https://api.anthropic.com/v1/models", timeout=10) as response:
+                    listed = [m["display_name"] for m in json.load(response)["data"]]
+            except Exception:  # noqa: BLE001 - shown as "router unreachable"
+                listed = None
+            hit = self.cache["models"] = (time.time(), listed)
+        models = {name: [] for name in PROVIDERS}
+        for display in hit[1] or []:
+            model, _, provider = display.rpartition(" (")
+            models.setdefault(provider.rstrip(")"), []).append(model)
+        return {"reachable": hit[1] is not None, "models": models}
 
     def last_reply(self, alias, cfg):
         db = self.database(cfg)
@@ -143,6 +183,9 @@ class Dashboard:
             "strategies": STRATEGIES,
             "traffic_days": cfg.get("traffic_days"),
             "renamed": cfg.get("renamed", {}),
+            "fallback": cfg.get("fallback", {}),
+            "default_chains": DEFAULT_CHAINS,
+            "providers": self.providers(),
             "proxy": {"address": f"{self.proxy.hostname}:{self.proxy.port}", "up": proxy_up},
             "db": {
                 "path": str(db_path) if db_path else None,
@@ -229,6 +272,12 @@ class Dashboard:
             if days is not None and (not isinstance(days, int) or days < 1):
                 raise ValueError("traffic_days must be a positive whole number or empty")
             cfg["traffic_days"] = days
+        if "fallback" in change:
+            fallback = checked_fallback(change["fallback"])
+            if fallback is None:
+                cfg.pop("fallback", None)
+            else:
+                cfg["fallback"] = fallback
         shutil.copy2(self.accounts_file, self.accounts_file.with_name(self.accounts_file.name + ".before-ui"))
         tmp = self.accounts_file.with_suffix(".ui-tmp")
         tmp.write_text(json.dumps(cfg, indent=2) + "\n")

@@ -27,6 +27,11 @@ SETUP_TOKEN_REREAD_MS = 60 * 60 * 1000
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
+# The accounts file's "fallback" section (chains per model family, triggers) for the
+# router. Same rules as the pool: only this addon sets it, the router strips it.
+POLICY_HEADER = "x-claude-codex-fallback"
+# Names the account that answered (`alias/model`), set by the router on every reply.
+SERVED_BY_HEADER = "x-claude-codex-served-by"
 UNUSABLE_RETRY_S = 300
 # How the first account of a session is chosen (accounts file "balance.strategy"):
 # session = the placeholder's own alias, prefer = "balance.prefer" for everyone,
@@ -100,6 +105,9 @@ class AccountInject:
         self.traffic_db = None
         self.traffic_days = None
         self.disabled = set()
+        self.fallback = {}
+        # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
+        self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
 
     def load(self, loader):
@@ -132,6 +140,11 @@ class AccountInject:
         self.traffic_days = data.get("traffic_days")
         # Switched off (in the UI): never tried, unless a session names the alias itself.
         self.disabled = set(data.get("disabled", []))
+        fallback = data.get("fallback", {})
+        threshold = fallback.get("threshold")
+        if threshold is not None and not 0 < float(threshold) <= 100:
+            raise ValueError("fallback.threshold must be a percentage")
+        self.fallback = fallback
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
@@ -190,8 +203,12 @@ class AccountInject:
         """Every usable login, the session's starting account first, then file order.
         A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
         alias = alias if pinned else self.start(alias, session)
+        names = [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]
+        # Accounts at the usage threshold go last: still a fallback, never a first choice.
+        # The starting account keeps "primary", so its thread deltas never move.
+        names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
         pool = []
-        for name in [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]:
+        for name in names:
             if self.unusable.get(name, 0) > time.time():
                 continue
             try:
@@ -199,6 +216,33 @@ class AccountInject:
             except Exception:  # noqa: BLE001 - one broken slot must not block the rest
                 self.unusable[name] = time.time() + UNUSABLE_RETRY_S
         return pool
+
+    def hot(self, alias):
+        """Whether an unexpired 5h or 7d window of the account is at the fallback threshold."""
+        threshold = self.fallback.get("threshold")
+        now = time.time()
+        return bool(threshold) and any(
+            used >= float(threshold) and reset > now for used, reset in self.usage.get(alias, [])
+        )
+
+    def responseheaders(self, flow):
+        # Every reply carries the answering account's utilization; remember it for hot().
+        if not flow.metadata.get("account_pool") or flow.response is None:
+            return
+        headers = flow.response.headers
+        alias = headers.get(SERVED_BY_HEADER, "").split("/")[0]
+        if alias not in self.accounts:
+            return
+        windows = []
+        for key in ("5h", "7d"):
+            used = headers.get(f"anthropic-ratelimit-unified-{key}-utilization")
+            reset = headers.get(f"anthropic-ratelimit-unified-{key}-reset")
+            try:
+                windows.append((float(used) * 100, float(reset) if reset else time.time() + UNUSABLE_RETRY_S))
+            except (TypeError, ValueError):
+                continue
+        if windows:
+            self.usage[alias] = windows
 
     def cascades(self, placeholder, path=""):
         """True when the next proxy, not this one, holds the login a placeholder names."""
@@ -309,6 +353,7 @@ class AccountInject:
     def requestheaders(self, flow):
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
+        flow.request.headers.pop(POLICY_HEADER, None)
         if self.upstream and flow.request.host == "bridge.claudeusercontent.com":
             # The router reaches Anthropic through the next proxy; the Chrome bridge must too.
             flow.server_conn.via = self.upstream
@@ -333,6 +378,9 @@ class AccountInject:
                 else:
                     flow.request.headers.pop("authorization", None)
                 flow.request.headers[POOL_HEADER] = json.dumps(pool)
+                if self.fallback:
+                    flow.request.headers[POLICY_HEADER] = json.dumps(self.fallback)
+                flow.metadata["account_pool"] = True
                 return
             token = self.resolve(placeholder, flow.request.path)
             private = parse(placeholder)[2]
