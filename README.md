@@ -30,6 +30,129 @@ your ChatGPT plan, in the same session, and flip between them whenever you want.
 - A **ChatGPT Plus, Pro, or Team** plan and the **Codex CLI** signed in.
 - **Rust** only if you install from crates.io or source. The prebuilt binary needs nothing.
 
+## Install the account proxy (`cc-proxy`)
+
+One line, nothing to clone. You need [uv](https://docs.astral.sh/uv/):
+
+```sh
+uvx --from git+https://github.com/FarisHijazi/cc-proxy cc-proxy --help
+```
+
+To keep it as a command on your PATH instead:
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+```
+
+This installs `cc-proxy` (the launcher) and `cc-proxy-traffic` (the traffic reader).
+The first `--serve` run downloads the prebuilt `claude-codex` router for your platform
+from this repo's release and checks its checksum. A `claude-codex` already on your PATH
+is used instead.
+
+### Run the server
+
+Run it on the machine that holds the Claude logins. Add each login with `cswap add`
+from [claude-swap](https://github.com/FarisHijazi/claude-swap), then list them in
+`~/.config/claude-codex/accounts.json`:
+
+```json
+{
+  "main": "user@example.com",
+  "accounts": {"user@example.com": 1, "other@example.com": 2},
+  "traffic_db": "~/.local/state/claude-codex/traffic.sqlite3",
+  "traffic_days": 30
+}
+```
+
+```sh
+cc-proxy --serve --listen-host "$(tailscale ip -4)" --port 18790 \
+  --accounts-file ~/.config/claude-codex/accounts.json
+```
+
+The proxy has no authentication of its own. Bind it only to a private address, such
+as a tailnet IP. Clients need its CA certificate, which it writes to
+`~/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem`.
+
+### Run the server as a service
+
+Linux (systemd user service):
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/cc-proxy.service <<UNIT
+[Unit]
+Description=cc-proxy account proxy
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/cc-proxy --serve --listen-host $(tailscale ip -4) --port 18790 --accounts-file %h/.config/claude-codex/accounts.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now cc-proxy
+loginctl enable-linger "$USER"     # keep it running after you log out
+journalctl --user -u cc-proxy -f   # follow its log
+```
+
+macOS (launchd agent):
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+IP=$(tailscale ip -4 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4)
+cat > ~/Library/LaunchAgents/build.cc-proxy.plist <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>build.cc-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/cc-proxy</string>
+    <string>--serve</string>
+    <string>--listen-host</string><string>$IP</string>
+    <string>--port</string><string>18790</string>
+    <string>--accounts-file</string><string>$HOME/.config/claude-codex/accounts.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/cc-proxy.log</string>
+</dict>
+</plist>
+PLIST
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/build.cc-proxy.plist
+tail -f ~/Library/Logs/cc-proxy.log
+# to stop and remove it: launchctl bootout "gui/$(id -u)/build.cc-proxy"
+```
+
+Docker (Linux host; mounts this machine's logins, see `compose.yaml`):
+
+```sh
+git clone https://github.com/FarisHijazi/cc-proxy && cd cc-proxy
+CC_PROXY_BIND="$(tailscale ip -4)" docker compose up -d
+docker compose logs -f
+```
+
+The CA is in the `cc-proxy-state` volume:
+`docker compose exec cc-proxy cat /home/app/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem`
+
+### Connect a client
+
+On every machine that runs Claude Code, with the server's CA saved as `server-ca.pem`:
+
+```sh
+uvx --from git+https://github.com/FarisHijazi/cc-proxy cc-proxy \
+  --accounts-file ~/.config/claude-codex/accounts.json \
+  --via http://SERVER_TAILNET_IP:18790 --via-ca server-ca.pem -- --resume
+```
+
+Everything after `--` goes to `claude`. The client's accounts file names the same
+aliases. Its `main` decides which login claude.ai sees for artifacts and Remote Control.
+
 ## Quickstart
 
 **1. Install `claude-codex`** using a prebuilt binary:

@@ -1,0 +1,8 @@
+target
+worktrees
+.git
+.audit
+.cc
+.cc-convos
+docs
+tests

@@ -199,6 +199,9 @@ A client's `"pin_main": true` adds `+pin`, so its sessions start on their own al
 metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` prunes). See
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
 `serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
+Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the
+router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
+`Dockerfile` and `compose.yaml` run `--serve`. See `docs/devlog/claude_20261027-cc-proxy-packaging.md` (plain path).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

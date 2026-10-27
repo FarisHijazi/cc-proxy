@@ -1,0 +1,19 @@
+# docker compose up -d: runs cc-proxy --serve with this machine's logins.
+# The proxy has no auth of its own, so publish it only on a private address
+# (a tailnet IP); CC_PROXY_BIND defaults to loopback.
+services:
+  cc-proxy:
+    build: .
+    image: cc-proxy
+    restart: unless-stopped
+    ports:
+      - "${CC_PROXY_BIND:-127.0.0.1}:18790:18790"
+    volumes:
+      - ${HOME}/.config/claude-codex/accounts.json:/config/accounts.json:ro
+      - ${HOME}/.local/share/claude-swap:/home/app/.local/share/claude-swap
+      - ${HOME}/.claude:/home/app/.claude:ro
+      - ${HOME}/.claude.json:/home/app/.claude.json:ro
+      - ${HOME}/.codex:/home/app/.codex
+      - cc-proxy-state:/home/app/.local/state
+volumes:
+  cc-proxy-state:
