@@ -437,3 +437,16 @@ def test_cascade_sends_the_chrome_bridge_through_the_next_proxy(monkeypatch):
     inject.websocket_message(flow)
     assert json.loads(flow.websocket.messages[-1].text)["oauth_token"] == "proxy-account-other"
     assert not flow.websocket.messages[-1].dropped
+
+
+def test_pinned_sessions_start_on_their_own_account_whatever_the_balance(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.strategy, inject.prefer = "prefer", "b"
+    assert session_pool(inject, "s1", "c") == ["b", "a", "c"]
+    flow = inference("Bearer proxy-account-c+pin+rc=a")
+    flow.request.headers[module.SESSION_HEADER] = "s2"
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [e["alias"] for e in pool] == ["c", "a", "b"]
+    assert flow.request.headers["authorization"] == "Bearer real-3"

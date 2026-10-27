@@ -146,6 +146,10 @@ session on one main account. `round-robin` and `least-sessions` spread new
 sessions. Every strategy keeps a session on its account; individual requests
 are never rotated, because prompt caches are per account.
 
+To make one machine always start on its own main account, whatever the proxy
+prefers, set `"pin_main": true` in that machine's accounts file. Its sessions
+still fall back to the other accounts when the main one runs out.
+
 Name accounts by their email, so it is obvious which login is which. Aliases may
 use letters, digits, `.`, `@`, `_` and `-`. To rename an alias without breaking
 sessions that are already running, map the old name in the proxy's accounts file;

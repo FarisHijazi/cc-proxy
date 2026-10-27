@@ -75,7 +75,7 @@ def parse(placeholder):
     owners = [s.removeprefix("rc=") for s in suffixes if s.startswith("rc=")]
     chrome_selection(placeholder)
     if len(owners) > 1 or any(
-        s not in {"private", "chromes"} and not s.startswith(("rc=", "chrome="))
+        s not in {"private", "chromes", "pin"} and not s.startswith(("rc=", "chrome="))
         for s in suffixes
     ):
         raise ValueError(f"malformed account placeholder {placeholder!r}")
@@ -173,9 +173,10 @@ class AccountInject:
         self.sticky[session] = (entry[0], now)
         return entry[0]
 
-    def pool(self, alias, session=None):
-        """Every usable login, the session's starting account first, then file order."""
-        alias = self.start(alias, session)
+    def pool(self, alias, session=None, pinned=False):
+        """Every usable login, the session's starting account first, then file order.
+        A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
+        alias = alias if pinned else self.start(alias, session)
         pool = []
         for name in [alias, *(a for a in self.accounts if a != alias)]:
             if self.unusable.get(name, 0) > time.time():
@@ -312,7 +313,8 @@ class AccountInject:
                 if alias not in self.accounts:
                     raise ValueError(f"unknown account alias {alias!r}")
                 flow.metadata["account_private"] = private
-                pool = self.pool(alias, flow.request.headers.get(SESSION_HEADER))
+                pinned = "pin" in placeholder.split("+")[1:]
+                pool = self.pool(alias, flow.request.headers.get(SESSION_HEADER), pinned)
                 if pool:
                     flow.request.headers["authorization"] = pool[0]["authorization"]
                 else:

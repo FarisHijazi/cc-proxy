@@ -633,13 +633,16 @@ CLAUDE_AI_SCOPES = [
 ]
 
 
-def placeholder_login(alias, opener, config, secure, remote_control=None, private=False, chrome=None):
+def placeholder_login(alias, opener, config, secure, remote_control=None, private=False, chrome=None, pin=False):
     """Write a login whose token the --serve proxy swaps for the real one.
 
     `remote_control` names another alias whose token the proxy uses on /v1/code/
     (Remote Control) only, so that login's claude.ai and phone app see the session.
-    `private` tells HQ never to mirror this session to claude.ai."""
+    `private` tells HQ never to mirror this session to claude.ai. `pin` starts inference
+    on this alias whatever the proxy's balance prefers (fallback still applies)."""
     token = f"proxy-account-{alias}"
+    if pin:
+        token += "+pin"
     if remote_control and remote_control != alias:
         token += f"+rc={remote_control}"
     if private:
@@ -702,6 +705,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
                     chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
+                    pin=main and getattr(args, "pin_main", False),
                 )
             except (OSError, ValueError, KeyError) as error:
                 if alias == main_account:
@@ -824,6 +828,8 @@ def main():
     )
     if not args.remote_control_account and args.accounts_file:
         args.remote_control_account = json.loads(args.accounts_file.read_text()).get("remote_control")
+    # Accounts file "pin_main": this machine's sessions start on its main account.
+    args.pin_main = bool(args.accounts_file and json.loads(args.accounts_file.read_text()).get("pin_main"))
     if args.remote_control_account and args.remote_control_account not in accounts:
         parser.error("--remote-control-account must name a configured account alias")
     if args.chrome_account and args.chrome_account not in accounts:

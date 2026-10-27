@@ -36,3 +36,12 @@ another as its backend.
 SIGTERM to the launcher alone leaves the router and mitmdump running: Python's
 default SIGTERM handler skips `serve()`'s `finally`. systemd kills the whole cgroup,
 so the ftower service is unaffected. Test runs must stop the children too.
+
+## 2026-10-27: `pin_main`
+
+A client accounts file with `"pin_main": true` adds `+pin` to its main placeholder;
+`AccountInject.pool()` then starts that session on its own alias instead of
+`balance.prefer`. Used on one work VM: its main is the work login, so artifacts land
+there, and Remote Control stays on the RC owner. The shared proxy now prefers that work
+login, with the personal login second in fallback order. Verified: suite 129 passed; a
+headless launch on the VM printed the work main account and replied.
