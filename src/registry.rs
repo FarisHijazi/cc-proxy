@@ -2,11 +2,12 @@ use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
     provider::{Availability, CliHandlers, Provider, RequestContext},
+    providers::codex::translate::model_allowlist::selectable_models,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
@@ -37,18 +38,6 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
     "composer-2.5-fast",
 ];
 
-pub(crate) const CODEX_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-];
-
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
 pub(crate) use crate::providers::gemini::models::GEMINI_MODELS;
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
@@ -57,6 +46,7 @@ pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
+    pub(crate) cooldowns: crate::fallback::Cooldowns,
 }
 
 impl Registry {
@@ -69,7 +59,7 @@ impl Registry {
                 .map(|alias| (*alias).to_string())
                 .collect(),
         );
-        models.insert("codex".into(), expand_codex_models());
+        models.insert("codex".into(), selectable_models());
         models.insert(
             "kimi".into(),
             KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
@@ -111,6 +101,7 @@ impl Registry {
             alias_provider,
             models,
             handlers,
+            cooldowns: crate::fallback::Cooldowns::default(),
         }
     }
 
@@ -133,6 +124,7 @@ impl Registry {
             alias_provider,
             models,
             handlers,
+            cooldowns: crate::fallback::Cooldowns::default(),
         }
     }
 
@@ -403,22 +395,6 @@ const CURSOR_CLI_PLACEHOLDER: PlaceholderCli = PlaceholderCli {
     provider: "cursor-cli",
 };
 const GEMINI_PLACEHOLDER: PlaceholderCli = PlaceholderCli { provider: "gemini" };
-fn expand_codex_models() -> Vec<String> {
-    let mut set = HashSet::new();
-    let mut out = Vec::new();
-    for model in CODEX_MODELS {
-        if set.insert((*model).to_string()) {
-            out.push((*model).to_string());
-        }
-        let fast = format!("{model}-fast");
-        if set.insert(fast.clone()) {
-            out.push(fast);
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
 fn build_cursor_models() -> Vec<String> {
     let mut out: Vec<String> = CURSOR_LEGACY_MODELS
         .iter()
@@ -516,10 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_codex_model_routes_to_codex_while_default_is_anthropic() {
+    fn explicit_codex_models_route_to_codex_while_default_is_anthropic() {
         let registry = Registry::new(AliasProvider::Anthropic);
-        let p = registry.provider_for_model("gpt-5.6-terra", None);
-        assert_eq!(p.expect("provider").name(), "codex");
+        for model in [
+            "gpt-5.6-terra",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol-fast",
+            "gpt-6.1-sol[1m]",
+        ] {
+            let provider = registry
+                .provider_for_model(model, None)
+                .unwrap_or_else(|| panic!("{model} should route"));
+            assert_eq!(provider.name(), "codex", "{model}");
+        }
     }
 
     #[test]

@@ -1303,8 +1303,11 @@ impl CodexHttpClient {
         let req_id = ctx.req_id.clone();
         let traffic = ctx.traffic.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        // Tokio task locals are not inherited by spawned tasks. Capture the
+        // fallback retry policy while still inside the dispatcher's scope.
+        let fail_fast = crate::retry::fail_fast_enabled();
 
-        tokio::spawn(async move {
+        tokio::spawn(crate::retry::fail_fast(fail_fast, async move {
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
 
@@ -1555,7 +1558,7 @@ impl CodexHttpClient {
                     }
                 }
             }
-        });
+        }));
 
         rx
     }
@@ -3473,6 +3476,73 @@ mod tests {
             Some("response.completed")
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stream_quota_sse_preserves_fail_fast_across_spawn() {
+        for fail_fast in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut attempts = 0_u32;
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        result = listener.accept() => result.unwrap(),
+                    };
+                    read_http_request(&mut stream).await;
+                    attempts += 1;
+                    let body = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                }
+                attempts
+            });
+
+            let client = Arc::new(authenticated_http_test_client(format!(
+                "http://{addr}/responses"
+            )));
+            let request = buffered_test_request();
+            let context = http_test_context();
+            let mut events = crate::retry::fail_fast(
+                fail_fast,
+                client.stream_codex_http_events(&request, &context),
+            )
+            .await
+            .unwrap();
+            // Consume after the caller's task-local scope has ended: the worker
+            // must retain its captured policy independently of the receiver.
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match events
+                        .recv()
+                        .await
+                        .expect("stream must report quota failure")
+                    {
+                        Ok(payload) => assert_eq!(payload["type"], "keepalive"),
+                        Err(error) => break error,
+                    }
+                }
+            })
+            .await
+            .expect("quota failure must reach the caller");
+            assert_eq!(error.status, 429);
+            stop_tx.send(()).unwrap();
+            assert_eq!(
+                server.await.unwrap(),
+                if fail_fast {
+                    1
+                } else {
+                    MAX_BUFFERED_TRANSPORT_ATTEMPTS
+                },
+                "fallback must skip retries while ordinary requests retain their retry budget"
+            );
+        }
     }
 
     #[tokio::test]

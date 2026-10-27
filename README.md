@@ -1,7 +1,7 @@
-# claude-code-with-codex
+# cc-proxy
 
 [![crates.io](https://img.shields.io/crates/v/claude-codex.svg)](https://crates.io/crates/claude-codex)
-[![CI](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml)
+[![CI](https://github.com/FarisHijazi/cc-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/FarisHijazi/cc-proxy/actions/workflows/ci.yml)
 
 Use Claude Code with your **Claude subscription and your ChatGPT (Codex)
 subscription at the same time**, and switch between them mid-conversation.
@@ -14,8 +14,8 @@ the model name:
 
 - Ask for a **Claude** model and it uses your **Claude subscription** (the login
   Claude Code already has). Nothing is translated and no API key is needed.
-- Ask for a **`gpt-5.6-*`** model and it uses your **ChatGPT subscription**
-  through the Codex login.
+- Ask for a **Codex model** such as **`gpt-6.1-sol`** and it uses your
+  **ChatGPT subscription** through the Codex login.
 
 So you can keep Opus on your Claude plan for hard work and run the fast slot on
 your ChatGPT plan, in the same session, and flip between them whenever you want.
@@ -29,6 +29,129 @@ your ChatGPT plan, in the same session, and flip between them whenever you want.
 - **Claude Code** installed and signed in with a **Claude Pro or Max** plan.
 - A **ChatGPT Plus, Pro, or Team** plan and the **Codex CLI** signed in.
 - **Rust** only if you install from crates.io or source. The prebuilt binary needs nothing.
+
+## Install the account proxy (`cc-proxy`)
+
+One line, nothing to clone. You need [uv](https://docs.astral.sh/uv/):
+
+```sh
+uvx --from git+https://github.com/FarisHijazi/cc-proxy cc-proxy --help
+```
+
+To keep it as a command on your PATH instead:
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+```
+
+This installs `cc-proxy` (the launcher) and `cc-proxy-traffic` (the traffic reader).
+The first `--serve` run downloads the prebuilt `claude-codex` router for your platform
+from this repo's release and checks its checksum. A `claude-codex` already on your PATH
+is used instead.
+
+### Run the server
+
+Run it on the machine that holds the Claude logins. Add each login with `cswap add`
+from [claude-swap](https://github.com/FarisHijazi/claude-swap), then list them in
+`~/.config/claude-codex/accounts.json`:
+
+```json
+{
+  "main": "user@example.com",
+  "accounts": {"user@example.com": 1, "other@example.com": 2},
+  "traffic_db": "~/.local/state/claude-codex/traffic.sqlite3",
+  "traffic_days": 30
+}
+```
+
+```sh
+cc-proxy --serve --listen-host "$(tailscale ip -4)" --port 18790 \
+  --accounts-file ~/.config/claude-codex/accounts.json
+```
+
+The proxy has no authentication of its own. Bind it only to a private address, such
+as a tailnet IP. Clients need its CA certificate, which it writes to
+`~/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem`.
+
+### Run the server as a service
+
+Linux (systemd user service):
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/cc-proxy.service <<UNIT
+[Unit]
+Description=cc-proxy account proxy
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/cc-proxy --serve --listen-host $(tailscale ip -4) --port 18790 --accounts-file %h/.config/claude-codex/accounts.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now cc-proxy
+loginctl enable-linger "$USER"     # keep it running after you log out
+journalctl --user -u cc-proxy -f   # follow its log
+```
+
+macOS (launchd agent):
+
+```sh
+uv tool install git+https://github.com/FarisHijazi/cc-proxy
+IP=$(tailscale ip -4 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4)
+cat > ~/Library/LaunchAgents/build.cc-proxy.plist <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>build.cc-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/cc-proxy</string>
+    <string>--serve</string>
+    <string>--listen-host</string><string>$IP</string>
+    <string>--port</string><string>18790</string>
+    <string>--accounts-file</string><string>$HOME/.config/claude-codex/accounts.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/cc-proxy.log</string>
+</dict>
+</plist>
+PLIST
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/build.cc-proxy.plist
+tail -f ~/Library/Logs/cc-proxy.log
+# to stop and remove it: launchctl bootout "gui/$(id -u)/build.cc-proxy"
+```
+
+Docker (Linux host; mounts this machine's logins, see `compose.yaml`):
+
+```sh
+git clone https://github.com/FarisHijazi/cc-proxy && cd cc-proxy
+CC_PROXY_BIND="$(tailscale ip -4)" docker compose up -d
+docker compose logs -f
+```
+
+The CA is in the `cc-proxy-state` volume:
+`docker compose exec cc-proxy cat /home/app/.local/state/claude-codex/account-router/accounts/<main>/ca/mitmproxy-ca-cert.pem`
+
+### Connect a client
+
+On every machine that runs Claude Code, with the server's CA saved as `server-ca.pem`:
+
+```sh
+uvx --from git+https://github.com/FarisHijazi/cc-proxy cc-proxy \
+  --accounts-file ~/.config/claude-codex/accounts.json \
+  --via http://SERVER_TAILNET_IP:18790 --via-ca server-ca.pem -- --resume
+```
+
+Everything after `--` goes to `claude`. The client's accounts file names the same
+aliases. Its `main` decides which login claude.ai sees for artifacts and Remote Control.
 
 ## Quickstart
 
@@ -75,7 +198,7 @@ claude-codex serve
 Claude Code now discovers the models exposed by the router. Switch directly:
 
 ```text
-/model gpt-5.6-sol[1m]
+/model gpt-6.1-sol[1m]
 /model claude-opus-5
 ```
 
@@ -84,14 +207,127 @@ the suffix before sending the model name to Codex.
 
 ## Switching models
 
-- **Inside Claude Code.** Run `/model gpt-5.6-sol[1m]` for Codex or
+- **Inside Claude Code.** Run `/model gpt-6.1-sol[1m]` for Codex or
   `/model claude-opus-5` for Claude.
 - **For one new session.** Set `ANTHROPIC_MODEL` when launching Claude Code.
 - **List what is available.** `claude-codex models`.
 
+The Codex catalog includes `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, and
+`gpt-6-luna`, plus the existing model IDs. Each has a `-fast` alias for Priority
+service tier. Upstream account access still determines whether a request succeeds.
+
+Sessions launched with `scripts/claude-account-router` default custom models to a
+1,000,000-token context window, so `/model gpt-6.1-sol` needs no `[1m]` suffix.
+This is a client setting, not a separate upstream model. Existing sessions keep
+their launch environment; use `[1m]` there or start a new launcher process.
+The launcher's default custom picker option is `gpt-6.1-sol[1m]`.
+
 Reasoning is carried across a switch. When you move a conversation from one plan
 to the other, the earlier turn's thinking is kept and shown to the next model as
 plain tagged text, so context is not lost.
+
+## Usage and account selection
+
+Native `/usage` uses the same account as Claude inference, selected by
+`--main-account` or the accounts file's `main`. It does not follow
+`--remote-control-account`. To keep phone control on one account while using
+another subscription for inference, configure the existing split explicitly:
+
+```json
+{
+  "main": "inference",
+  "remote_control": "controller",
+  "accounts": { "inference": 1, "controller": 2 }
+}
+```
+
+`/usage` shows the inference account's actual limits, not an average across
+accounts or another provider's remaining quota.
+
+### Automatic quota fallback (`--serve` / `--via`)
+
+When a request gets a 429 for quota, or a Claude account rejects its credential
+with 401, the shared proxy tries the next option before any output reaches Claude
+Code. Running sessions keep working without a relaunch or `cswap switch`.
+Credential storage and refresh still use `claude-swap`; request selection does not.
+An empty Claude account pool does not block Codex or Cursor inference:
+
+| Requested | Tries, in order |
+| --- | --- |
+| A Claude model | each Claude account in the accounts file, then the Codex model of the same tier, then Cursor |
+| A Codex model | Codex, then the Claude model of the same tier on each account, then Cursor |
+
+The accounts file can choose which account a session starts on. The proxy
+reloads it on the next request:
+
+```json
+"balance": {"strategy": "prefer", "prefer": "personal"}
+```
+
+`session` (the default) starts on the session's own account. `prefer` starts every
+session on one main account. `round-robin` and `least-sessions` spread new
+sessions. Every strategy keeps a session on its account; individual requests
+are never rotated, because prompt caches are per account.
+
+To make one machine always start on its own main account, whatever the proxy
+prefers, set `"pin_main": true` in that machine's accounts file. Its sessions
+still fall back to the other accounts when the main one runs out.
+
+Name accounts by their email, so it is obvious which login is which. Aliases may
+use letters, digits, `.`, `@`, `_` and `-`. To rename an alias without breaking
+sessions that are already running, map the old name in the proxy's accounts file;
+those sessions keep sending it:
+
+```json
+"accounts": {"user@example.com": 1},
+"renamed": {"personal": "user@example.com"}
+```
+
+| Tier | Claude | Codex | Cursor |
+| --- | --- | --- | --- |
+| Opus | `claude-opus-5-5` | `gpt-6.1-sol` | `cursor:claude-opus-5` |
+| Fable | `claude-fable-5-1` | `gpt-6-astra` | `cursor:claude-fable-5` |
+| Sonnet, Haiku | `claude-sonnet-5-5` | `gpt-6-luna` | `cursor:claude-sonnet-5` |
+
+The session's own account is tried first, then the rest in accounts-file order.
+An exhausted account is skipped until the reset time Anthropic reports. Adding an
+alias to the accounts file takes effect on the next request. Cursor uses the
+`cursor-agent` login on the proxy host.
+
+### Chaining proxies (`--serve --via`)
+
+A `--serve` proxy can use another `--serve` proxy as its backend. It swaps in the
+logins it holds itself, and passes every other alias on, still a placeholder, to
+the next proxy, which swaps it there:
+
+```sh
+claude-account-router --serve --port 18790 --accounts-file accounts.json \
+  --via http://next-proxy:18790 --via-ca next-proxy-ca.pem
+```
+
+All of this proxy's Anthropic traffic, including the Chrome bridge, goes through
+the next proxy. Each hop runs its own quota fallback over the accounts it holds.
+An alias that no hop holds gets a 401 from the last hop.
+
+### Recording all traffic (`--serve`)
+
+Set `"traffic_db": "/path/traffic.sqlite3"` in the `--serve` proxy's accounts file
+and it records every request, reply and Chrome-bridge message in SQLite. It takes
+effect on the next request, without a restart. Each row of `flows` says when, which
+machine, OS user and folder (the launch folder and the session's working directory),
+which session and account, the model, the account or backend that served it, and the
+status. `--via` clients send their machine, user and folder in headers that the proxy
+strips. Clients launched before those headers existed are named by their tailnet IP.
+
+Credential headers and fields are never written. The parts of a conversation that
+repeat every turn are stored once, so a busy day is a few hundred MB.
+`"traffic_days": 30` keeps 30 days: the recorder deletes older rows itself, at most
+once an hour.
+
+```sh
+scripts/claude-traffic -n 20          # newest flows
+scripts/claude-traffic show FLOW_ID   # one flow, request and reply in full
+```
 
 ## How it works
 
@@ -575,7 +811,10 @@ token in it would break the Claude passthrough. `/healthz` stays open.
 
 ## Credits
 
-Built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy),
-which provides the Codex, Kimi, Grok, and Cursor backends. This fork adds using
+Started from [`fcakyon/claude-code-with-codex`](https://github.com/fcakyon/claude-code-with-codex),
+itself built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy),
+which provides the Codex, Kimi, Grok, and Cursor backends. That project added using
 your Claude subscription as a backend alongside Codex, reasoning that survives a
-mid-conversation switch, and reading the Codex login from the Codex CLI.
+mid-conversation switch, and reading the Codex login from the Codex CLI. cc-proxy
+adds the shared multi-account proxy. The installer and demo GIF still come from
+`fcakyon/claude-code-with-codex` releases, because cc-proxy publishes none yet.

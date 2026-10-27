@@ -1,0 +1,32 @@
+[project]
+name = "cc-proxy"
+version = "0.4.0"
+description = "Claude Code on several Claude accounts plus Codex and Cursor, through one shared proxy with quota fallback"
+authors = [
+    { name = "Faris Hijazi", email = "theefaris@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mitmproxy>=12.2,<13",
+    "claude-swap @ git+https://github.com/FarisHijazi/claude-swap",
+]
+
+[project.scripts]
+cc-proxy = "cc_proxy.cli:main"
+cc-proxy-traffic = "cc_proxy.cli:traffic"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/cc_proxy"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"scripts" = "cc_proxy/scripts"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["python", "scripts", "pyproject.toml", "LICENSE", "README.md"]

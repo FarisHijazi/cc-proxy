@@ -132,7 +132,12 @@ pub fn spawn(options: &RunOptions, prompt: &str) -> Result<RunningAgent, SpawnEr
     }
 
     let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+        // execvp reports EACCES, not ENOENT, for a missing name when any PATH
+        // directory is unreadable, so recheck before blaming permissions.
+        if error.kind() == std::io::ErrorKind::NotFound
+            || (error.kind() == std::io::ErrorKind::PermissionDenied
+                && !binary_is_runnable(&options.binary))
+        {
             SpawnError::NotFound {
                 binary: options.binary.clone(),
                 detail: error.to_string(),

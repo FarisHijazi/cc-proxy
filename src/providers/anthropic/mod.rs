@@ -144,6 +144,7 @@ fn is_stripped_request_header(name: &str) -> bool {
             | "content-length"
             | "proxy-connection"
             | crate::inbound_auth::PROXY_KEY_HEADER
+            | crate::fallback::POOL_HEADER
     )
 }
 
@@ -221,12 +222,21 @@ impl AnthropicProvider {
 
     /// Select the fixed account origin (also used by integration tests).
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .no_zstd()
+            .no_zstd();
+        if let Some((proxy, ca)) = crate::config::anthropic_upstream_proxy() {
+            let pem = std::fs::read(&ca).expect("failed to read CCP_ANTHROPIC_PROXY_CA");
+            builder = builder
+                .proxy(reqwest::Proxy::https(&proxy).expect("invalid CCP_ANTHROPIC_PROXY"))
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(&pem).expect("invalid CCP_ANTHROPIC_PROXY_CA"),
+                );
+        }
+        let client = builder
             .build()
             .expect("failed to build anthropic passthrough client");
         Self {

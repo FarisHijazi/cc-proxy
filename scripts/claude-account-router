@@ -2,6 +2,7 @@
 """Launch an isolated Claude session with account-aware mitmproxy routing."""
 
 import argparse
+import getpass
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ import time
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 def proxy_command(
@@ -292,9 +293,9 @@ def account_selection(entries, accounts_file=None, main=None):
     for alias, source in accounts.items():
         if alias.casefold() in {name.casefold() for name in normalized}:
             raise ValueError("account aliases must differ beyond letter case")
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,23}", alias):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}", alias):
             raise ValueError(
-                "account aliases need 1-24 letters, digits, underscores or hyphens"
+                "account aliases need 1-64 letters, digits, dots, @, underscores or hyphens"
             )
         if isinstance(source, bool) or not isinstance(source, (int, str)):
             raise TypeError(
@@ -361,14 +362,25 @@ def with_flags(args, *flags):
 
 def aggregate_mcp(login, manifest, forwarded):
     """Add shared tools while retaining the main account's native Chrome UI."""
-    main = manifest["accounts"].get(manifest["main"], {})
-    if "secure_storage_dir" in main:
-        # Claude moves the main login into the OS keychain at startup, so the
-        # main account's Chrome child reads its own plaintext copy.
-        copy = login / f"{manifest['main']}-chrome-secure"
-        shutil.copytree(main["secure_storage_dir"], copy)
-        accounts = {**manifest["accounts"], manifest["main"]: {**main, "secure_storage_dir": str(copy)}}
-        manifest = {**manifest, "accounts": accounts}
+    accounts = dict(manifest["accounts"])
+    for alias, account in manifest["accounts"].items():
+        if "secure_storage_dir" not in account:
+            continue
+        credential = Path(account["secure_storage_dir"]) / ".credentials.json"
+        data = json.loads(credential.read_text())
+        oauth = data.get("claudeAiOauth", {})
+        placeholder = str(oauth.get("accessToken", "")).startswith("proxy-account-")
+        if alias != manifest["main"] and not placeholder:
+            continue
+        # Native MCP children stay account-isolated even when the parent opts
+        # into native aggregation. Claude can move the parent's login to Keychain.
+        copy = login / f"{alias}-chrome-secure"
+        shutil.copytree(account["secure_storage_dir"], copy)
+        if placeholder:
+            oauth["accessToken"] = f"proxy-account-{alias}+chrome={alias}"
+            (copy / ".credentials.json").write_text(json.dumps(data))
+        accounts[alias] = {**account, "secure_storage_dir": str(copy)}
+    manifest = {**manifest, "accounts": accounts}
     manifest_path = login / "accounts.json"
     write_private(manifest_path, json.dumps(manifest))
     servers = {}
@@ -424,7 +436,7 @@ def take_settings(forwarded):
     return rest, extra
 
 
-def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
+def client_environment(state, port, secure_storage, proxy_url=None, extra=None, identify=False):
     env = os.environ.copy()
     # Privacy is per launch: a tcc started from this session's shell must not inherit it.
     env.pop("TCC_PRIVATE", None)
@@ -446,11 +458,26 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
     ):
         settings_env[name] = settings_env["HTTPS_PROXY"]
     settings_env["no_proxy"] = settings_env["NO_PROXY"]
+    if identify:
+        # A shared --serve proxy records which machine, user and folder each request is from.
+        # Percent-encoded: header values must be ASCII. The proxy strips them.
+        identity = {
+            "X-Claude-Client-Host": socket.gethostname(),
+            "X-Claude-Client-User": getpass.getuser(),
+            "X-Claude-Client-Cwd": quote(os.getcwd()),
+        }
+        own = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        settings_env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(
+            [*filter(None, [own]), *(f"{k}: {v}" for k, v in identity.items())]
+        )
     # The proxy makes this a first-party session, so Remote Control's set_model
-    # (HQ's model picker) accepts only catalog models; this adds the Codex one.
+    # (HQ's model picker) accepts only catalog models; this adds the default Codex
+    # model. Claude Code owns context budgeting before a request reaches the proxy,
+    # so pin custom models to the 1M window even when /model uses a bare name.
     settings_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = (
-        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-5.6-sol"
+        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-6.1-sol[1m]"
     )
+    settings_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "1000000"
     # An API credential selects API-key auth even when a subscription is saved.
     # Empty strings in CLI settings also override project settings for this run.
     for key in (
@@ -574,6 +601,17 @@ def serve(args, state):
     router_env = os.environ.copy()
     router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
     router_env["CCP_TRAFFIC_LOG"] = "0"
+    if args.via:
+        # Cascade: aliases not held here pass, still placeholders, to the next --serve proxy.
+        if not args.via_ca:
+            raise ValueError("--serve --via needs --via-ca")
+        (state / "upstream-ca.pem").write_bytes(certificate_bundle(args.via_ca))
+        command += [
+            "--set", f"proxy_upstream={args.via}",
+            "--set", f"ssl_verify_upstream_trusted_ca={state / 'upstream-ca.pem'}",
+        ]
+        router_env["CCP_ANTHROPIC_PROXY"] = args.via
+        router_env["CCP_ANTHROPIC_PROXY_CA"] = str(args.via_ca.expanduser().resolve())
     with (state / "serve.log").open("a") as log:
         processes = [
             subprocess.Popen(
@@ -584,6 +622,11 @@ def serve(args, state):
             )
         ]
         try:
+
+            def stop(_signum, _frame):
+                raise KeyboardInterrupt  # run the finally below; default SIGTERM skips it
+
+            signal.signal(signal.SIGTERM, stop)
             wait_listener(processes[0], router_port, log.name)
             processes.append(subprocess.Popen(command, stdout=log, stderr=log))
             wait_listener(processes[1], args.port, log.name, host=args.listen_host)
@@ -608,17 +651,22 @@ CLAUDE_AI_SCOPES = [
 ]
 
 
-def placeholder_login(alias, opener, config, secure, remote_control=None, private=False):
+def placeholder_login(alias, opener, config, secure, remote_control=None, private=False, chrome=None, pin=False):
     """Write a login whose token the --serve proxy swaps for the real one.
 
     `remote_control` names another alias whose token the proxy uses on /v1/code/
     (Remote Control) only, so that login's claude.ai and phone app see the session.
-    `private` tells HQ never to mirror this session to claude.ai."""
+    `private` tells HQ never to mirror this session to claude.ai. `pin` starts inference
+    on this alias whatever the proxy's balance prefers (fallback still applies)."""
     token = f"proxy-account-{alias}"
+    if pin:
+        token += "+pin"
     if remote_control and remote_control != alias:
         token += f"+rc={remote_control}"
     if private:
         token += "+private"
+    if chrome is not None:
+        token += "+chromes" if chrome == "*" else f"+chrome={chrome}"
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/profile",
         headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
@@ -674,6 +722,8 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     alias, opener, config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
+                    chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
+                    pin=main and getattr(args, "pin_main", False),
                 )
             except (OSError, ValueError, KeyError) as error:
                 if alias == main_account:
@@ -682,6 +732,8 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                 print(f"Account {alias}: unavailable on the proxy ({error})", file=sys.stderr)
                 continue
             manifest["accounts"][alias] = {"config_dir": str(config), "secure_storage_dir": str(secure)}
+        if getattr(args, "chrome_account", None):
+            manifest["chrome_account"] = args.chrome_account
         forwarded = aggregate_mcp(login, manifest, forwarded)
         share_user_config(state / "claude")
         (state / "client-ca.pem").write_bytes(certificate_bundle(args.via_ca))
@@ -691,6 +743,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
             Path(manifest["accounts"][main_account]["secure_storage_dir"]),
             args.via,
             extra_settings,
+            identify=True,
         )
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
@@ -773,7 +826,10 @@ def main():
     )
     parser.add_argument("--listen-host", default="127.0.0.1", help="--serve bind address")
     parser.add_argument("--router-bin", default="claude-codex", help="--serve router binary")
-    parser.add_argument("--via", help="use a --serve proxy at http://HOST:PORT")
+    parser.add_argument(
+        "--via",
+        help="use a --serve proxy at http://HOST:PORT (with --serve: cascade to it)",
+    )
     parser.add_argument("--via-ca", type=Path, help="the --serve proxy's CA certificate")
     parser.add_argument(
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
@@ -791,6 +847,8 @@ def main():
     )
     if not args.remote_control_account and args.accounts_file:
         args.remote_control_account = json.loads(args.accounts_file.read_text()).get("remote_control")
+    # Accounts file "pin_main": this machine's sessions start on its main account.
+    args.pin_main = bool(args.accounts_file and json.loads(args.accounts_file.read_text()).get("pin_main"))
     if args.remote_control_account and args.remote_control_account not in accounts:
         parser.error("--remote-control-account must name a configured account alias")
     if args.chrome_account and args.chrome_account not in accounts:

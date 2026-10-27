@@ -1,9 +1,11 @@
-# claude-code-with-codex (FarisHijazi fork)
+# cc-proxy
 
 Local Rust proxy that speaks the Anthropic Messages API and routes each request
-to a backend based on the model name. Fork of
-[fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex);
-`upstream` remote points there. Upstream conventions live in
+to a backend based on the model name. Repo: `FarisHijazi/cc-proxy`. It started as a
+GitHub fork of [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex)
+and was republished on 2026-10-27 as a standalone repo.
+Local checkouts and deployed copies keep the directory name `claude-code-with-codex`, because
+launchers and the ftower unit reference that path. Upstream conventions live in
 [AGENTS.md](AGENTS.md) and still apply.
 
 ## The constraint that drives everything
@@ -145,6 +147,33 @@ of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
+Native `/usage` follows `--main-account`, just like Claude inference; `+rc=` changes
+only Remote Control endpoints. A GPT model does not move Claude subagents to a
+different Claude account. Select a main account with remaining quota and a separate
+RC owner rather than rewriting usage percentages. Live TUI and regression evidence is in
+`docs/devlog/claude_20261024-usage-account-routing.md` (plain path).
+
+Quota fallback: `account_inject` (the credential owner) attaches every usable login,
+session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages`;
+`src/fallback.rs` (the routing owner) strips it and walks the tier chain on 429,
+plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
+still reaches other vendors. The explicit primary-account marker prevents a filtered
+pool from handing thread ownership to a backup; cooldowns belong to each Registry.
+Claude model: accounts, then Codex, then Cursor. Codex model: Codex, then Claude
+accounts, then Cursor. Never relay the pool header upstream, never retry after
+output, and never send a thread delta to another account (refuse so Claude Code
+resends history). Attempts with a fallback after them run inside
+`retry::fail_fast`, including its explicit capture into the spawned HTTP SSE reader,
+or Codex's own 429 backoff stalls the chain for minutes. No `cswap switch` is needed;
+cswap remains the credential owner rather than the request selector. The accounts
+file's `balance` (`session` | `prefer` + `prefer` alias | `round-robin` |
+`least-sessions`) picks only a session's first account, keyed by
+`x-claude-code-session-id`; never rotate individual requests (per-account caches). Aliases are
+emails (pattern shared by the three launcher scripts); the proxy file's `renamed` maps old aliases
+that running sessions still send. A client's `main` sets the login claude.ai sees (artifacts,
+Remote Control, `/usage`); `balance.prefer` only picks inference. Read
+`docs/devlog/claude_20261024-quota-fallback.md` on demand (plain path).
+
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
 spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
@@ -161,12 +190,30 @@ See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 proxy's profile endpoint, and aggregate every alias. No proxy auth: bind `--serve` to a tailnet IP.
 Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
 `docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
+`--serve --via` chains proxies: `account_inject.cascades()` leaves aliases this hop
+does not hold as placeholders, the router reaches Anthropic through `CCP_ANTHROPIC_PROXY`
+(trusting `CCP_ANTHROPIC_PROXY_CA`), and the Chrome bridge gets `server_conn.via`. See
+`docs/devlog/claude_20261026-cascading-proxies.md` (plain path).
+A client's `"pin_main": true` adds `+pin`, so its sessions start on their own alias, ignoring `balance.prefer`.
+`"traffic_db"` in the `--serve` accounts file turns on `scripts/account_traffic.py` (every flow, sender
+metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` prunes). See
+`docs/devlog/claude_20261027-traffic-database.md` (plain path).
+`serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
+Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the
+router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
+`Dockerfile` and `compose.yaml` run `--serve`. See `docs/devlog/claude_20261027-cc-proxy-packaging.md` (plain path).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the
 routed-session map persists in the proxy state dir. The launcher sets
-`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-5.6-sol`) because a proxied session counts as
-first-party and Remote Control `set_model` otherwise rejects non-catalog ids. Folder trust
+`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-6.1-sol[1m]`) because a proxied session counts as
+first-party and Remote Control `set_model` otherwise rejects non-catalog ids. The launcher sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` so bare custom model names also use 1M in new processes.
+Codex model bases and derived fast variants come only from
+`src/providers/codex/translate/model_allowlist.rs`; the registry consumes that catalog.
+The new catalog and live context verification are in
+`docs/devlog/claude_20261024-codex-6-models.md` (plain path).
+Folder trust
 accepted in any account profile carries to every sibling profile. Record: HQ repo
 `docs/devlog/claude_20261023-native-ui-and-rc-protocol.md`. The account
 proxy owns endpoint selection and credential isolation; HQ owns its native protocol.

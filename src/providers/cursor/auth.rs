@@ -163,18 +163,34 @@ pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
 /// two in step — and `cursor-agent logout` takes this backend with it, which is
 /// the behaviour you want from a borrowed credential.
 ///
-/// macOS only for now; the CLI stores it elsewhere on other platforms, and a
-/// `None` here simply means this source has nothing to offer.
+/// macOS keeps it in the Keychain; elsewhere the CLI writes
+/// `$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config`). A `None` here
+/// simply means this source has nothing to offer.
 pub fn cursor_agent_token() -> Option<String> {
-    if !use_macos_keychain() {
-        return None;
-    }
-    SystemKeychain
-        .read(CURSOR_AGENT_KEYCHAIN_SERVICE, CURSOR_AGENT_KEYCHAIN_ACCOUNT)
-        .ok()
-        .flatten()
+    let token = if use_macos_keychain() {
+        SystemKeychain
+            .read(CURSOR_AGENT_KEYCHAIN_SERVICE, CURSOR_AGENT_KEYCHAIN_ACCOUNT)
+            .ok()
+            .flatten()
+    } else {
+        cursor_agent_auth_file()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|auth| auth.get("accessToken")?.as_str().map(str::to_string))
+    };
+    token
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
+}
+
+fn cursor_agent_auth_file() -> Option<std::path::PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })?;
+    Some(config.join("cursor/auth.json"))
 }
 
 /// Load only the bearer token for call sites that do not need auth metadata.
