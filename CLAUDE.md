@@ -202,6 +202,7 @@ metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` p
 Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the
 router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
 `Dockerfile` and `compose.yaml` run `--serve`. See `docs/devlog/claude_20261027-cc-proxy-packaging.md` (plain path).
+Run tests as CI does with an empty `HOME`: tests that read the machine's Codex login pass locally and fail in CI.
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

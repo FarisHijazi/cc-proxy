@@ -1418,8 +1418,21 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn models_endpoint_lists_supported_models() {
+    // Codex models are listed only with a Codex login, so give this test its own
+    // instead of depending on the machine's (CI has none).
+    let dir = tempfile::tempdir().unwrap();
+    let auth = dir.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({"tokens": {"access_token": "test-access", "refresh_token": "test-refresh", "account_id": "acct_test"}})
+            .to_string(),
+    )
+    .unwrap();
+    // SAFETY: tests that touch the environment run single-threaded (--test-threads=1).
+    unsafe { std::env::set_var("CCP_CODEX_AUTH_FILE", &auth) };
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models").await;
+    unsafe { std::env::remove_var("CCP_CODEX_AUTH_FILE") };
 
     assert_eq!(status, StatusCode::OK);
     let data = value["data"].as_array().unwrap();

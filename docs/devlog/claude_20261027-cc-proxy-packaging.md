@@ -34,3 +34,11 @@ on `CC_PROXY_BIND` (default loopback), because the proxy has no auth.
   launchd plist passes `plutil -lint` on the Mac. Both were written into a throwaway HOME;
   neither was installed.
 - Not yet verified: the router download, because release v0.4.0 does not exist yet.
+
+## Release CI
+
+The first `v0.4.0` release run failed in `cargo test`: `models_endpoint_lists_supported_models`
+expected `gpt-5.6-sol`, but the router lists Codex models only when a Codex login exists, and CI
+has none. It passed on dev only because dev has `~/.codex/auth.json`. The test now writes its own
+login and points `CCP_CODEX_AUTH_FILE` at it. Reproduce CI locally with an empty `HOME` (keep
+`CARGO_HOME` and `RUSTUP_HOME`).
