@@ -333,6 +333,13 @@ alias to the accounts file takes effect on the next request. Cursor uses the
 
 ### Chaining proxies (`--serve --via`)
 
+Server mode keeps its CA and Remote Control session map directly under
+`--state-dir`, independent of the main account alias. Client mode keeps its
+account-specific directories. When upgrading an existing server, preserve its
+original trusted `ca/` directory and session map at the state root before
+restarting; do not generate a new CA or redistribute trust to clients to fix
+an account rename. See the [migration record](docs/devlog/claude_20261027-stable-server-ca-and-emudhra.md).
+
 A `--serve` proxy can use another `--serve` proxy as its backend. It swaps in the
 logins it holds itself, and passes every other alias on, still a placeholder, to
 the next proxy, which swaps it there:

@@ -10,6 +10,10 @@
   mitmproxy; `src/server.rs` remains the model routing owner. Never stream
   request bodies before mitmproxy's `map_remote` hook runs. The vendored
   response-only addon and license are pinned upstream copies.
+- Shared `--serve` state belongs directly to `--state-dir`, never to a main
+  account alias: preserve the deployed CA and Remote Control session map when
+  migrating an older server. Clients retain account-scoped state. See
+  `docs/devlog/claude_20261027-stable-server-ca-and-emudhra.md` on demand.
 - Account launcher credentials are access-only snapshots in temporary secure
   storage. Never copy or consume the source login's refresh grant, and never
   write its config directory. Read the account-routing devlog when changing

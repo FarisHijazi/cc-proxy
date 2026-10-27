@@ -18,6 +18,33 @@ launcher = runpy.run_path(
 )
 
 
+@pytest.mark.parametrize("mode", ["serve", "via"])
+def test_server_state_survives_main_account_changes(tmp_path, monkeypatch, mode):
+    monkeypatch.delenv("TCC_PRIVATE", raising=False)
+    names = launcher["main"].__globals__
+    state = tmp_path / "state"
+    accounts = tmp_path / "accounts.json"
+    seen = []
+
+    def capture(args, *values):
+        seen.append(values[0] if mode == "serve" else values[2])
+        return 0
+
+    monkeypatch.setitem(names, mode, capture)
+    for alias in ("work", "client-a"):
+        accounts.write_text(json.dumps({"main": alias, "accounts": {alias: 1}}))
+        monkeypatch.setattr(names["sys"], "argv", [
+            "claude-account-router", "--accounts-file", str(accounts),
+            "--state-dir", str(state),
+            *(["--serve"] if mode == "serve" else ["--via", "http://127.0.0.1:18790"]),
+        ])
+        assert launcher["main"]() == 0
+
+    assert seen == ([state, state] if mode == "serve" else [
+        state / "accounts" / "work", state / "accounts" / "client-a",
+    ])
+
+
 def test_routing_boundary_and_loopback_only(tmp_path):
     command = launcher["proxy_command"]("http://127.0.0.1:18765", 19999, tmp_path)
     delimiter, method, pattern, replacement = command[-1].split("@")

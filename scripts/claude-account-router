@@ -955,7 +955,8 @@ def main():
             "--account/--accounts-file replaces --cswap-account and --login-from"
         )
     state = args.state_dir.expanduser().resolve()
-    if accounts:
+    # A shared server's CA and session ownership must survive account changes.
+    if accounts and not args.serve:
         state = state / "accounts" / main_account
     protected = (Path.home() / ".claude").resolve()
     managed_paths = [state, state / "claude", state / "ca", state / "client-ca.pem"]
