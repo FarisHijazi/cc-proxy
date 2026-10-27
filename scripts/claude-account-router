@@ -409,6 +409,10 @@ def aggregate_mcp(login, manifest, forwarded):
     # Claude reserves claude-in-chrome for its built-in server. Keep that UI
     # on main; the additional server exposes cross-account browser tools.
     chrome = [] if {"--chrome", "--no-chrome"}.intersection(forwarded) else ["--chrome"]
+    # The built-in tools see only main's browsers, and the system prompt steers the
+    # model to them, so hide them whenever the aggregate serves every account.
+    if "account-chrome" in servers:
+        chrome += ["--disallowedTools", "mcp__claude-in-chrome"]
     return with_flags(forwarded, *chrome, "--mcp-config", str(config_path))
 
 

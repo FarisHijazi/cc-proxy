@@ -142,6 +142,8 @@ reuse and live validation (deliberately a plain path, not an include).
 Local shortcuts and saved account maps are runtime configuration outside this
 repository; their setup and smoke checks are recorded in that devlog.
 
+When the aggregate `account-chrome` server is loaded, the launcher passes `--disallowedTools mcp__claude-in-chrome`:
+the built-in tools see only main's browsers and the system prompt steers the model to them. `/chrome` still works.
 `--chrome-account` routes the native Chrome bridge to a selected login independently
 of main, replacing the aggregate Chrome adapter for that session. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`

@@ -754,6 +754,8 @@ def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
     )
     assert args.count("--chrome") == 1 and "--no-chrome" not in args
     assert "existing.json" in args
+    # Only the aggregate's tools stay visible, so the model sees every account's browsers.
+    assert args[args.index("--disallowedTools") + 1] == "mcp__claude-in-chrome"
     config = json.loads((login / "mcp.json").read_text())
     assert set(config["mcpServers"]) == {"account-chrome", "account-artifacts"}
     # The main client moves its own login into the keychain; Chrome reads a copy.
@@ -768,7 +770,7 @@ def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
 def test_native_chrome_selector_keeps_native_server_and_artifact_accounts(tmp_path):
     manifest = {"main": "work", "chrome_account": "personal", "accounts": {}}
     args = launcher["aggregate_mcp"](tmp_path, manifest, ["--model", "gpt-toy"])
-    assert "--chrome" in args
+    assert "--chrome" in args and "--disallowedTools" not in args
     servers = json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
     assert set(servers) == {"account-artifacts"}
     command = launcher["proxy_command"](
