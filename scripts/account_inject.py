@@ -21,6 +21,9 @@ REMOTE_CONTROL_PATH = "/v1/code/"
 SESSIONS_PATH = "/v1/code/sessions"
 # Refresh a little early so a token never expires mid-request.
 MARGIN_MS = 5 * 60 * 1000
+# A `claude setup-token` has no expiry or refresh grant (about a year, inference only);
+# re-read it this often so a replaced one is picked up.
+SETUP_TOKEN_REREAD_MS = 60 * 60 * 1000
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
@@ -50,6 +53,8 @@ def slot_token(slot):
         email = switcher._get_sequence_data()["accounts"][slot]["email"]
         raw, _ = switcher._read_account_credentials_ex(slot, email)
         token = oauth.extract_oauth_data(raw) or {}
+        if token.get("accessToken") and "expiresAt" not in token and not token.get("refreshToken"):
+            return token["accessToken"], time.time() * 1000 + SETUP_TOKEN_REREAD_MS
         if token.get("expiresAt", 0) - MARGIN_MS <= time.time() * 1000:
             outcome = switcher.consume_backup_grant(slot, email, raw)
             if outcome.error is None:

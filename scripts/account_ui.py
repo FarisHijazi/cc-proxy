@@ -17,6 +17,7 @@ import ssl
 import time
 import urllib.request
 import zlib
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,10 +30,24 @@ CACHE_S = 60
 COLUMNS = "id, started, client_host, client_ip, client_user, cwd, launch_cwd, account, served_by, model, status, method, url"
 
 
-def login_error(error):
-    if error and "401" in error:
-        return "the proxy's login for this account was rejected; run `cswap add` for it on the proxy host"
-    return error
+def inference_only(error):
+    """A `claude setup-token` may only call the model, so usage and profile answer 401/403."""
+    return bool(error) and ("401" in error or "403" in error)
+
+
+def reply_usage(headers):
+    """Usage windows from the rate-limit headers Anthropic sends with every reply."""
+    h = {k.lower(): v for k, v in headers}
+    windows = {}
+    for name, key in (("five_hour", "5h"), ("seven_day", "7d")):
+        used = h.get(f"anthropic-ratelimit-unified-{key}-utilization")
+        if used is not None:
+            reset = h.get(f"anthropic-ratelimit-unified-{key}-reset")
+            windows[name] = {
+                "utilization": float(used) * 100,
+                "resets_at": datetime.fromtimestamp(int(reset), timezone.utc).isoformat() if reset else None,
+            }
+    return windows
 
 
 def alias_of(placeholder):
@@ -69,21 +84,38 @@ class Dashboard:
         self.cache[(alias, path)] = (time.time(), value)
         return value
 
+    def last_reply(self, alias, cfg):
+        db = self.database(cfg)
+        row = db.execute(
+            "SELECT started, response_headers FROM flows WHERE served_by LIKE ? AND status = 200 "
+            "AND response_headers LIKE '%ratelimit-unified%' ORDER BY started DESC LIMIT 1",
+            (alias + "/%",),
+        ).fetchone() if db else None
+        return (reply_usage(json.loads(row[1])), row[0]) if row else ({}, None)
+
     def account(self, alias, slot, cfg):
         usage = self.fetch(alias, "/api/oauth/usage")
         profile = self.fetch(alias, "/api/oauth/profile")
         organization = profile.get("organization") or {}
+        error = usage.get("error") or profile.get("error")
+        windows = {
+            w: {"utilization": usage[w].get("utilization"), "resets_at": usage[w].get("resets_at")}
+            for w in WINDOWS
+            if isinstance(usage.get(w), dict) and usage[w].get("utilization") is not None
+        }
+        token_only = inference_only(error)
+        usage_at = None
+        if not windows:
+            windows, usage_at = self.last_reply(alias, cfg)
         return {
             "alias": alias,
             "slot": slot,
             "email": (profile.get("account") or {}).get("email"),
             "plan": (organization.get("organization_type") or "").removeprefix("claude_") or None,
-            "usage": {
-                w: {"utilization": usage[w].get("utilization"), "resets_at": usage[w].get("resets_at")}
-                for w in WINDOWS
-                if isinstance(usage.get(w), dict) and usage[w].get("utilization") is not None
-            },
-            "error": login_error(usage.get("error") or profile.get("error")),
+            "usage": windows,
+            "usage_at": usage_at,
+            "token_only": token_only,
+            "error": None if token_only else error,
             "disabled": alias in cfg.get("disabled", []),
         }
 

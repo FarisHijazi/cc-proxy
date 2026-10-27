@@ -208,9 +208,11 @@ function renderAccounts() {
         <span class="name">${esc(a.email || a.alias)}</span><span class="spacer"></span>
         ${preferred ? `<span class="badge accent">preferred</span>` : ""}
         ${a.plan ? `<span class="badge">${esc(a.plan)}</span>` : ""}
+        ${a.token_only ? `<span class="badge" title="claude setup-token: model calls only, no usage or profile API">setup-token</span>` : ""}
       </div>
       ${a.email && a.email !== a.alias ? `<div class="small muted">${esc(a.alias)}</div>` : ""}
-      ${windows.length ? windows.map(([n, w]) => meter(n, w)).join("") : `<div class="small muted">${a.error ? "usage unavailable: " + esc(a.error) : "no usage reported"}</div>`}
+      ${windows.length ? windows.map(([n, w]) => meter(n, w)).join("") : `<div class="small muted">${a.error ? "usage unavailable: " + esc(a.error) : a.token_only ? "no replies recorded yet; usage appears after its first one" : "no usage reported"}</div>`}
+      ${windows.length && a.usage_at ? `<div class="small muted">from its last reply, ${ago(a.usage_at)} ago</div>` : ""}
       <div class="card-foot">
         <span class="small muted">#${i + 1} · slot ${esc(a.slot)}</span><span class="spacer"></span>
         <button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>

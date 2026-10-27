@@ -208,6 +208,8 @@ from the accounts file; profiles are cached a day in `<state>/profiles.json`. Ru
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
 `disabled`, `traffic_days` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
+cswap slots may hold `claude setup-token`s (no `expiresAt`, no refresh, inference scope only): `slot_token()` uses them
+as-is; they cannot answer usage/profile, so the dashboard reads their usage from recorded reply headers.
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

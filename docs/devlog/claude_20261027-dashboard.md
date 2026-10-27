@@ -23,7 +23,16 @@ another process (a second `mitmdump`, not this work). Verified against live data
 save rewrote the file with a backup, a bad `order` was refused, and model calls kept returning 200
 after the save. Screenshots were checked in light and dark with headless Chromium.
 
-## Found while building it
+## Found while building it: setup-tokens were never used
 
-Three of the proxy's five logins return 401 for usage and profile. Their cswap slots need
-`cswap add` again, so fallback in practice has two Claude accounts.
+Three of the five slots hold `claude setup-token` credentials: an access token and
+`["user:inference"]`, with no `expiresAt` and no refresh token. `slot_token()` treated the missing
+expiry as expired, tried to refresh, failed, and raised. The proxy then answered those aliases
+with its own 401 and `pool()` left them out, so they never served a request. `slot_token()` now
+uses such a credential as-is and re-reads it hourly. Verified: a request pinned to each of the
+three (`+pin`) was served by that account.
+
+A setup-token cannot call `/api/oauth/usage` or `/api/oauth/profile`. The dashboard marks these
+accounts `setup-token` and shows usage from the latest reply's `anthropic-ratelimit-unified-5h-*`
+and `-7d-*` headers, which the traffic database records. This also means a client whose `main` is a
+setup-token account cannot launch, because the launcher needs that profile.

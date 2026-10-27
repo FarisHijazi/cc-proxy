@@ -45,6 +45,14 @@ def test_invalid_settings_are_refused_and_nothing_is_written(tmp_path, change):
     assert accounts.read_text() == before
 
 
-def test_a_rejected_login_says_how_to_fix_it():
-    assert "cswap add" in ui["login_error"]("HTTP Error 401: Unauthorized")
-    assert ui["login_error"](None) is None
+def test_setup_tokens_are_recognised_and_read_usage_from_reply_headers():
+    assert ui["inference_only"]("HTTP Error 401: Unauthorized")
+    assert not ui["inference_only"](None)
+    windows = ui["reply_usage"]([
+        ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+        ("anthropic-ratelimit-unified-5h-reset", "1793121600"),
+        ("anthropic-ratelimit-unified-7d-utilization", "0.85"),
+    ])
+    assert windows["five_hour"]["utilization"] == 25.0
+    assert windows["five_hour"]["resets_at"].startswith("2026-")
+    assert windows["seven_day"] == {"utilization": 85.0, "resets_at": None}

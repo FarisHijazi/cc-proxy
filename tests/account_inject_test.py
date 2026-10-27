@@ -467,3 +467,27 @@ def test_spreading_and_prefer_skip_disabled_accounts(monkeypatch):
     assert [session_pool(inject, s, "a")[0] for s in ("s1", "s2", "s3")] == ["a", "c", "a"]
     inject.strategy, inject.prefer = "prefer", "b"
     assert session_pool(inject, "s4", "c")[0] == "c"
+
+
+def test_setup_tokens_are_used_as_is_and_never_refreshed(monkeypatch):
+    import claude_swap.switcher
+
+    refreshed = []
+
+    class Switcher:
+        def current_account_number(self):
+            return "1"
+
+        def _get_sequence_data(self):
+            return {"accounts": {"3": {"email": "user@example.com"}}}
+
+        def _read_account_credentials_ex(self, slot, email):
+            return json.dumps({"claudeAiOauth": {"accessToken": "setup-token", "scopes": ["user:inference"]}}), None
+
+        def consume_backup_grant(self, *args):
+            refreshed.append(args)
+
+    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", Switcher)
+    token, expires = module.slot_token("3")
+    assert token == "setup-token" and expires > time.time() * 1000
+    assert refreshed == []
