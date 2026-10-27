@@ -198,6 +198,8 @@ strips. Clients launched before those headers existed are named by their tailnet
 
 Credential headers and fields are never written. The parts of a conversation that
 repeat every turn are stored once, so a busy day is a few hundred MB.
+`"traffic_days": 30` keeps 30 days: the recorder deletes older rows itself, at most
+once an hour.
 
 ```sh
 scripts/claude-traffic -n 20          # newest flows

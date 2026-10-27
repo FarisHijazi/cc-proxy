@@ -137,3 +137,22 @@ def test_repeated_conversation_parts_are_stored_once_and_restored(tmp_path):
     reader = runpy.run_path(str(Path(__file__).parents[1] / "scripts/claude-traffic"))
     stored = json.loads(zlib.decompress(db.execute("SELECT request_body FROM flows").fetchone()[0]))
     assert reader["restored"](db, stored)["system"] == SYSTEM
+
+
+def test_rows_and_unused_blobs_older_than_traffic_days_are_dropped(tmp_path, monkeypatch):
+    traffic = module.TrafficDB(lambda: str(tmp_path / "traffic.sqlite3"), lambda: 30)
+    now = [1_000_000_000.0]
+    monkeypatch.setattr(module.time, "time", lambda: now[0])
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"{}")
+    traffic.response(flow)
+    now[0] += 31 * 86400
+    flow = inference_flow()
+    flow.request.content = json.dumps({"model": "m", "messages": [{"role": "user", "content": "new"}]}).encode()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"{}")
+    traffic.response(flow)
+    db = sqlite3.connect(tmp_path / "traffic.sqlite3")
+    assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1  # only the new message

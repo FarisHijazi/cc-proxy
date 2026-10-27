@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS flows (
 );
 CREATE INDEX IF NOT EXISTS flows_started ON flows(started);
 CREATE INDEX IF NOT EXISTS flows_session ON flows(session_id);
-CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, body BLOB);
+CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, body BLOB, last_seen REAL);
 CREATE TABLE IF NOT EXISTS websocket_messages (
     flow_id TEXT, at REAL, from_client INTEGER, body BLOB
 );
@@ -127,10 +127,15 @@ def clean_headers(headers):
     )
 
 
+PRUNE_EVERY_S = 3600
+
+
 class TrafficDB:
-    def __init__(self, path_of):
+    def __init__(self, path_of, days_of=lambda: None):
         self.path_of = path_of  # the accounts file's "traffic_db", read live
+        self.days_of = days_of  # its "traffic_days": keep this many days, unset keeps all
         self.path = self.db = None
+        self.pruned = 0.0
 
     def connection(self):
         path = self.path_of()
@@ -143,7 +148,23 @@ class TrafficDB:
                 self.db = sqlite3.connect(Path(path).expanduser(), isolation_level=None)
                 self.db.execute("PRAGMA journal_mode=WAL")
                 self.db.executescript(SCHEMA)
+                try:  # databases written before blobs had last_seen
+                    self.db.execute("ALTER TABLE blobs ADD COLUMN last_seen REAL")
+                    self.db.execute("UPDATE blobs SET last_seen = ?", (time.time(),))
+                except sqlite3.OperationalError:
+                    pass
         return self.db
+
+    def prune(self):
+        """Drop what is older than traffic_days. A blob a kept flow uses was seen after that cutoff."""
+        days = self.days_of()
+        if not days or time.time() - self.pruned < PRUNE_EVERY_S:
+            return
+        self.pruned = time.time()
+        cutoff = self.pruned - float(days) * 86400
+        self.db.execute("DELETE FROM flows WHERE started < ?", (cutoff,))
+        self.db.execute("DELETE FROM websocket_messages WHERE at < ?", (cutoff,))
+        self.db.execute("DELETE FROM blobs WHERE last_seen < ?", (cutoff,))
 
     def requestheaders(self, flow):
         if self.connection() is None:
@@ -187,7 +208,10 @@ class TrafficDB:
         def stored(value):
             raw = json.dumps(redact(value), ensure_ascii=False, sort_keys=True).encode()
             digest = hashlib.sha256(raw).hexdigest()
-            self.db.execute("INSERT OR IGNORE INTO blobs VALUES (?, ?)", (digest, zlib.compress(raw)))
+            self.db.execute(
+                "INSERT INTO blobs VALUES (?, ?, ?) ON CONFLICT(hash) DO UPDATE SET last_seen = excluded.last_seen",
+                (digest, zlib.compress(raw), time.time()),
+            )
             return {"$blob": digest}
 
         request = dict(request)
@@ -203,6 +227,7 @@ class TrafficDB:
         db = self.connection()
         if meta is None or db is None:
             return
+        self.prune()
         request, response = flow.request, flow.response
         body = request.get_content(strict=False) or b""
         model = cwd = None

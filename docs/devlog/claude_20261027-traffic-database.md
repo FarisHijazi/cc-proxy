@@ -36,3 +36,11 @@ The `--serve` proxy now records every flow when its accounts file has `"traffic_
   recorded its host, user, launch folder, pinned placeholder, model and status.
 - `served_by` stays empty until the proxy service is restarted onto the new router binary
   (installed, not restarted, so running sessions were not interrupted).
+
+## Retention
+
+`"traffic_days"` in the accounts file. `TrafficDB.prune()` runs at most once an hour from
+`record()`, so no separate job exists. It deletes flows and websocket messages older than the
+cutoff, and blobs whose `last_seen` is older. A blob a kept flow uses was seen when that flow
+was recorded, so it survives. Older databases gain `last_seen` on connect, set to now. ftower
+keeps 30 days.
