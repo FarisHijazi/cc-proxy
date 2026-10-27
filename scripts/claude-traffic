@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Read the --serve proxy's traffic database (written by account_traffic.py).
+
+  claude-traffic [-n 20]       newest flows: when, machine, user, folder, account, model
+  claude-traffic show FLOW_ID  one flow with its decompressed request and response
+Metadata columns are plain SQL, so `sqlite3 DB` works for anything else.
+"""
+
+import argparse
+import json
+import sqlite3
+import time
+import zlib
+from pathlib import Path
+
+
+def restored(db, value):
+    """Put back the parts account_traffic.py stored once in `blobs`."""
+    if isinstance(value, dict) and set(value) == {"$blob"}:
+        row = db.execute("SELECT body FROM blobs WHERE hash = ?", (value["$blob"],)).fetchone()
+        return json.loads(zlib.decompress(row[0])) if row else value
+    if isinstance(value, dict):
+        return {k: restored(db, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [restored(db, v) for v in value]
+    return value
+
+
+def default_db():
+    accounts = Path.home() / ".config/claude-codex/accounts.json"
+    return json.loads(accounts.read_text()).get("traffic_db")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--db", default=None, help="default: the accounts file's traffic_db")
+    parser.add_argument("-n", type=int, default=20)
+    parser.add_argument("command", nargs="*", help="show FLOW_ID")
+    args = parser.parse_args()
+    path = args.db or default_db()
+    if not path:
+        parser.error("no --db and no traffic_db in ~/.config/claude-codex/accounts.json")
+    db = sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    if args.command[:1] == ["show"] and len(args.command) == 2:
+        row = db.execute("SELECT * FROM flows WHERE id = ?", (args.command[1],)).fetchone()
+        if row is None:
+            parser.error("no such flow")
+        for key in row.keys():
+            value = row[key]
+            if key.endswith("_body"):
+                value = zlib.decompress(value).decode(errors="replace") if value else ""
+                if key == "request_body" and '"$blob"' in value:
+                    value = json.dumps(restored(db, json.loads(value)), ensure_ascii=False, indent=1)
+            print(f"== {key}\n{value}")
+        for message in db.execute("SELECT * FROM websocket_messages WHERE flow_id = ? ORDER BY at", (row["id"],)):
+            direction = "->" if message["from_client"] else "<-"
+            print(f"== websocket {direction} {zlib.decompress(message['body']).decode(errors='replace')}")
+        return
+    if args.command:
+        parser.error("unknown command")
+    query = (
+        "SELECT id, started, client_host, client_user, cwd, launch_cwd, account, served_by, model,"
+        " status, method, url FROM flows ORDER BY started DESC LIMIT ?"
+    )
+    for row in db.execute(query, (args.n,)):
+        account = (row["account"] or "").removeprefix("proxy-account-").split("+")[0]
+        print(" | ".join(str(x or "-") for x in (
+            row["id"], time.strftime("%m-%d %H:%M:%S", time.localtime(row["started"])),
+            row["client_host"], row["client_user"], row["cwd"] or row["launch_cwd"],
+            account, row["served_by"] or row["model"], row["status"], row["method"], row["url"],
+        )))
+
+
+if __name__ == "__main__":
+    main()

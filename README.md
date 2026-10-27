@@ -186,6 +186,24 @@ All of this proxy's Anthropic traffic, including the Chrome bridge, goes through
 the next proxy. Each hop runs its own quota fallback over the accounts it holds.
 An alias that no hop holds gets a 401 from the last hop.
 
+### Recording all traffic (`--serve`)
+
+Set `"traffic_db": "/path/traffic.sqlite3"` in the `--serve` proxy's accounts file
+and it records every request, reply and Chrome-bridge message in SQLite. It takes
+effect on the next request, without a restart. Each row of `flows` says when, which
+machine, OS user and folder (the launch folder and the session's working directory),
+which session and account, the model, the account or backend that served it, and the
+status. `--via` clients send their machine, user and folder in headers that the proxy
+strips. Clients launched before those headers existed are named by their tailnet IP.
+
+Credential headers and fields are never written. The parts of a conversation that
+repeat every turn are stored once, so a busy day is a few hundred MB.
+
+```sh
+scripts/claude-traffic -n 20          # newest flows
+scripts/claude-traffic show FLOW_ID   # one flow, request and reply in full
+```
+
 ## How it works
 
 Claude Code sends normal Anthropic API requests to the proxy. The proxy reads

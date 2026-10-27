@@ -2,6 +2,7 @@
 """Launch an isolated Claude session with account-aware mitmproxy routing."""
 
 import argparse
+import getpass
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ import time
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 def proxy_command(
@@ -435,7 +436,7 @@ def take_settings(forwarded):
     return rest, extra
 
 
-def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
+def client_environment(state, port, secure_storage, proxy_url=None, extra=None, identify=False):
     env = os.environ.copy()
     # Privacy is per launch: a tcc started from this session's shell must not inherit it.
     env.pop("TCC_PRIVATE", None)
@@ -457,6 +458,18 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None):
     ):
         settings_env[name] = settings_env["HTTPS_PROXY"]
     settings_env["no_proxy"] = settings_env["NO_PROXY"]
+    if identify:
+        # A shared --serve proxy records which machine, user and folder each request is from.
+        # Percent-encoded: header values must be ASCII. The proxy strips them.
+        identity = {
+            "X-Claude-Client-Host": socket.gethostname(),
+            "X-Claude-Client-User": getpass.getuser(),
+            "X-Claude-Client-Cwd": quote(os.getcwd()),
+        }
+        own = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        settings_env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(
+            [*filter(None, [own]), *(f"{k}: {v}" for k, v in identity.items())]
+        )
     # The proxy makes this a first-party session, so Remote Control's set_model
     # (HQ's model picker) accepts only catalog models; this adds the default Codex
     # model. Claude Code owns context budgeting before a request reaches the proxy,
@@ -725,6 +738,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
             Path(manifest["accounts"][main_account]["secure_storage_dir"]),
             args.via,
             extra_settings,
+            identify=True,
         )
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)

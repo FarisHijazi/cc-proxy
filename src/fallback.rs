@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const POOL_HEADER: &str = "x-claude-codex-account-pool";
+/// Response header naming the account or backend that served the request.
+pub const SERVED_BY_HEADER: &str = "x-claude-codex-served-by";
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,8 +285,14 @@ pub async fn dispatch(
         let credential_rejected =
             matches!(step, Step::Account(_, _)) && response.status() == StatusCode::UNAUTHORIZED;
         if response.status() != StatusCode::TOO_MANY_REQUESTS && !credential_rejected {
+            let served = format!("{owner}/{model}");
             if !first_choice && response.status().is_success() {
-                note(log, &ctx.req_id, &requested, &format!("{owner}/{model}"));
+                note(log, &ctx.req_id, &requested, &served);
+            }
+            let mut response = response;
+            // The --serve proxy's traffic recorder reads which account answered.
+            if let Ok(value) = HeaderValue::from_str(&served) {
+                response.headers_mut().insert(SERVED_BY_HEADER, value);
             }
             return response;
         }

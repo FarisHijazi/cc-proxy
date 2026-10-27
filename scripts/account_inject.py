@@ -92,6 +92,7 @@ class AccountInject:
         self.sticky, self.turn = {}, -1
         self.chrome = None
         self.upstream = None
+        self.traffic_db = None
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
 
     def load(self, loader):
@@ -119,6 +120,8 @@ class AccountInject:
         self.accounts = {a: str(s) for a, s in data["accounts"].items()}
         # Old alias -> current alias, so sessions launched before a rename keep working.
         self.renamed = dict(data.get("renamed", {}))
+        # Where account_traffic.py records every flow; unset records nothing.
+        self.traffic_db = data.get("traffic_db")
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
@@ -340,4 +343,9 @@ class AccountInject:
             )
 
 
-addons = [AccountInject()]
+inject = AccountInject()
+# First, so it sees each request before the placeholder is swapped for a real token.
+traffic = runpy.run_path(str(Path(__file__).with_name("account_traffic.py")))["TrafficDB"](
+    lambda: inject.traffic_db
+)
+addons = [traffic, inject]
