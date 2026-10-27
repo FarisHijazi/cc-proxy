@@ -1,9 +1,11 @@
-# claude-code-with-codex (FarisHijazi fork)
+# cc-proxy
 
 Local Rust proxy that speaks the Anthropic Messages API and routes each request
-to a backend based on the model name. Fork of
-[fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex);
-`upstream` remote points there. Upstream conventions live in
+to a backend based on the model name. Repo: `FarisHijazi/cc-proxy`. It started as a
+GitHub fork of [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex)
+and was republished on 2026-10-27 as a standalone repo.
+Local checkouts and deployed copies keep the directory name `claude-code-with-codex`, because
+launchers and the ftower unit reference that path. Upstream conventions live in
 [AGENTS.md](AGENTS.md) and still apply.
 
 ## The constraint that drives everything

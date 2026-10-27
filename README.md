@@ -1,7 +1,7 @@
-# claude-code-with-codex
+# cc-proxy
 
 [![crates.io](https://img.shields.io/crates/v/claude-codex.svg)](https://crates.io/crates/claude-codex)
-[![CI](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml)
+[![CI](https://github.com/FarisHijazi/cc-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/FarisHijazi/cc-proxy/actions/workflows/ci.yml)
 
 Use Claude Code with your **Claude subscription and your ChatGPT (Codex)
 subscription at the same time**, and switch between them mid-conversation.
@@ -688,7 +688,10 @@ token in it would break the Claude passthrough. `/healthz` stays open.
 
 ## Credits
 
-Built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy),
-which provides the Codex, Kimi, Grok, and Cursor backends. This fork adds using
+Started from [`fcakyon/claude-code-with-codex`](https://github.com/fcakyon/claude-code-with-codex),
+itself built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy),
+which provides the Codex, Kimi, Grok, and Cursor backends. That project added using
 your Claude subscription as a backend alongside Codex, reasoning that survives a
-mid-conversation switch, and reading the Codex login from the Codex CLI.
+mid-conversation switch, and reading the Codex login from the Codex CLI. cc-proxy
+adds the shared multi-account proxy. The installer and demo GIF still come from
+`fcakyon/claude-code-with-codex` releases, because cc-proxy publishes none yet.
