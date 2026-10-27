@@ -45,3 +45,27 @@ login and points `CCP_CODEX_AUTH_FILE` at it. Reproduce CI locally with an empty
 The second run built Linux and macOS, but Windows failed: `is_executable_file` in
 `src/providers/cursor_cli/process.rs` used `std::os::unix` without a `#[cfg(unix)]` guard. It now
 has a Unix version (execute bit) and a non-Unix one (any file).
+
+## Faster, config-driven client launch (claude-accounts moves here)
+
+`claude-accounts` was a dotclaude shell wrapper that probed the proxy with an HTTP GET (`curl -m 2`,
+1.2 s on a healthy tailnet) and fell back to a wstunnel tunnel. Under load the GET passed 2 s, so
+machines on the tailnet wrongly took the tunnel. The launcher then fetched each account's profile
+in series (0.5 s each).
+
+Now `scripts/claude-accounts` (and the package's `claude-accounts` entry) runs the launcher with
+`~/.config/claude-codex/accounts.json`. Its `via` list and `via_ca` replace `--via`/`--via-ca`.
+`reach()` tries each entry with a 0.4 s TCP connect. A `tunnel` entry starts wstunnel for the session
+and is ready when its local port listens. `profiles()` caches profiles for a day in
+`<state>/profiles.json` and fetches missing ones in parallel. A single explicit `--via` is used as
+given.
+
+Measured with `claude --version` as the payload (the launcher's own cost):
+
+| Machine | Before | First launch | Cached |
+| --- | --- | --- | --- |
+| dev (tailnet) | about 2.9 s | 1.49 s | 0.44 s |
+| work VM (tailnet) | not measured | 2.82 s | 0.76 s |
+| second work VM (tunnel only) | not measured | 2.89 s | 0.68 s |
+
+The Mac keeps the old dotclaude wrapper until its checkout can be updated.

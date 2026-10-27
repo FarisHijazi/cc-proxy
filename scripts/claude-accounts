@@ -1,0 +1,3 @@
+#!/bin/sh
+# Launch Claude through the shared proxy named in the accounts file ("via", "via_ca").
+exec claude-account-router --accounts-file "${CC_PROXY_ACCOUNTS:-$HOME/.config/claude-codex/accounts.json}" "$@"

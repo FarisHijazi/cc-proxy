@@ -229,8 +229,12 @@ def test_via_placeholder_login_comes_from_the_proxy_profile(tmp_path, monkeypatc
 
     config, secure = tmp_path / "config", tmp_path / "secure"
     secure.mkdir()
-    launcher["placeholder_login"]("work", Opener(), config, secure)
+    found, missing = launcher["profiles"](["work"], Opener(), tmp_path / "profiles.json")
+    assert not missing
+    launcher["placeholder_login"]("work", found["work"], config, secure)
     assert seen == ["Bearer proxy-account-work"]
+    again, _ = launcher["profiles"](["work"], Opener(), tmp_path / "profiles.json")
+    assert again == found and seen == ["Bearer proxy-account-work"]  # cached, no second request
     account = json.loads((config / ".claude.json").read_text())["oauthAccount"]
     assert account == {
         "emailAddress": "user@example.com",
@@ -813,13 +817,14 @@ def test_placeholder_names_the_remote_control_owner(tmp_path):
 
     secure = tmp_path / "secure"
     secure.mkdir()
-    launcher["placeholder_login"]("work", Opener(), tmp_path / "config", secure, "personal")
+    profile = launcher["profiles"](["work"], Opener(), tmp_path / "profiles.json")[0]["work"]
+    launcher["placeholder_login"]("work", profile, tmp_path / "config", secure, "personal")
     oauth = json.loads((secure / ".credentials.json").read_text())["claudeAiOauth"]
     assert oauth["accessToken"] == "proxy-account-work+rc=personal"
-    assert seen == ["Bearer proxy-account-work+rc=personal"]
     (tmp_path / "secure2").mkdir()
-    launcher["placeholder_login"]("work", Opener(), tmp_path / "config2", tmp_path / "secure2", "work")
-    assert seen[-1] == "Bearer proxy-account-work"
+    launcher["placeholder_login"]("work", profile, tmp_path / "config2", tmp_path / "secure2", "work")
+    oauth = json.loads((tmp_path / "secure2" / ".credentials.json").read_text())["claudeAiOauth"]
+    assert oauth["accessToken"] == "proxy-account-work"
 
 
 def test_folder_trusted_in_a_sibling_profile_is_trusted_here(tmp_path, monkeypatch):
@@ -910,7 +915,12 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
     monkeypatch.setitem(names, "certificate_bundle", lambda ca: b"")
     monkeypatch.setitem(names, "ssl", __import__("types").SimpleNamespace(create_default_context=lambda **k: None))
     monkeypatch.setattr(names["urllib"].request, "build_opener", lambda *a: Opener())
-    monkeypatch.setattr(names["subprocess"], "call", lambda command, env: launched.append(command) or 0)
+    def launch(command, env):
+        credential = Path(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / ".credentials.json"
+        launched.append(json.loads(credential.read_text())["claudeAiOauth"]["accessToken"])
+        return 0
+
+    monkeypatch.setattr(names["subprocess"], "call", launch)
     accounts = tmp_path / "accounts.json"
     accounts.write_text(json.dumps({"main": "work", "remote_control": "personal", "accounts": {"work": 2, "personal": 1}}))
     monkeypatch.setattr(
@@ -919,9 +929,10 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
         ["claude-account-router", "--accounts-file", str(accounts), "--state-dir", str(tmp_path / "state"),
          "--via", "http://127.0.0.1:18790", "--via-ca", str(tmp_path / "ca.pem"), *flag],
     )
-    assert launcher["main"]() == 0 and launched
+    assert launcher["main"]() == 0
     suffix = "+private" if private else ""
-    assert seen == [f"Bearer proxy-account-work+rc=personal{suffix}+chromes", "Bearer proxy-account-personal"]
+    assert launched == [f"proxy-account-work+rc=personal{suffix}+chromes"]
+    assert sorted(seen) == ["Bearer proxy-account-personal", "Bearer proxy-account-work"]
 
 
 @pytest.mark.parametrize("selected", [None, "personal", "work"])
@@ -973,3 +984,18 @@ def test_via_native_chrome_is_opted_in_without_broadening_mcp_children(tmp_path,
         "work": "proxy-account-work+chrome=work", "personal": "proxy-account-personal+chrome=personal",
     }
     assert captured["servers"] == ({"account-chrome", "account-artifacts"} if selected is None else {"account-artifacts"})
+
+
+def test_reach_tries_addresses_in_order_and_skips_closed_ones(tmp_path):
+    import socket
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            dead = closed.getsockname()[1]
+        with (tmp_path / "log").open("w") as log:
+            url, tunnel = launcher["reach"]([f"http://127.0.0.1:{dead}", f"http://127.0.0.1:{port}"], log)
+    assert (url, tunnel) == (f"http://127.0.0.1:{port}", None)

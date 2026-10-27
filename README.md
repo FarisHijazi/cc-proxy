@@ -142,16 +142,32 @@ The CA is in the `cc-proxy-state` volume:
 
 ### Connect a client
 
-On every machine that runs Claude Code, with the server's CA saved as `server-ca.pem`:
+On every machine that runs Claude Code, save the server's CA and list the server in
+`~/.config/claude-codex/accounts.json`:
 
-```sh
-uvx --from git+https://github.com/FarisHijazi/cc-proxy cc-proxy \
-  --accounts-file ~/.config/claude-codex/accounts.json \
-  --via http://SERVER_TAILNET_IP:18790 --via-ca server-ca.pem -- --resume
+```json
+{
+  "main": "user@example.com",
+  "accounts": {"user@example.com": 1, "other@example.com": 2},
+  "via": [
+    "http://SERVER_TAILNET_IP:18790",
+    {"tunnel": "wss://proxy.example.com", "target": "SERVER_TAILNET_IP:18790",
+     "headers_file": "~/.config/claude-codex/proxy-gate.headers"}
+  ],
+  "via_ca": "~/.config/claude-codex/server-ca.pem"
+}
 ```
 
-Everything after `--` goes to `claude`. The client's accounts file names the same
-aliases. Its `main` decides which login claude.ai sees for artifacts and Remote Control.
+```sh
+uvx --from git+https://github.com/FarisHijazi/cc-proxy claude-accounts -- --resume
+```
+
+Everything after `--` goes to `claude`. `claude-accounts` tries each `via` entry in order
+with a short TCP connect. A `tunnel` entry starts a [wstunnel](https://github.com/erebe/wstunnel)
+client for this session only, for when the tailnet is not reachable, and stops it when
+Claude exits. Leave it out if you only use the tailnet. Account profiles are cached for a
+day, so a launch takes well under a second. The client's `main` decides which login
+claude.ai sees for artifacts and Remote Control.
 
 ## Quickstart
 

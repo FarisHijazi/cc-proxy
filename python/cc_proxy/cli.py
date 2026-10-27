@@ -75,3 +75,10 @@ def main():
 
 def traffic():
     run("claude-traffic")
+
+
+def accounts():
+    """claude-accounts: the launcher with ~/.config/claude-codex/accounts.json (or $CC_PROXY_ACCOUNTS)."""
+    default = Path.home() / ".config/claude-codex/accounts.json"
+    sys.argv[1:1] = ["--accounts-file", os.environ.get("CC_PROXY_ACCOUNTS") or str(default)]
+    run("claude-account-router")

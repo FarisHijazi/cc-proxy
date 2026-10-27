@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 
@@ -651,7 +652,90 @@ CLAUDE_AI_SCOPES = [
 ]
 
 
-def placeholder_login(alias, opener, config, secure, remote_control=None, private=False, chrome=None, pin=False):
+PROFILE_TTL_S = 86400  # a login's email, uuid and plan; delete profiles.json to refetch
+
+
+def port_open(host, port, timeout):
+    try:
+        socket.create_connection((host, port), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def reach(candidates, log):
+    """The first proxy that answers, as (http://HOST:PORT, tunnel process or None).
+
+    A string is tried directly with a short TCP connect. A {"tunnel": "wss://...",
+    "target": "HOST:PORT", "headers_file": ...} entry starts a wstunnel client for this
+    session only; it is ready once its local port listens."""
+    if len(candidates) == 1 and isinstance(candidates[0], str):
+        return candidates[0], None  # one explicit --via: use it as given
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            origin = urlsplit(candidate)
+            if port_open(origin.hostname, origin.port, 0.4):
+                return candidate, None
+            continue
+        with socket.socket() as free:
+            free.bind(("127.0.0.1", 0))
+            port = free.getsockname()[1]
+        tunnel = subprocess.Popen(
+            [
+                candidate.get("wstunnel") or shutil.which("wstunnel") or str(Path.home() / ".local/bin/wstunnel"),
+                "client",
+                "--http-headers-file", str(Path(candidate["headers_file"]).expanduser()),
+                "-L", f"tcp://127.0.0.1:{port}:{candidate['target']}",
+                candidate["tunnel"],
+            ],
+            stdout=log,
+            stderr=log,
+        )
+        for _ in range(100):
+            if port_open("127.0.0.1", port, 0.1):
+                return f"http://127.0.0.1:{port}", tunnel
+            if tunnel.poll() is not None:
+                break
+            time.sleep(0.02)
+        tunnel.terminate()
+    raise ValueError("no configured proxy is reachable: " + ", ".join(map(str, candidates)))
+
+
+def profiles(aliases, opener, cache_file):
+    """Each alias's claude.ai profile: from a one-day cache, else fetched in parallel."""
+    try:
+        cache = json.loads(cache_file.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    now = time.time()
+    found = {a: cache[a]["profile"] for a in aliases if now - cache.get(a, {}).get("at", 0) < PROFILE_TTL_S}
+
+    def fetch(alias):
+        request = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/profile",
+            headers={"Authorization": f"Bearer proxy-account-{alias}", "anthropic-beta": "oauth-2025-04-20"},
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                return alias, json.load(response)
+        except (OSError, ValueError) as error:
+            return alias, error
+
+    missing = [a for a in aliases if a not in found]
+    errors = {}
+    if missing:
+        with ThreadPoolExecutor(len(missing)) as pool:
+            for alias, result in pool.map(fetch, missing):
+                if isinstance(result, Exception):
+                    errors[alias] = result
+                else:
+                    found[alias] = result
+                    cache[alias] = {"at": now, "profile": result}
+        cache_file.write_text(json.dumps(cache))
+    return found, errors
+
+
+def placeholder_login(alias, profile, config, secure, remote_control=None, private=False, chrome=None, pin=False):
     """Write a login whose token the --serve proxy swaps for the real one.
 
     `remote_control` names another alias whose token the proxy uses on /v1/code/
@@ -667,12 +751,6 @@ def placeholder_login(alias, opener, config, secure, remote_control=None, privat
         token += "+private"
     if chrome is not None:
         token += "+chromes" if chrome == "*" else f"+chrome={chrome}"
-    request = urllib.request.Request(
-        "https://api.anthropic.com/api/oauth/profile",
-        headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
-    )
-    with opener.open(request, timeout=30) as response:
-        profile = json.load(response)
     organization = profile["organization"]
     config.mkdir(mode=0o700, parents=True, exist_ok=True)
     update_account_metadata(
@@ -702,9 +780,17 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
     """Run claude against a --serve proxy; this machine holds placeholder logins only."""
     if not (args.via_ca and accounts):
         raise ValueError("--via needs --via-ca and an account map")
+    candidates = args.via if isinstance(args.via, list) else [args.via]
+    with (state / "tunnel.log").open("a") as log:
+        args.via, tunnel = reach(candidates, log)
     origin = urlsplit(args.via)
     if origin.scheme != "http" or not origin.hostname or not origin.port:
         raise ValueError("--via must be http://HOST:PORT")
+    if tunnel:
+        print(f"Tunnelling to the proxy through {candidates[-1]['tunnel']}", file=sys.stderr)
+        # A closed terminal or kill must still stop the tunnel (the finally below).
+        for stop in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(stop, lambda *_: sys.exit(130))
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"https": args.via}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=args.via_ca)),
@@ -712,14 +798,18 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
     login = Path(tempfile.mkdtemp(prefix="login-", dir=state))
     try:
         manifest = {"main": main_account, "accounts": {}, "claude": shutil.which("claude") or "claude"}
-        for alias in [main_account, *(name for name in accounts if name != main_account)]:
+        aliases = [main_account, *(name for name in accounts if name != main_account)]
+        found, missing = profiles(aliases, opener, state / "profiles.json")
+        for alias in aliases:
             config = state / "claude" if alias == main_account else login / alias / "config"
             secure = login / alias / "secure"
             secure.mkdir(mode=0o700, parents=True)
             try:
                 main = alias == main_account
+                if alias in missing:
+                    raise missing[alias]
                 placeholder_login(
-                    alias, opener, config, secure,
+                    alias, found[alias], config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
                     chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
@@ -749,6 +839,8 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
     finally:
         shutil.rmtree(login, ignore_errors=True)
+        if tunnel:
+            tunnel.terminate()
 
 
 def main():
@@ -835,6 +927,11 @@ def main():
         "claude_args", nargs=argparse.REMAINDER, help="Claude arguments after --"
     )
     args = parser.parse_args()
+    saved = json.loads(args.accounts_file.read_text()) if args.accounts_file else {}
+    if not (args.via or args.serve) and saved.get("via"):
+        # The proxy's addresses, tried in order by reach(); via_ca is its CA.
+        args.via = saved["via"]
+        args.via_ca = args.via_ca or Path(saved["via_ca"]).expanduser()
     if args.private_remote_control and not args.via:
         # Only the --serve proxy's placeholder carries +private; failing open would mirror it.
         parser.error("--private-remote-control (or TCC_PRIVATE=1) needs --via")
@@ -845,10 +942,10 @@ def main():
     accounts, main_account = account_selection(
         args.account, args.accounts_file, args.main_account
     )
-    if not args.remote_control_account and args.accounts_file:
-        args.remote_control_account = json.loads(args.accounts_file.read_text()).get("remote_control")
+    if not args.remote_control_account:
+        args.remote_control_account = saved.get("remote_control")
     # Accounts file "pin_main": this machine's sessions start on its main account.
-    args.pin_main = bool(args.accounts_file and json.loads(args.accounts_file.read_text()).get("pin_main"))
+    args.pin_main = bool(saved.get("pin_main"))
     if args.remote_control_account and args.remote_control_account not in accounts:
         parser.error("--remote-control-account must name a configured account alias")
     if args.chrome_account and args.chrome_account not in accounts:
