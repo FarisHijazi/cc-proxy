@@ -765,6 +765,12 @@ OpenAI-compatible server (Ollama, LM Studio, OpenRouter):
 CCP_GEMINI_BASE_URL=http://localhost:11434/v1 claude-codex serve
 ```
 
+On a `--serve` host the router needs no restart for this: it reads
+`~/.config/claude-code-proxy/config.json` on every request, so writing
+`{"gemini": {"baseUrl": "http://<host>:8100/v1"}}` there lists the gemini ids at
+once. The gemini server can run on another machine that has the signed-in
+Chrome; every `--via` client then gets gemini through the shared proxy.
+
 ### Cursor CLI (`cursor-cli`)
 
 Drives the **`cursor-agent` binary you already have signed in**, rather than
@@ -796,6 +802,12 @@ directory field, but Claude Code states its cwd in the environment block it
 prepends to the conversation, and the proxy reads it back out — so one proxy
 serves every project. Set `cursorCli.workspace` to pin every run to one
 directory instead.
+
+Behind a shared `--serve` proxy, `cursor-agent` runs on the proxy host with that
+host's `cursor-agent login`. A `--via` client's folder usually does not exist
+there, so the run starts in the router's own directory and cannot see the
+client's files: use it for questions and plans that carry their context in the
+prompt.
 
 Note what that pin is: `--workspace` chooses where the agent *starts*, not what
 it may touch. An agent given an absolute path in the prompt will read it even
