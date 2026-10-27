@@ -37,6 +37,9 @@ SIGTERM to the launcher alone leaves the router and mitmdump running: Python's
 default SIGTERM handler skips `serve()`'s `finally`. systemd kills the whole cgroup,
 so the ftower service is unaffected. Test runs must stop the children too.
 
+Fixed 2026-10-27: `serve()` turns SIGTERM into `KeyboardInterrupt`, as local mode already
+did, so its `finally` stops both children. Verified on ftower by stopping only the launcher.
+
 ## 2026-10-27: `pin_main`
 
 A client accounts file with `"pin_main": true` adds `+pin` to its main placeholder;

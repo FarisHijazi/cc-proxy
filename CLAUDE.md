@@ -196,6 +196,7 @@ A client's `"pin_main": true` adds `+pin`, so its sessions start on their own al
 `"traffic_db"` in the `--serve` accounts file turns on `scripts/account_traffic.py` (every flow, sender
 metadata, no credentials; read with `scripts/claude-traffic`). See
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
+`serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the

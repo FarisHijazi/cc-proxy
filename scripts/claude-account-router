@@ -622,6 +622,11 @@ def serve(args, state):
             )
         ]
         try:
+
+            def stop(_signum, _frame):
+                raise KeyboardInterrupt  # run the finally below; default SIGTERM skips it
+
+            signal.signal(signal.SIGTERM, stop)
             wait_listener(processes[0], router_port, log.name)
             processes.append(subprocess.Popen(command, stdout=log, stderr=log))
             wait_listener(processes[1], args.port, log.name, host=args.listen_host)
