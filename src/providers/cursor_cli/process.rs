@@ -263,11 +263,18 @@ pub fn binary_is_runnable(binary: &str) -> bool {
     std::env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(binary)))
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+// Windows has no execute bit; any file may be launched.
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]

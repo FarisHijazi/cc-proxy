@@ -42,3 +42,6 @@ expected `gpt-5.6-sol`, but the router lists Codex models only when a Codex logi
 has none. It passed on dev only because dev has `~/.codex/auth.json`. The test now writes its own
 login and points `CCP_CODEX_AUTH_FILE` at it. Reproduce CI locally with an empty `HOME` (keep
 `CARGO_HOME` and `RUSTUP_HOME`).
+The second run built Linux and macOS, but Windows failed: `is_executable_file` in
+`src/providers/cursor_cli/process.rs` used `std::os::unix` without a `#[cfg(unix)]` guard. It now
+has a Unix version (execute bit) and a non-Unix one (any file).
