@@ -249,5 +249,10 @@ truth (code, tests, `scripts/claude-rc-smoke`, its own `CLAUDE.md`) in `~/Projec
 push, then bump the sha here and re-run `uv run --with pytest --with pytest-asyncio --with mcp
 --with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests` plus `cargo test --all`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
 watch feed, uploads, TTS); cookie-only auth from dev Chrome (auto-probes `http://127.0.0.1:9222`, override
-`CLAUDE_AI_CDP_URL`) is live-verified. Shared CLI credentials are re-read but NEVER refreshed by this client. Its cswap-slot auth compiles `slot_token` out of this repo's `scripts/account_inject.py`, found
-through the installed or editable `cc_proxy` package, so keep that function's name and its constants.
+`CLAUDE_AI_CDP_URL`) is live-verified. Shared CLI credentials are re-read but NEVER refreshed by this client.
+The client now reads cswap through its storage API only, never through this
+proxy's `slot_token` (which may consume backup grants). cswap still owns refresh.
+The 0.6.0 canonical integration and consumer pin/lock verification are recorded in
+`docs/devlog/claude_2026-10-28-canonical-web-client-sync.json` (deliberately a plain
+path, not an include). Read the canonical `docs/web-api.md` for live versus
+fixture-only capabilities; the dependency pin is not a full browser-parity claim.

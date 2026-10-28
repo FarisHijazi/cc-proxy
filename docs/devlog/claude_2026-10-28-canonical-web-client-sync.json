@@ -1,0 +1,65 @@
+{
+  "date": "2026-10-28",
+  "result": "Canonical dependency synced and verified in the isolated claude-rc-live worktree only",
+  "canonical_repo": "https://github.com/FarisHijazi/claude-rc-api",
+  "canonical_commit": "ee338fbc836eee5006cff13a1632241c225bc7e0",
+  "version": "0.6.0",
+  "changes": [
+    "Updated only this worktree's pyproject.toml pin from ab77994 to ee338fb",
+    "Generated uv.lock using uv; installed the published git dependency, not an editable canonical override",
+    "Corrected the stale CLAUDE.md cswap AST-reader note: canonical client now uses read-only cswap storage APIs",
+    "Original repository checkout was not edited or synchronized"
+  ],
+  "verification": {
+    "canonical_suite": {
+      "command": "uv run --extra test --extra web --extra cli --with playwright pytest -q",
+      "passed": 685,
+      "skipped": 0
+    },
+    "consumer_python": {
+      "command": "uv run --with pytest --with pytest-asyncio --with mcp --with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests",
+      "passed": 162,
+      "skipped": 1,
+      "skip_reason": "test_live_native_accounts_discover_and_select requires private access-only snapshots; CHROME_ACCOUNT_LIVE_MANIFEST was not supplied",
+      "exit": 0
+    },
+    "consumer_rust": {
+      "command": "cargo test --all -- --test-threads=1",
+      "passed": 1071,
+      "failed": 0,
+      "exit": 0,
+      "note": "Ran before the Python dependency pin; Rust source unchanged. Existing subscription smoke emitted a model-unavailable diagnostic, not proof of model availability"
+    },
+    "installed_dependency": {
+      "location": "this worktree's .venv/lib/python3.12/site-packages/claude_rc",
+      "version": "0.6.0",
+      "public_live_correlator": true,
+      "public_dictation_helper": true
+    },
+    "installed_live_read_only": {
+      "source": "cookies:cdp",
+      "session_limit": 1,
+      "sessions_returned": 1,
+      "environments_returned": 4,
+      "default_continuous_recovery": true,
+      "credentials_printed_or_refreshed": false,
+      "existing_user_resources_mutated": false
+    },
+    "canonical_remote_sha_matches": true
+  },
+  "evidence": [
+    "Canonical docs/web-api.md: per-capability matrix and captured endpoint map",
+    "Canonical docs/devlog/claude_2026-10-28-integration.json: integration changes and complete remaining acceptance plan",
+    "Canonical docs/devlog/claude_2026-10-28-integration-qualified.json: latest integrated live run",
+    "Canonical docs/devlog/claude_2026-10-28-integration-cas.json: opaque CAS-token diagnosis"
+  ],
+  "limitations": [
+    "This pin is not a full web parity claim",
+    "Genuine permission execution and permanent-rule reuse lack a live generator",
+    "Routine runs were submitted but returned limit-related output without ROUTINE_OK; terminal success is not execution proof",
+    "Cookie attachment upload returned 401 and Files API upload 404; roundtrip/mount/prefetch staging remain unqualified",
+    "Owned OAuth refresh/enrollment, dedicated MCP/dialog fixtures, custom-environment workspace mapping and complete live-browser navigation remain incomplete",
+    "Public sharing, support/debug/feedback uploads, network writes and token/webhook flows require explicit approval and were not submitted",
+    "Fork/grouping/templates/SCM/integration-fire contracts remain uncaptured; host-local management menus and browser conveniences are not complete"
+  ]
+}
