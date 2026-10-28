@@ -860,10 +860,12 @@ token in it would break the Claude passthrough. `/healthz` stays open.
 
 ## Driving Claude Code on the web (`claude-rc`)
 
-The wheel also installs `claude-rc`, a client for claude.ai/code cloud sessions
-(`python/claude_rc`). It uses your Claude Code login: `CLAUDE_AI_ACCESS_TOKEN`,
-`--cswap-slot N`, a claude.ai `--session-key`, or `~/.claude/.credentials.json`.
-A `claude setup-token` cannot reach sessions.
+The wheel also installs `claude-rc`, a client for claude.ai/code cloud sessions,
+from its own repo ([FarisHijazi/claude-rc-api](https://github.com/FarisHijazi/claude-rc-api),
+pinned in `pyproject.toml`). It uses claude.ai cookies from a signed-in Chrome
+(`CLAUDE_AI_CDP_URL`), `CLAUDE_AI_ACCESS_TOKEN`, `--cswap-slot N`, a claude.ai
+`--session-key`, or `~/.claude/.credentials.json`. A `claude setup-token`
+cannot reach sessions.
 
 ```sh
 claude-rc envs list
@@ -875,8 +877,7 @@ claude-rc speak "hello" -o hello.ogg                     # claude.ai text to spe
 ```
 
 The endpoints are private and were read from the CLI and a browser capture;
-several are still unverified live. See
-`docs/devlog/claude_20261028-claude-code-web-api.md`.
+several are still unverified live. See `docs/web-api.md` in that repo.
 
 ## Limitations
 

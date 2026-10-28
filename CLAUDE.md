@@ -243,8 +243,11 @@ launcher refuses it without `--via`, and `account_inject` never puts a token on 
 into HQ). A caller's `--settings` merges under the launcher's. Read
 `docs/devlog/claude_20261023-rc-owner-private-mirror.md` on demand (plain path).
 
-`python/claude_rc` (vendored claude-rc-api, now 0.4.0 locally; `claude-rc` in the wheel) drives Claude Code on the
-web as the web app does: sessions, environments, scheduled tasks, permission and AskUserQuestion answers, the
-account watch feed, uploads and TTS. All HTTP goes through `RemoteControlClient._send`; tests are MockTransport-only
-(`tests/claude_rc*_test.py`). `scripts/claude-rc-smoke` is unrun, but whoami/list/envs/create/send/stream/watch/archive passed live 2026-10-28 from dev with cookie-only auth (`CLAUDE_AI_CDP_URL=http://127.0.0.1:9222`); under cookies, envs use the private org route (public one 403s a cookie). Shapes, auth (a setup-token
-cannot reach sessions) and the needs-live-check list: `docs/devlog/claude_20261028-claude-code-web-api.md` (plain path).
+`claude_rc` (the `claude-rc` command) is NOT vendored any more: it is the pinned git dependency
+`claude-rc-api @ git+https://github.com/FarisHijazi/claude-rc-api@<sha>` in `pyproject.toml`, the single source of
+truth (code, tests, `scripts/claude-rc-smoke`, its own `CLAUDE.md`) in `~/Projects/claude-rc-api`. Change it there,
+push, then bump the sha here and re-run `uv run --with pytest --with mcp pytest -q tests --ignore
+tests/account_artifacts_test.py`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
+watch feed, uploads, TTS); cookie-only auth from dev Chrome (`CLAUDE_AI_CDP_URL=http://127.0.0.1:9222`) is
+live-verified. Its cswap-slot auth compiles `slot_token` out of this repo's `scripts/account_inject.py`, found
+through the installed or editable `cc_proxy` package, so keep that function's name and its constants.
