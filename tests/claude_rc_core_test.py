@@ -32,6 +32,13 @@ AUTH_ENV = (
     "CLAUDE_RC_ACCESS_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_AI_SESSION_KEY",
+    "CLAUDE_AI_COOKIES",
+    "CLAUDE_AI_AUTO_REFRESH",
+    "CLAUDE_AI_CHROME_ACCOUNT",
+    "CLAUDE_AI_CHROME_PROFILE",
+    "CLAUDE_AI_CHROME_DIR",
+    "CLAUDE_AI_CDP_URL",
+    "XDG_STATE_HOME",
     "CLAUDE_RC_CSWAP_SLOT",
     "CLAUDE_AI_ORG_UUID",
     "CLAUDE_RC_ORG_UUID",
@@ -137,14 +144,15 @@ def test_resolve_auth_order(tmp_path, monkeypatch):
     slot = resolve_auth(slot_token=lambda s: (f"slot-{s}", 9999999999999))
     assert slot.credentials.access_token == "slot-3" and slot.credentials.refresh_token is None
 
-    monkeypatch.setenv("CLAUDE_AI_SESSION_KEY", "sk")
-    assert resolve_auth().session_key == "sk"
-
     monkeypatch.setenv("CLAUDE_RC_ACCESS_TOKEN", "rc-env")
     assert resolve_auth().credentials.access_token == "rc-env"
 
     monkeypatch.setenv("CLAUDE_AI_ACCESS_TOKEN", "ai-env")
     assert resolve_auth().credentials.access_token == "ai-env"
+
+    # Cookie auth is primary whenever a cookie source yields a sessionKey.
+    monkeypatch.setenv("CLAUDE_AI_SESSION_KEY", "sk")
+    assert resolve_auth().session_key == "sk" and resolve_auth().credentials is None
 
     assert resolve_auth("explicit").credentials.access_token == "explicit"
     explicit_slot = resolve_auth(cswap_slot=7, slot_token=lambda s: (f"slot-{s}", 9999999999999))
@@ -345,7 +353,7 @@ def test_cookie_mode_moves_to_claude_ai(monkeypatch):
             rc.archive_session("cse_1")
     first = seen[0]
     assert str(first.url) == "https://claude.ai/v1/code/sessions/cse_1"
-    assert first.headers["cookie"] == "sessionKey=sk-cookie"
+    assert first.headers["cookie"] == "sessionKey=sk-cookie; sessionKeyV3=sk-cookie"
     assert "authorization" not in first.headers
     assert first.headers["anthropic-client-platform"] == "web_claude_ai"
     assert len(seen) == 2  # the 401 was not retried: a cookie cannot be refreshed
@@ -403,3 +411,10 @@ def test_explicit_credentials_object_still_works():
     )) as rc:
         rc.mark_read("cse_1", event_id="e1")
     assert seen == ["Bearer obj"]
+
+
+def test_cswap_live_account_is_the_default_login(tmp_path, monkeypatch):
+    _write_creds(tmp_path)
+    monkeypatch.setattr("claude_rc.credentials.cswap_current_slot", lambda: "2")
+    auth = resolve_auth(slot_token=lambda s: (f"live-{s}", 9999999999999))
+    assert (auth.credentials.access_token, auth.origin) == ("live-2", "cswap slot 2")

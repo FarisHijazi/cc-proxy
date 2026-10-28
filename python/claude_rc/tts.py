@@ -33,6 +33,8 @@ import threading
 from typing import Any, Callable, Iterable, Iterator, Optional
 from urllib.parse import urlencode
 
+from .webauth import proxy_url
+
 # client.py imports this module (TTSMixin), so APIError is imported at call
 # time; the platform value mirrors client.CLIENT_PLATFORM (a test pins it).
 CLIENT_PLATFORM = "web_claude_ai"
@@ -115,6 +117,8 @@ def _connect(client: Any, url: str, connect: Optional[Callable[..., Any]], open_
         http = client._headers(web=False, org=False, json_body=False)
         headers = {k: v for k, v in http.items() if k in _UPGRADE_HEADERS}
         agent = headers.pop("User-Agent", None)
+        # CLAUDE_AI_PROXY (e.g. a home exit node) also carries the socket past Cloudflare.
+        proxy = {"proxy": proxy_url()} if proxy_url() else {}
         try:
             return connect(
                 url,
@@ -123,6 +127,7 @@ def _connect(client: Any, url: str, connect: Optional[Callable[..., Any]], open_
                 user_agent_header=agent,
                 open_timeout=open_timeout,
                 max_size=None,
+                **proxy,
             )
         except InvalidStatus as exc:
             resp = exc.response

@@ -110,6 +110,7 @@ from .lifecycle import (
 from .sse import SSEFrame, parse_sse
 from .triggers import fire_routine, rfc3339, trigger_body, trigger_prompt, trigger_url
 from .tts import TTSError, ogg_duration_ms, ogg_opus, tts_url
+from .webauth import CloudflareChallenge, CookieJar, keepalive, load_jar
 from .webui import serve as serve_webui
 
 __all__ = [
@@ -204,4 +205,8 @@ __all__ = [
     "SSEFrame",
     "parse_sse",
     "serve_webui",
+    "CookieJar",
+    "CloudflareChallenge",
+    "load_jar",
+    "keepalive",
 ]

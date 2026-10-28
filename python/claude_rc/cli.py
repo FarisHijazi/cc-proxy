@@ -1,6 +1,7 @@
 """Command-line interface for the Claude Remote Control API.
 
     claude-rc whoami                 # show login / org / token status
+    claude-rc auth                   # which auth source is used (cookie names only)
     claude-rc list                   # list your Remote Control sessions
     claude-rc get <session_id>       # session details
     claude-rc events <session_id>    # recent events (history)
@@ -48,6 +49,7 @@ from typing import Any, Optional
 from . import __version__
 from .client import APIError, ControlRejected, ControlTimeout, RemoteControlClient
 from .credentials import CredentialsError, load_org_uuid, resolve_auth
+from . import webauth
 
 try:  # optional pretty output
     from rich.console import Console
@@ -108,6 +110,27 @@ def cmd_whoami(args) -> int:
         _print(f"scopes       : {', '.join(creds.scopes) or '(unknown)'}")
         _print(f"subscription : {creds.subscription_type or '-'}")
     _print(f"org uuid     : {'present' if org else 'not configured (looked up from /api/oauth/profile on use)'}")
+    return 0
+
+
+def cmd_auth(args) -> int:
+    """Offline diagnostic: the auth source a client would use. Never prints a
+    secret — cookies by name only."""
+    try:
+        auth = resolve_auth()
+    except CredentialsError as e:
+        _print(f"no auth source: {e}")
+        return 1
+    _print(f"source       : {auth.origin}")
+    jar = auth.jar
+    if jar is None:
+        _print("mode         : bearer OAuth (api.anthropic.com)")
+        return 0
+    _print("mode         : claude.ai cookies")
+    _print(f"cookies      : {', '.join(jar.names())}")
+    _print(f"org (cookie) : {jar.org_uuid or '-'}")
+    _print(f"owns refresh : {jar.owns_refresh()}")
+    _print(f"state file   : {webauth.state_path()}{'' if webauth.state_path().exists() else ' (absent)'}")
     return 0
 
 
@@ -683,6 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     cmd("whoami", cmd_whoami, "show login / org / token status")
+    cmd("auth", cmd_auth, "which auth source is used (cookie names only, offline)")
 
     pl = cmd("list", cmd_list, "list sessions", json_out=True)
     pl.add_argument("--limit", type=int, default=None)

@@ -15,6 +15,7 @@ from websockets.sync.client import connect as ws_connect
 from websockets.sync.server import serve
 
 from claude_rc import client as client_mod
+from claude_rc import webauth
 from claude_rc import files as files_mod
 from claude_rc import tts
 from claude_rc.client import APIError, RemoteControlClient
@@ -176,7 +177,7 @@ def test_stream_speech_protocol_and_cookie_auth(fake):
     assert req.headers["Cookie"] == "sessionKey=sk-test"
     assert req.headers["Origin"] == "https://claude.ai"
     assert "Authorization" not in req.headers
-    assert req.headers["User-Agent"].startswith("claude-rc-api-python/")
+    assert req.headers["User-Agent"] == webauth.BROWSER_USER_AGENT  # claude.ai sits behind Cloudflare
 
 
 def test_synthesize_and_save_with_bearer(fake, tmp_path):
@@ -328,3 +329,16 @@ def test_upload_without_file_uuid_is_an_error():
     _, handler = _recorder(201, {"weird": True})
     with pytest.raises(ValueError):
         _client(handler).upload_attachment(b"x")
+
+
+def test_tts_socket_uses_claude_ai_proxy(monkeypatch):
+    seen = {}
+
+    def fake_connect(url, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop")
+
+    monkeypatch.setenv("CLAUDE_AI_PROXY", "socks5://localhost:1055")
+    with pytest.raises(RuntimeError):
+        tts._connect(_client(session_key="sk-test"), "wss://claude.ai/x", fake_connect, 5)
+    assert seen["proxy"] == "socks5://localhost:1055"
