@@ -304,3 +304,12 @@ def test_singular_cookie_env_alias(monkeypatch):
     monkeypatch.setenv("CLAUDE_AI_COOKIE", "sessionKey=sk-alias; lastActiveOrg=org-9")
     jar = webauth.from_env()
     assert (jar.session_key, jar.org_uuid) == ("sk-alias", "org-9")
+
+
+def test_session_key_sent_under_both_names(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AI_SESSION_KEY", "sk-one")
+    assert {k: v for k, v in webauth.from_env().cookies.items() if k.startswith("sessionKey")} == {
+        "sessionKey": "sk-one", "sessionKeyV3": "sk-one"}
+    monkeypatch.delenv("CLAUDE_AI_SESSION_KEY")
+    monkeypatch.setenv("CLAUDE_AI_COOKIE", "sessionKeyV3=sk-v3")
+    assert webauth.from_env().session_key == "sk-v3"

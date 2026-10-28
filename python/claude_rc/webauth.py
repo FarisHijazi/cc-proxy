@@ -57,6 +57,7 @@ from .credentials import CredentialsError
 
 DOMAIN = "claude.ai"
 SESSION_COOKIE = "sessionKey"
+SESSION_COOKIE_V3 = "sessionKeyV3"
 ORG_COOKIE = "lastActiveOrg"
 # A cheap authenticated route to keep the session in use. UNVERIFIED as a
 # keep-alive (not in the 2026-10-28 HAR capture); override with `path=`.
@@ -233,8 +234,11 @@ def from_env() -> Optional[CookieJar]:
     cookies = parse_cookie_header(os.environ.get(ENV_COOKIES) or os.environ.get(ENV_COOKIE_ALIAS, ""))
     if os.environ.get(ENV_SESSION_KEY):
         cookies[SESSION_COOKIE] = os.environ[ENV_SESSION_KEY].strip()
-    if not cookies.get(SESSION_COOKIE):
+    # claude.ai sets the same value under both names; send both like the browser.
+    key = cookies.get(SESSION_COOKIE) or cookies.get(SESSION_COOKIE_V3)
+    if not key:
         return None
+    cookies[SESSION_COOKIE] = cookies[SESSION_COOKIE_V3] = key
     seed = _seed(cookies[SESSION_COOKIE])
     state = from_state()
     if state is not None and state.seed == seed:
