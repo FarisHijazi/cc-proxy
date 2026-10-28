@@ -246,8 +246,8 @@ into HQ). A caller's `--settings` merges under the launcher's. Read
 `claude_rc` (the `claude-rc` command) is NOT vendored any more: it is the pinned git dependency
 `claude-rc-api @ git+https://github.com/FarisHijazi/claude-rc-api@<sha>` in `pyproject.toml`, the single source of
 truth (code, tests, `scripts/claude-rc-smoke`, its own `CLAUDE.md`) in `~/Projects/claude-rc-api`. Change it there,
-push, then bump the sha here and re-run `uv run --with pytest --with mcp pytest -q tests --ignore
-tests/account_artifacts_test.py`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
-watch feed, uploads, TTS); cookie-only auth from dev Chrome (`CLAUDE_AI_CDP_URL=http://127.0.0.1:9222`) is
-live-verified. Its cswap-slot auth compiles `slot_token` out of this repo's `scripts/account_inject.py`, found
+push, then bump the sha here and re-run `uv run --with pytest --with pytest-asyncio --with mcp
+--with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests` plus `cargo test --all`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
+watch feed, uploads, TTS); cookie-only auth from dev Chrome (auto-probes `http://127.0.0.1:9222`, override
+`CLAUDE_AI_CDP_URL`) is live-verified. Shared CLI credentials are re-read but NEVER refreshed by this client. Its cswap-slot auth compiles `slot_token` out of this repo's `scripts/account_inject.py`, found
 through the installed or editable `cc_proxy` package, so keep that function's name and its constants.

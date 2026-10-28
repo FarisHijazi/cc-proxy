@@ -12,12 +12,17 @@
   the editable checkout's `scripts/`).
 
 Verified:
-- `uv run --with pytest --with mcp pytest -q tests --ignore tests/account_artifacts_test.py`: 149 passed, 2
-  skipped. `account_artifacts_test.py` needs `claude_artifact_cli`, which is not installed here; it does not touch
-  claude_rc.
-- The fork's 265 tests pass against the installed dependency in this venv, the cswap-slot test included
+- Full Python suite: `uv run --with pytest --with pytest-asyncio --with mcp --with claude-artifact-cli==0.3.0
+  --with fastmcp==4.1.1 pytest -q tests`: 162 passed, 1 skipped. These additional dependencies come from the
+  script headers; pytest-asyncio is needed for the artifacts async test.
+- `cargo test --all --quiet`: 1071 passed, 0 failed (all Rust test targets).
+- The fork's 266 tests pass against the installed dependency in this venv, the cswap-slot test included
   (`account_inject.py` found through the editable cc_proxy).
 - Live, read-only, cookie auth over dev Chrome CDP through the installed `claude-rc`: `whoami` (org present) and
   `list --limit 2`.
 
 Updating: change the fork, push `main`, then bump the sha in `pyproject.toml` and re-run the tests above.
+
+Safe-auth follow-up: the pin now includes automatic local Chrome CDP discovery (no env setup), live cookies
+preferred to stale state jars, and a guard against refreshing shared CLI file / macOS Keychain credentials.
+Client-owned OAuth files still refresh. Live whoami/list passed with the default auth chain.
