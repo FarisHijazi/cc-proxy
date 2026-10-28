@@ -172,8 +172,14 @@ class EnvironmentsMixin:
     def list_environments(self, *, kind: str | Sequence[str] | None = None, page_size: int = 100) -> list[dict]:
         """All environments (every page), each ``{environment_id, name, kind, …}``.
         ``kind`` filters, e.g. ``kind="bridge"`` for Remote Control machines or
-        ``kind=("anthropic_cloud", "byoc")``."""
-        envs = list(self.iter_environments(page_size=page_size))
+        ``kind=("anthropic_cloud", "byoc")``. Under cookie auth this is the web
+        app's private org route: the public one answers 403 "Authentication
+        method not allowed" to a cookie (live, 2026-10-28)."""
+        auth = getattr(self, "_auth", None)
+        if auth is not None and auth.is_cookie:
+            envs = self.list_org_environments()
+        else:
+            envs = list(self.iter_environments(page_size=page_size))
         if kind is None:
             return envs
         return environments_of_kind(envs, *((kind,) if isinstance(kind, str) else kind))

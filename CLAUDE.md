@@ -246,5 +246,5 @@ into HQ). A caller's `--settings` merges under the launcher's. Read
 `python/claude_rc` (vendored claude-rc-api, now 0.4.0 locally; `claude-rc` in the wheel) drives Claude Code on the
 web as the web app does: sessions, environments, scheduled tasks, permission and AskUserQuestion answers, the
 account watch feed, uploads and TTS. All HTTP goes through `RemoteControlClient._send`; tests are MockTransport-only
-(`tests/claude_rc*_test.py`). `scripts/claude-rc-smoke` is the live check, still unrun. Shapes, auth (a setup-token
+(`tests/claude_rc*_test.py`). `scripts/claude-rc-smoke` is unrun, but whoami/list/envs/create/send/stream/watch/archive passed live 2026-10-28 from dev with cookie-only auth (`CLAUDE_AI_CDP_URL=http://127.0.0.1:9222`); under cookies, envs use the private org route (public one 403s a cookie). Shapes, auth (a setup-token
 cannot reach sessions) and the needs-live-check list: `docs/devlog/claude_20261028-claude-code-web-api.md` (plain path).

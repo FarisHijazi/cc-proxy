@@ -307,3 +307,17 @@ Collected from every implementer's report. Each is also flagged "unverified" in 
 
 `client.stream_events`, the 0.3.0 path, still drops `session_update` and `delivery_update` frames.
 `stream_session` is the path that keeps them.
+
+## LIVE CHECK from dev (2026-10-28, cookie only)
+
+Auth was dev Chrome's cookies over CDP (`CLAUDE_AI_CDP_URL=http://127.0.0.1:9222`, account theefaris), with no
+OAuth and no proxy. Dev's home IP passes Cloudflare with plain httpx.
+- Passed: `whoami`, `list`, `envs list`, `create` (haiku, Default env, `cse_…` returned), `send` (reply printed),
+  `watch <cse>` (SSE replays and follows the transcript), `watch` (account feed: added, changed per turn, changed to
+  archived), and `archive`.
+- Fixed:
+  - Under cookie auth, `list_environments` uses the private org route; `GET /v1/environment_providers` answers 403
+    "Authentication method not allowed" to a cookie.
+  - Added the `archive` CLI command.
+  - stdout is now line-buffered, so `watch` piped to a file is live.
+- Endpoint map captured from the page: claude-web-api `docs/research-handoff-2026-10-28.md`.

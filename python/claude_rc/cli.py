@@ -368,6 +368,13 @@ def cmd_create(args) -> int:
     return 0
 
 
+def cmd_archive(args) -> int:
+    with _rc(args) as rc:
+        done = rc.archive_session(args.session_id)
+    print(f"archived {args.session_id}" if done else f"{args.session_id} was already archived")
+    return 0
+
+
 def cmd_unarchive(args) -> int:
     with _rc(args) as rc:
         out = rc.unarchive_session(args.session_id)
@@ -750,6 +757,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--config", action="append", metavar="K=V", help="extra config field (JSON value)")
     pc.add_argument("--defer-events", action="store_true", help="send the first message after create, like the web")
 
+    cmd("archive", cmd_archive, "archive a session", session=True)
     cmd("unarchive", cmd_unarchive, "restore an archived session", json_out=True, session=True)
     cmd("delete", cmd_delete, "delete a session (route unverified)", session=True)
 
@@ -845,6 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    sys.stdout.reconfigure(line_buffering=True)  # live output when piped (watch/stream)
     try:
         return args.func(args)
     except CredentialsError as e:
