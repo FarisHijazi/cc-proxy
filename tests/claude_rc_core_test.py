@@ -411,3 +411,10 @@ def test_explicit_credentials_object_still_works():
     )) as rc:
         rc.mark_read("cse_1", event_id="e1")
     assert seen == ["Bearer obj"]
+
+
+def test_cswap_live_account_is_the_default_login(tmp_path, monkeypatch):
+    _write_creds(tmp_path)
+    monkeypatch.setattr("claude_rc.credentials.cswap_current_slot", lambda: "2")
+    auth = resolve_auth(slot_token=lambda s: (f"live-{s}", 9999999999999))
+    assert (auth.credentials.access_token, auth.origin) == ("live-2", "cswap slot 2")

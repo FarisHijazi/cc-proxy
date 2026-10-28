@@ -343,6 +343,16 @@ def load_slot_token() -> Callable[[str], tuple[str, float]]:
     return namespace["slot_token"]
 
 
+def cswap_current_slot() -> Optional[str]:
+    """cswap's live account (the login Claude Code itself uses — Keychain on
+    macOS), or ``None`` when cswap is not installed or has no account."""
+    try:
+        from claude_swap.switcher import ClaudeAccountSwitcher
+    except ImportError:
+        return None
+    slot = ClaudeAccountSwitcher().current_account_number()
+    return None if slot is None else str(slot)
+
 def cswap_credentials(slot: str, slot_token: Callable[[str], tuple[str, float]] | None = None) -> OAuthCredentials:
     """An access-token-only :class:`OAuthCredentials` for a cswap slot (no
     refresh token: the client re-asks cswap when it expires)."""
@@ -405,7 +415,8 @@ def resolve_auth(
        file, local Chrome, Chrome over CDP); the client moves to claude.ai;
     3. env ``CLAUDE_AI_ACCESS_TOKEN``, then ``CLAUDE_RC_ACCESS_TOKEN``, then the
        CLI's ``CLAUDE_CODE_OAUTH_TOKEN`` (bare tokens: no refresh);
-    4. env ``CLAUDE_RC_CSWAP_SLOT`` (cswap slot, access token only, never written back);
+    4. env ``CLAUDE_RC_CSWAP_SLOT``, else cswap's live account (Claude Code's own login,
+       Keychain on macOS) — access token only, cswap keeps owning the refresh;
     5. ``~/.claude/.credentials.json`` (or ``credentials_path``), refreshed and
        written back when it expires.
 
@@ -427,7 +438,7 @@ def resolve_auth(
         for env in (ENV_CLAUDE_AI_ACCESS_TOKEN, ENV_ACCESS_TOKEN, ENV_CLI_OAUTH_TOKEN):
             if os.environ.get(env):
                 return AuthSource(credentials=OAuthCredentials(access_token=os.environ[env]), origin=f"env:{env}")
-        slot = os.environ.get(ENV_CSWAP_SLOT) or None
+        slot = os.environ.get(ENV_CSWAP_SLOT) or cswap_current_slot()
     if slot is not None:
         def reload_slot(slot: str = str(slot)) -> OAuthCredentials:
             return cswap_credentials(slot, slot_token)
