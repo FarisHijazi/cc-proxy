@@ -12,6 +12,10 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+# claude_rc: read claude.ai cookies from local Chrome / over CDP (claude_rc.webauth).
+web = ["browser-cookie3>=0.19", "websockets>=12"]
+
 [project.scripts]
 cc-proxy = "cc_proxy.cli:main"
 cc-proxy-traffic = "cc_proxy.cli:traffic"

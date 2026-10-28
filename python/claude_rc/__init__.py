@@ -51,6 +51,7 @@ from .events import (
     custom_tool_result,
 )
 from .sse import SSEFrame, parse_sse
+from .webauth import CloudflareChallenge, CookieJar, keepalive, load_jar
 from .webui import serve as serve_webui
 
 __all__ = [
@@ -83,6 +84,10 @@ __all__ = [
     "SSEFrame",
     "parse_sse",
     "serve_webui",
+    "CookieJar",
+    "CloudflareChallenge",
+    "load_jar",
+    "keepalive",
     "CCR_BETA",
     "MANAGED_AGENTS_BETA",
 ]

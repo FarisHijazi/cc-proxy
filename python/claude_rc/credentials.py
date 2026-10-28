@@ -54,7 +54,8 @@ ENV_CLAUDE_AI_ORG_UUID = "CLAUDE_AI_ORG_UUID"
 ENV_ORG_UUID = "CLAUDE_RC_ORG_UUID"
 # The CLI's own env override for a bare access token.
 ENV_CLI_OAUTH_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
-# A claude.ai browser ``sessionKey`` cookie; selects cookie auth on claude.ai.
+# A claude.ai browser ``sessionKey`` cookie; selects cookie auth on claude.ai
+# (the other cookie sources live in claude_rc.webauth).
 ENV_SESSION_KEY = "CLAUDE_AI_SESSION_KEY"
 # A claude-swap (cswap) slot whose stored login to borrow (access token only).
 ENV_CSWAP_SLOT = "CLAUDE_RC_CSWAP_SLOT"
@@ -359,21 +360,31 @@ def cswap_credentials(slot: str, slot_token: Callable[[str], tuple[str, float]] 
 class AuthSource:
     """What a client authenticates with, and how to re-read it.
 
-    Exactly one of ``credentials`` (Bearer OAuth) or ``session_key`` (claude.ai
-    ``sessionKey`` cookie) is set. ``reload`` re-reads the source (credentials
-    file, cswap slot) for a rotated or expired token; ``None`` when there is
-    nothing to re-read (explicit token, env var, cookie). ``origin`` names where
-    it came from, for messages (never the secret itself).
+    Exactly one of ``credentials`` (Bearer OAuth) or ``jar`` (claude.ai cookies,
+    :class:`~claude_rc.webauth.CookieJar`) is set; a bare ``session_key`` is
+    turned into a one-cookie jar. ``reload`` re-reads a bearer source
+    (credentials file, cswap slot) for a rotated or expired token; a jar
+    re-reads itself (:meth:`~claude_rc.webauth.CookieJar.reread`). ``origin``
+    names where it came from, for messages (never the secret itself).
     """
 
     credentials: Optional[OAuthCredentials] = None
-    session_key: Optional[str] = None
+    session_key: Optional[str] = field(default=None, repr=False)
     origin: str = ""
     reload: Optional[Callable[[], OAuthCredentials]] = None
+    jar: Any = None
+
+    def __post_init__(self) -> None:
+        from .webauth import EXPLICIT, CookieJar
+
+        if self.jar is None and self.session_key is not None:
+            self.jar = CookieJar({"sessionKey": self.session_key}, EXPLICIT)
+        if self.jar is not None:
+            self.session_key = self.jar.session_key
 
     @property
     def is_cookie(self) -> bool:
-        return self.session_key is not None
+        return self.jar is not None
 
 
 def resolve_auth(
@@ -388,15 +399,20 @@ def resolve_auth(
     """Pick the client's identity. First match wins:
 
     1. explicit arguments: ``credentials``, ``token``, ``session_key``, ``cswap_slot``;
-    2. env ``CLAUDE_AI_ACCESS_TOKEN``, then ``CLAUDE_RC_ACCESS_TOKEN``, then the
+    2. claude.ai cookies — the primary mode whenever any source yields a
+       ``sessionKey`` (:func:`claude_rc.webauth.load_jar`: env
+       ``CLAUDE_AI_SESSION_KEY`` / ``CLAUDE_AI_COOKIES``, the rotated-jar state
+       file, local Chrome, Chrome over CDP); the client moves to claude.ai;
+    3. env ``CLAUDE_AI_ACCESS_TOKEN``, then ``CLAUDE_RC_ACCESS_TOKEN``, then the
        CLI's ``CLAUDE_CODE_OAUTH_TOKEN`` (bare tokens: no refresh);
-    3. env ``CLAUDE_AI_SESSION_KEY`` (cookie auth; the client moves to claude.ai);
     4. env ``CLAUDE_RC_CSWAP_SLOT`` (cswap slot, access token only, never written back);
     5. ``~/.claude/.credentials.json`` (or ``credentials_path``), refreshed and
        written back when it expires.
 
     ``slot_token`` replaces cc-proxy's slot reader (tests).
     """
+    from .webauth import load_jar
+
     if credentials is not None:
         return AuthSource(credentials=credentials, origin="explicit credentials")
     if token:
@@ -405,11 +421,12 @@ def resolve_auth(
         return AuthSource(session_key=session_key, origin="explicit session key")
     slot = cswap_slot if cswap_slot not in (None, "") else None
     if slot is None:
+        jar = load_jar()
+        if jar is not None:
+            return AuthSource(jar=jar, origin=f"cookies:{jar.origin}")
         for env in (ENV_CLAUDE_AI_ACCESS_TOKEN, ENV_ACCESS_TOKEN, ENV_CLI_OAUTH_TOKEN):
             if os.environ.get(env):
                 return AuthSource(credentials=OAuthCredentials(access_token=os.environ[env]), origin=f"env:{env}")
-        if os.environ.get(ENV_SESSION_KEY):
-            return AuthSource(session_key=os.environ[ENV_SESSION_KEY], origin=f"env:{ENV_SESSION_KEY}")
         slot = os.environ.get(ENV_CSWAP_SLOT) or None
     if slot is not None:
         def reload_slot(slot: str = str(slot)) -> OAuthCredentials:

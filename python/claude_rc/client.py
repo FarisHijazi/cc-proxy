@@ -31,6 +31,8 @@ import httpx
 from ._version import __version__
 from .credentials import (
     CLAUDE_AI_BASE_URL,
+    ENV_CLAUDE_AI_ORG_UUID,
+    ENV_ORG_UUID,
     ENV_TRUSTED_DEVICE_TOKEN,
     OAUTH_BETA,
     AuthSource,
@@ -58,6 +60,7 @@ from .events import (
     user_message,
 )
 from .sse import parse_sse
+from . import webauth
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 # Beta headers. The CLI sends none on /v1/code/*, but the claude.ai web app sends
@@ -133,6 +136,7 @@ def build_headers(
     *,
     token: str | None = None,
     session_key: str | None = None,
+    cookie: str | None = None,
     org_uuid: str | None = None,
     web: bool = True,
     betas: Sequence[str] = (),
@@ -149,14 +153,19 @@ def build_headers(
     web_claude_ai`` (what makes a worker treat a message as a human's, spec
     §8), ``anthropic-client-feature: ccr``. ``web=False`` is the bare OAuth set
     (``/api/oauth/profile``): no platform, feature or CCR beta — only ``betas``.
-    Auth is ``Authorization: Bearer`` or, with ``session_key``, the claude.ai
-    ``sessionKey`` cookie. ``x-organization-uuid`` rides when ``org_uuid`` is
+    Auth is ``Authorization: Bearer`` or claude.ai cookies: ``cookie`` (a full
+    ``Cookie`` header from :class:`~claude_rc.webauth.CookieJar`) or a bare
+    ``session_key``; cookie auth sends no ``Authorization`` and a browser
+    ``User-Agent``. ``x-organization-uuid`` rides when ``org_uuid`` is
     given. ``json_body=False`` leaves ``Content-Type`` to httpx (multipart).
     ``extra`` is applied last and wins.
     """
     h: dict[str, str] = {"anthropic-version": ANTHROPIC_VERSION, "User-Agent": USER_AGENT}
-    if session_key is not None:
-        h["Cookie"] = f"sessionKey={session_key}"
+    if cookie is None and session_key is not None:
+        cookie = f"sessionKey={session_key}"
+    if cookie is not None:
+        h["Cookie"] = cookie
+        h["User-Agent"] = webauth.user_agent()
     elif token is not None:
         h["Authorization"] = f"Bearer {token}"
     if json_body:
@@ -291,11 +300,14 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         """Credentials come from :func:`~claude_rc.credentials.resolve_auth`
         (``credentials`` / ``token`` / ``session_key`` / ``cswap_slot``, then the
         environment, then ``~/.claude/.credentials.json``), or ``auth`` as
-        resolved. ``base_url`` defaults to ``https://api.anthropic.com``, or
-        ``https://claude.ai`` under cookie auth. ``transport`` replaces httpx's
-        network transport (``httpx.MockTransport`` in tests). The org UUID is
-        ``org_uuid``, else env / ``~/.claude.json``, else looked up from
-        ``/api/oauth/profile`` on first use (:attr:`org_uuid`)."""
+        resolved. Cookie auth (:mod:`claude_rc.webauth`) is the default whenever
+        a cookie source yields a ``sessionKey``. ``base_url`` defaults to
+        ``https://api.anthropic.com``, or ``https://claude.ai`` under cookie
+        auth. ``transport`` replaces httpx's network transport
+        (``httpx.MockTransport`` in tests). The org UUID is ``org_uuid``, else
+        env, else the ``lastActiveOrg`` cookie (cookie auth) or
+        ``~/.claude.json`` (bearer), else looked up on first use
+        (:attr:`org_uuid`)."""
         self._auth = auth or resolve_auth(
             token,
             credentials=credentials,
@@ -307,7 +319,16 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         default_base = CLAUDE_AI_BASE_URL if self._auth.is_cookie else DEFAULT_BASE_URL
         self.base_url = (base_url or default_base).rstrip("/")
         self._creds_path = credentials_path
-        self._org_uuid = org_uuid or load_org_uuid(config_path)
+        if self._auth.is_cookie:
+            # ~/.claude.json names the CLI login's org, not the browser's.
+            self._org_uuid = (
+                org_uuid
+                or os.environ.get(ENV_CLAUDE_AI_ORG_UUID)
+                or os.environ.get(ENV_ORG_UUID)
+                or self._auth.jar.org_uuid
+            )
+        else:
+            self._org_uuid = org_uuid or load_org_uuid(config_path)
         self._org_looked_up = bool(self._org_uuid)
         self._auto_refresh = auto_refresh
         self._persist_refresh = persist_refresh
@@ -329,6 +350,16 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         self._refresher.close()
 
     # -- auth --------------------------------------------------------------
+    @property
+    def cookie_jar(self) -> Optional["webauth.CookieJar"]:
+        """The live claude.ai cookie jar under cookie auth, else ``None``."""
+        return self._auth.jar
+
+    def cookie_header(self) -> Optional[str]:
+        """The current ``Cookie`` header (rotated values included), for other
+        transports such as the TTS websocket; ``None`` under bearer auth."""
+        return self._auth.jar.header() if self._auth.jar is not None else None
+
     def _reload_credentials(self) -> bool:
         """Re-read the credential source; ``True`` if it held different tokens.
 
@@ -434,7 +465,7 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         )
         return build_headers(
             token=None if self._auth.is_cookie else self._token(),
-            session_key=self._auth.session_key,
+            cookie=self.cookie_header(),
             org_uuid=self.org_uuid if org else None,
             web=web,
             betas=betas,
@@ -485,7 +516,11 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         overrides. Bodies: ``json``, or ``content`` / ``data`` / ``files``
         (multipart — pass bytes, not file objects, so a retry can resend).
 
-        A 401 triggers one credential renewal and resend. A 429 is retried for
+        A 401 triggers one credential renewal and resend. Under cookie auth
+        every claude.ai ``Set-Cookie`` is merged into the jar, a 401/403
+        re-reads the cookie source once and resends if it changed, and a
+        Cloudflare challenge raises
+        :class:`~claude_rc.webauth.CloudflareChallenge`. A 429 is retried for
         any method; network errors and 5xx only when ``retry`` (default: GET /
         HEAD / OPTIONS). Any status outside ``accept`` raises :class:`APIError`.
         With ``stream=True`` the body is left unread: iterate it, then close the
@@ -519,8 +554,16 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
                 time.sleep(_retry_delay(attempt))
                 continue
             status = resp.status_code
+            jar = self._auth.jar
+            if jar is not None:
+                jar.merge(resp)
+                if status in (401, 403) and webauth.is_cloudflare_challenge(resp):
+                    resp.close()
+                    raise webauth.challenge_error(resp)
             again = None
             if status == 401 and not renewed and self._renew_after_401():
+                renewed, again = True, 0.0
+            elif status in (401, 403) and jar is not None and not renewed and jar.reread():
                 renewed, again = True, 0.0
             elif status == 429 and attempt < _MAX_RETRIES:
                 attempt += 1
