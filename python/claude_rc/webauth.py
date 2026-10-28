@@ -70,6 +70,7 @@ BROWSER_USER_AGENT = (
 
 ENV_SESSION_KEY = "CLAUDE_AI_SESSION_KEY"
 ENV_COOKIES = "CLAUDE_AI_COOKIES"
+ENV_COOKIE_ALIAS = "CLAUDE_AI_COOKIE"  # singular spelling, accepted too
 ENV_AUTO_REFRESH = "CLAUDE_AI_AUTO_REFRESH"
 ENV_CHROME_ACCOUNT = "CLAUDE_AI_CHROME_ACCOUNT"
 ENV_CHROME_PROFILE = "CLAUDE_AI_CHROME_PROFILE"
@@ -229,7 +230,7 @@ class CookieJar:
 
 # --- sources -------------------------------------------------------------------
 def from_env() -> Optional[CookieJar]:
-    cookies = parse_cookie_header(os.environ.get(ENV_COOKIES, ""))
+    cookies = parse_cookie_header(os.environ.get(ENV_COOKIES) or os.environ.get(ENV_COOKIE_ALIAS, ""))
     if os.environ.get(ENV_SESSION_KEY):
         cookies[SESSION_COOKIE] = os.environ[ENV_SESSION_KEY].strip()
     if not cookies.get(SESSION_COOKIE):

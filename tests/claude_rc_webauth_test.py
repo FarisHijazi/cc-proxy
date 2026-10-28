@@ -14,7 +14,7 @@ from claude_rc.client import RemoteControlClient
 from claude_rc.credentials import CredentialsError, resolve_auth
 
 ENV = (
-    "CLAUDE_AI_SESSION_KEY", "CLAUDE_AI_COOKIES", "CLAUDE_AI_AUTO_REFRESH",
+    "CLAUDE_AI_SESSION_KEY", "CLAUDE_AI_COOKIES", "CLAUDE_AI_COOKIE", "CLAUDE_AI_AUTO_REFRESH",
     "CLAUDE_AI_CHROME_ACCOUNT", "CLAUDE_AI_CHROME_PROFILE", "CLAUDE_AI_CHROME_DIR",
     "CLAUDE_AI_CDP_URL", "CLAUDE_AI_USER_AGENT", "CLAUDE_AI_ACCESS_TOKEN",
     "CLAUDE_RC_ACCESS_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_RC_CSWAP_SLOT",
@@ -298,3 +298,9 @@ def test_cli_auth_prints_names_not_values(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "SECRET" not in out
     assert "lastActiveOrg, sessionKey" in out and "org-1" in out and "owns refresh : True" in out
+
+
+def test_singular_cookie_env_alias(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AI_COOKIE", "sessionKey=sk-alias; lastActiveOrg=org-9")
+    jar = webauth.from_env()
+    assert (jar.session_key, jar.org_uuid) == ("sk-alias", "org-9")
