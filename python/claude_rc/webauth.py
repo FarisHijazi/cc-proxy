@@ -170,9 +170,15 @@ class CookieJar:
         if not is_claude_domain(resp.request.url.host if resp.request else ""):
             return False
         changed = False
+        pair = {SESSION_COOKIE, SESSION_COOKIE_V3}
         with self._lock:
-            for line in resp.headers.get_list("set-cookie"):
+            lines = resp.headers.get_list("set-cookie")
+            for line in lines:
                 changed |= self._apply(line)
+            # A rotation that names only one of the pair must not leave the other stale.
+            touched = pair & {line.split("=", 1)[0].strip() for line in lines}
+            if len(touched) == 1 and (value := self.cookies.get(touched.pop())):
+                self.cookies.update(dict.fromkeys(pair, value))
             if changed and self.owns_refresh():
                 self._save()
         return changed

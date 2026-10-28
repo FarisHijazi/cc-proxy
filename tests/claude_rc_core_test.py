@@ -353,7 +353,7 @@ def test_cookie_mode_moves_to_claude_ai(monkeypatch):
             rc.archive_session("cse_1")
     first = seen[0]
     assert str(first.url) == "https://claude.ai/v1/code/sessions/cse_1"
-    assert first.headers["cookie"] == "sessionKey=sk-cookie"
+    assert first.headers["cookie"] == "sessionKey=sk-cookie; sessionKeyV3=sk-cookie"
     assert "authorization" not in first.headers
     assert first.headers["anthropic-client-platform"] == "web_claude_ai"
     assert len(seen) == 2  # the 401 was not retried: a cookie cannot be refreshed

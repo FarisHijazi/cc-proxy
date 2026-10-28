@@ -180,11 +180,11 @@ def test_set_cookie_rotation_persisted_when_we_own_refresh(monkeypatch):
     monkeypatch.setenv("CLAUDE_AI_COOKIES", "cf_clearance=cf")
     with _client(_rotating, org_uuid="o") as rc:
         rc.get_session("cse_1")
-        assert rc.cookie_jar.cookies == {"sessionKey": "sk-new", "__cf_bm": "bm"}
+        assert rc.cookie_jar.cookies == {"sessionKey": "sk-new", "sessionKeyV3": "sk-new", "__cf_bm": "bm"}
     path = webauth.state_path()
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     saved = json.loads(path.read_text())
-    assert saved["cookies"] == {"sessionKey": "sk-new", "__cf_bm": "bm"}
+    assert saved["cookies"] == {"sessionKey": "sk-new", "sessionKeyV3": "sk-new", "__cf_bm": "bm"}
     assert saved["seed"] == webauth._seed("sk-old")
     # A restart with the same (now stale) env key resumes the rotated jar.
     assert webauth.load_jar().session_key == "sk-new"
