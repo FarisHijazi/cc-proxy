@@ -19,6 +19,8 @@ Two wire formats share these endpoints:
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -369,3 +371,195 @@ def custom_tool_result(custom_tool_use_id: str, text: str, is_error: bool = Fals
         "content": [{"type": "text", "text": text}],
         "is_error": is_error,
     }
+
+
+# --- Interaction additions (sessions.md §5, §7) -----------------------------
+class StreamFrame:
+    """``event:`` names on ``/v1/code/sessions/{id}/events/stream`` (sessions.md §7)."""
+
+    CLIENT_EVENT = "client_event"            # a persisted envelope; id: = sequence_num
+    EPHEMERAL_EVENT = "ephemeral_event"      # {event_type, payload, source, timestamp}, no id
+    CATCH_UP_TRUNCATED = "catch_up_truncated"  # history gap: page /events to fill it
+    SESSION_UPDATE = "session_update"        # {connection_status, …}
+    SECURITY_UPDATE = "security_update"      # {security_tier}
+    DELIVERY_UPDATE = "delivery_update"      # {event_id, status, timestamp}
+
+
+# Stream frames that carry no envelope: surfaced as an Event whose payload
+# ``type`` is the frame name (see stream_meta_event).
+STREAM_META_FRAMES = frozenset({
+    StreamFrame.CATCH_UP_TRUNCATED,
+    StreamFrame.SESSION_UPDATE,
+    StreamFrame.SECURITY_UPDATE,
+    StreamFrame.DELIVERY_UPDATE,
+})
+
+# Every control_request subtype a WORKER sends that waits on a controller's
+# control_response (sessions.md §5.5). A superset of BLOCKING_CONTROL_SUBTYPES.
+WORKER_PROMPT_SUBTYPES = frozenset({"can_use_tool", "request_user_dialog", "elicitation", "hook_callback"})
+
+
+def stream_meta_event(name: str, data: Any) -> Event:
+    """Wrap an envelope-less stream frame (``session_update``, ``security_update``,
+    ``delivery_update``, ``catch_up_truncated``) as an :class:`Event` whose
+    payload is ``{"type": <frame name>, **data}``; ``raw`` keeps
+    ``{"event", "data"}``. No sequence number."""
+    body = data if isinstance(data, dict) else {}
+    return Event(payload={**body, "type": name}, raw={"event": name, "data": data})
+
+
+def image_block(data: bytes | str, media_type: str) -> dict:
+    """A Messages API base64 ``image`` content block (``data`` as bytes or as an
+    already base64-encoded string)."""
+    encoded = base64.b64encode(data).decode() if isinstance(data, (bytes, bytearray)) else data
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
+
+
+def cli_web_user_message(
+    content: str | list,
+    *,
+    session_id: str | None = None,
+    message_uuid: str | None = None,
+    priority: str | None = None,
+    requeue_if_interrupted_within_ms: int | None = None,
+    file_attachments: list[dict] | None = None,
+    **extra: Any,
+) -> dict:
+    """A user message as claude.ai/code sends it (HAR 2026-10-28): ``content``
+    stays a plain string when it is one, and the event carries ``session_id``.
+
+    ``priority`` is ``now`` | ``next`` | ``later`` (``later`` = the composer's
+    "queue for later"); ``requeue_if_interrupted_within_ms`` is an int ≤ 10000;
+    ``file_attachments`` are ``{file_uuid, file_name, is_image?, sha256?,
+    file_size?}`` refs from ``/api/oauth/file_upload``. ``extra`` adds other
+    schema fields verbatim (``shouldQuery``, ``client_composed`` …, sessions.md
+    §5.2). Server-stamped fields (``client_platform`` …) are never sent.
+    """
+    if priority is not None and priority not in ("now", "next", "later"):
+        raise ValueError(f"priority must be now|next|later, not {priority!r}")
+    if requeue_if_interrupted_within_ms is not None and not 0 <= requeue_if_interrupted_within_ms <= 10000:
+        raise ValueError("requeue_if_interrupted_within_ms must be within 0..10000")
+    msg: dict[str, Any] = {
+        "type": "user",
+        "parent_tool_use_id": None,
+        "message": {"role": "user", "content": content},
+    }
+    if message_uuid:
+        msg["uuid"] = message_uuid
+    if session_id:
+        msg["session_id"] = session_id
+    if priority is not None:
+        msg["priority"] = priority
+    if requeue_if_interrupted_within_ms is not None:
+        msg["requeue_if_interrupted_within_ms"] = requeue_if_interrupted_within_ms
+    if file_attachments:
+        msg["file_attachments"] = [dict(a) for a in file_attachments]
+    msg.update(extra)
+    return msg
+
+
+def cli_permission_decision(
+    request_id: str,
+    *,
+    allow: bool,
+    updated_input: dict | None = None,
+    updated_permissions: list[dict] | None = None,
+    message: str | None = None,
+    interrupt: bool | None = None,
+    tool_use_id: str | None = None,
+    tool_name: str | None = None,
+    classification: str | None = None,
+) -> dict:
+    """Answer a ``can_use_tool`` prompt with the full ``PermissionResult``
+    (sessions.md §5.2, schema ``CA``):
+
+    * allow: ``{behavior:"allow", updatedInput?, updatedPermissions?, toolUseID?,
+      decisionClassification?}`` plus ``tool_name`` (the CLI's ``O4t`` adds it).
+      ``updatedPermissions`` is how "Always allow" persists a rule — pass the
+      request's ``permission_suggestions``.
+    * deny: ``{behavior:"deny", message, interrupt?, toolUseID?, decisionClassification?}``.
+
+    ``classification`` is ``user_temporary`` (allow once) | ``user_permanent``
+    (always allow) | ``user_reject`` (deny).
+    """
+    if allow:
+        decision: dict[str, Any] = {"behavior": "allow"}
+        if updated_input is not None:
+            decision["updatedInput"] = updated_input
+        if updated_permissions:
+            decision["updatedPermissions"] = list(updated_permissions)
+        if tool_name:
+            decision["tool_name"] = tool_name
+    else:
+        decision = {"behavior": "deny", "message": message or "Denied by controller"}
+        if interrupt is not None:
+            decision["interrupt"] = interrupt
+    if tool_use_id:
+        decision["toolUseID"] = tool_use_id
+    if classification:
+        decision["decisionClassification"] = classification
+    return cli_control_response(request_id, decision)
+
+
+def join_answer_labels(labels: list[str]) -> str:
+    """The string a worker stores for a multi-select answer: labels joined with
+    ``", "``, a label holding ``", "`` or ``"`` JSON-quoted (the worker's own
+    ``$0t``, ``all/a_0257144446.js``). Workers accept a list and join it
+    themselves; this is for callers that want the stored form."""
+    return ", ".join(json.dumps(x) if (", " in x or '"' in x) else x for x in labels)
+
+
+def cli_question_answer(
+    request_id: str,
+    tool_input: dict,
+    answers: dict[str, str | list[str]],
+    *,
+    annotations: dict[str, dict] | None = None,
+    tool_use_id: str | None = None,
+) -> dict:
+    """Answer an ``AskUserQuestion`` ``can_use_tool`` prompt: an allow whose
+    ``updatedInput`` is the original input plus ``answers`` (question text ->
+    label / free text; a list of labels for a ``multiSelect`` question, at most
+    ``len(options) + 1`` entries — the +1 is "Other") and optional
+    ``annotations`` (question text -> ``{notes?, preview?, unanswered?}``,
+    ``unanswered`` ∈ ``skipped`` | ``replied_in_chat`` | ``dismissed``).
+
+    Encoding checked against the worker's admission of a controller's answer
+    (``all/a_0257144446.js``): it refuses an input that already had
+    ``answers``/``annotations``, a list for a single-select question, and keys
+    that are not one of the questions' text.
+    """
+    updated = {**tool_input, "answers": dict(answers)}
+    if annotations:
+        updated["annotations"] = dict(annotations)
+    return cli_permission_decision(
+        request_id, allow=True, updated_input=updated, tool_use_id=tool_use_id, tool_name="AskUserQuestion"
+    )
+
+
+def cli_user_dialog_response(request_id: str, *, completed: bool, result: Any = None) -> dict:
+    """Answer a ``request_user_dialog`` with ``{behavior: completed | cancelled,
+    result?}`` — the key the 2.1.312 schema (``rkn``) names; the older
+    :func:`cli_dialog_response` sends ``status`` instead. ``result`` is opaque,
+    per ``dialog_kind``."""
+    inner: dict[str, Any] = {"behavior": "completed" if completed else "cancelled"}
+    if completed and result is not None:
+        inner["result"] = result
+    return cli_control_response(request_id, inner)
+
+
+def cli_elicitation_response(request_id: str, action: str, content: dict | None = None) -> dict:
+    """Answer an MCP ``elicitation`` with ``{action: accept | decline | cancel,
+    content?}`` (schema ``c7o``); ``content`` holds the form values for an accept."""
+    if action not in ("accept", "decline", "cancel"):
+        raise ValueError(f"action must be accept|decline|cancel, not {action!r}")
+    inner: dict[str, Any] = {"action": action}
+    if content is not None:
+        inner["content"] = content
+    return cli_control_response(request_id, inner)
+
+
+def cli_hook_callback_response(request_id: str, output: dict) -> dict:
+    """Answer a ``hook_callback`` with the hook's JSON output (``{continue?,
+    decision?, reason?, hookSpecificOutput?, …}``), relayed as the response."""
+    return cli_control_response(request_id, dict(output))

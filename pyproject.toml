@@ -10,6 +10,7 @@ dependencies = [
     "mitmproxy>=12.2,<13",
     "claude-swap @ git+https://github.com/FarisHijazi/claude-swap",
     "httpx>=0.27",
+    "websockets>=13",
 ]
 
 [project.scripts]

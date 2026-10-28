@@ -46,6 +46,7 @@ from .files import FilesMixin
 from .interaction import InteractionMixin
 from .lifecycle import LifecycleMixin
 from .triggers import TriggersMixin
+from .tts import TTSMixin
 from .events import (
     RC,
     Event,
@@ -257,7 +258,9 @@ class ControlTimeout(TimeoutError):
 # ---------------------------------------------------------------------------
 # OAuth (Remote Control) client
 # ---------------------------------------------------------------------------
-class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, InteractionMixin, FilesMixin):
+class RemoteControlClient(
+    LifecycleMixin, EnvironmentsMixin, TriggersMixin, InteractionMixin, FilesMixin, TTSMixin
+):
     """Controller-side client for Remote Control sessions (``/v1/code/sessions``).
 
     This plays the same role as the browser at claude.ai/code: it does not run

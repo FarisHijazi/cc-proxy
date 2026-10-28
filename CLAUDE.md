@@ -242,3 +242,9 @@ launcher refuses it without `--via`, and `account_inject` never puts a token on 
 `x-hq-mirror: 1`; the route addon strips it and lets the request reach Anthropic (else it loops
 into HQ). A caller's `--settings` merges under the launcher's. Read
 `docs/devlog/claude_20261023-rc-owner-private-mirror.md` on demand (plain path).
+
+`python/claude_rc` (vendored claude-rc-api, now 0.4.0 locally; `claude-rc` in the wheel) drives Claude Code on the
+web as the web app does: sessions, environments, scheduled tasks, permission and AskUserQuestion answers, the
+account watch feed, uploads and TTS. All HTTP goes through `RemoteControlClient._send`; tests are MockTransport-only
+(`tests/claude_rc*_test.py`). `scripts/claude-rc-smoke` is the live check, still unrun. Shapes, auth (a setup-token
+cannot reach sessions) and the needs-live-check list: `docs/devlog/claude_20261028-claude-code-web-api.md` (plain path).

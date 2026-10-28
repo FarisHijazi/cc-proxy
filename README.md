@@ -858,6 +858,26 @@ token in it would break the Claude passthrough. `/healthz` stays open.
 
 [gemini-web-api]: https://github.com/FarisHijazi/gemini-web-api
 
+## Driving Claude Code on the web (`claude-rc`)
+
+The wheel also installs `claude-rc`, a client for claude.ai/code cloud sessions
+(`python/claude_rc`). It uses your Claude Code login: `CLAUDE_AI_ACCESS_TOKEN`,
+`--cswap-slot N`, a claude.ai `--session-key`, or `~/.claude/.credentials.json`.
+A `claude setup-token` cannot reach sessions.
+
+```sh
+claude-rc envs list
+claude-rc create --model claude-haiku-5-5 --repo owner/name "fix the failing test"
+claude-rc pending <session_id>
+claude-rc answer <session_id> question --select "Blue"   # or allow | always | deny
+claude-rc watch                                          # account-wide feed
+claude-rc speak "hello" -o hello.ogg                     # claude.ai text to speech
+```
+
+The endpoints are private and were read from the CLI and a browser capture;
+several are still unverified live. See
+`docs/devlog/claude_20261028-claude-code-web-api.md`.
+
 ## Limitations
 
 - Switching plans in the middle of an active tool call (for example pressing Esc

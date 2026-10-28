@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""LIVE end-to-end check of python/claude_rc against Claude Code on the web.
+
+Run by a human, once a credential exists. It spends a little model usage and
+creates (then archives and deletes) one real cloud session:
+
+  CLAUDE_AI_ACCESS_TOKEN=... scripts/claude-rc-smoke [--env env_…] [--model claude-haiku-5-5] [--keep]
+  scripts/claude-rc-smoke --cswap-slot 2
+
+Steps: list environments -> create a session -> "reply with exactly PONG" ->
+stream until the turn ends -> check PONG -> an AskUserQuestion turn answered
+with "Blue" -> rename -> set model -> archive -> delete (skipped with --keep).
+Each step prints PASS/FAIL with the HTTP status of its last request. Tokens are
+never printed: only where the credential came from.
+
+Needs httpx and websockets (`uv run --no-project --with httpx --with websockets
+scripts/claude-rc-smoke`). Exit status is the number of failed steps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+
+from claude_rc import APIError, RemoteControlClient, default_environment  # noqa: E402
+from claude_rc.interaction import PendingRequest  # noqa: E402
+
+PONG_PROMPT = "Reply with exactly PONG and nothing else."
+QUESTION_PROMPT = (
+    "Use the AskUserQuestion tool to ask me one single-select question, "
+    "'Which colour?', with exactly two options: 'Red' and 'Blue'. "
+    "After I answer, reply with exactly the colour I chose and nothing else."
+)
+
+
+class Steps:
+    """PASS/FAIL bookkeeping; remembers the last HTTP status the client saw."""
+
+    def __init__(self) -> None:
+        self.failed = 0
+        self.last = "-"
+
+    def hook(self, response) -> None:
+        self.last = f"{response.request.method} {response.url.path} -> {response.status_code}"
+
+    def run(self, name: str, fn):
+        self.last = "-"
+        try:
+            out = fn()
+        except APIError as e:
+            self.failed += 1
+            kind = f" {e.error_type}" if e.error_type else ""
+            print(f"FAIL  {name}: HTTP {e.status}{kind} [{self.last}] {e.body[:200]}", flush=True)
+            return None
+        except Exception as e:  # noqa: BLE001 - report and carry on to cleanup
+            self.failed += 1
+            print(f"FAIL  {name}: {type(e).__name__}: {e} [{self.last}]", flush=True)
+            return None
+        print(f"PASS  {name} [{self.last}]", flush=True)
+        return out
+
+
+def turn(rc: RemoteControlClient, sid: str, start_seq: int, *, answer: str | None = None, deadline: float) -> str:
+    """Stream from ``start_seq`` until the turn ends; return the assistant text.
+    An AskUserQuestion prompt is answered with ``answer``; any other permission
+    prompt is allowed once. Raises on a terminal session or the deadline."""
+    text: list[str] = []
+    for ev in rc.stream_session(sid, from_sequence_num=start_seq):
+        if time.monotonic() > deadline:
+            raise TimeoutError("turn did not finish in time")
+        if ev.role == "assistant":
+            text.append(ev.text())
+        if ev.is_blocking_control:
+            req = PendingRequest.from_payload(ev.payload, ev)
+            if req and req.kind == "question" and answer:
+                rc.select_option(sid, req, answer)
+                print(f"      answered AskUserQuestion with {answer!r}", flush=True)
+            elif req and req.kind == "permission":
+                rc.allow_once(sid, req)
+                print(f"      allowed {req.tool_name}", flush=True)
+        if ev.is_terminal:
+            raise RuntimeError(f"session ended: {ev.type}/{ev.subtype}")
+        if ev.is_turn_end:
+            return "".join(text)
+    raise RuntimeError("stream closed before the turn ended")
+
+
+def _hard_timeout(signum, frame) -> None:
+    """A stream that never yields again (no frames, no reconnect) ends here."""
+    raise TimeoutError("hard timeout")
+
+
+def newest_seq(rc: RemoteControlClient, sid: str) -> int:
+    page = rc.list_events(sid, limit=1, sort_order="desc")
+    return max((e.sequence_num or 0) for e in page) if page else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--env", help="environment id (default: the CLI's pick, a cloud env first)")
+    ap.add_argument("--model", default="claude-haiku-5-5", help="cheap model for the session")
+    ap.add_argument("--switch-model", default="claude-sonnet-5-5", help="model for the set-model step")
+    ap.add_argument("--keep", action="store_true", help="skip the delete step")
+    ap.add_argument("--timeout", type=float, default=300.0, help="seconds per turn")
+    ap.add_argument("--token")
+    ap.add_argument("--cswap-slot", dest="cswap_slot")
+    ap.add_argument("--session-key", dest="session_key")
+    ap.add_argument("--org")
+    args = ap.parse_args(argv)
+
+    steps = Steps()
+    rc = RemoteControlClient(
+        token=args.token, cswap_slot=args.cswap_slot, session_key=args.session_key, org_uuid=args.org
+    )
+    rc._http.event_hooks["response"].append(steps.hook)
+    print(f"auth: {rc._auth.origin}; base {rc.base_url}", flush=True)
+    signal.signal(signal.SIGALRM, _hard_timeout)
+    signal.alarm(int(args.timeout * 3 + 120))
+
+    envs = steps.run("list environments", rc.list_environments)
+    if envs is not None:
+        print(f"      {len(envs)} environments", flush=True)
+    env_id = args.env
+    if not env_id and envs:
+        env = default_environment(envs) or {}
+        env_id = env.get("environment_id") or env.get("id")
+    if not env_id:
+        print("FAIL  no environment to create a session in (pass --env)")
+        return steps.failed + 1
+
+    session = steps.run(
+        f"create session ({env_id}, {args.model})",
+        lambda: rc.create_session(env_id, PONG_PROMPT, model=args.model, title="claude-rc smoke"),
+    )
+    if not session or not session.get("id"):
+        return steps.failed + 1
+    sid = session["id"]
+    print(f"      session {sid}", flush=True)
+
+    try:
+        reply = steps.run(
+            "PONG turn", lambda: turn(rc, sid, 0, deadline=time.monotonic() + args.timeout)
+        )
+        if reply is not None:
+            ok = "PONG" in reply
+            steps.failed += 0 if ok else 1
+            print(f"{'PASS' if ok else 'FAIL'}  reply contains PONG: {reply.strip()[:80]!r}", flush=True)
+
+        def question_turn() -> str:
+            start = newest_seq(rc, sid)
+            rc.send_prompt(sid, QUESTION_PROMPT)
+            return turn(rc, sid, start, answer="Blue", deadline=time.monotonic() + args.timeout)
+
+        reply = steps.run("AskUserQuestion turn", question_turn)
+        if reply is not None:
+            ok = "Blue" in reply
+            steps.failed += 0 if ok else 1
+            print(f"{'PASS' if ok else 'FAIL'}  reply names the chosen option: {reply.strip()[:80]!r}", flush=True)
+
+        renamed = steps.run("rename", lambda: rc.rename_session(sid, "claude-rc smoke (renamed)"))
+        if renamed is not None and renamed.get("title") != "claude-rc smoke (renamed)":
+            steps.failed += 1
+            print(f"FAIL  rename did not stick: {renamed.get('title')!r}")
+        steps.run(f"set model {args.switch_model}", lambda: rc.set_model(sid, args.switch_model))
+    finally:
+        steps.run("archive", lambda: rc.archive_session(sid))
+        if args.keep:
+            print(f"SKIP  delete (--keep): {sid}")
+        else:
+            steps.run("delete", lambda: rc.delete_session(sid))
+        rc.close()
+
+    print(f"\n{steps.failed} failed", flush=True)
+    return steps.failed
+
+
+if __name__ == "__main__":
+    sys.exit(main())

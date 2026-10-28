@@ -37,6 +37,12 @@ HTTP surface (all JSON unless noted):
     POST /api/sessions/{id}/effort            {"effort": "low".."max" | null}
     POST /api/sessions/{id}/mark_read         {"sequence_num": ...?}
     POST /api/sessions/{id}/archive
+    GET  /api/environments                    {"environments": [...]} (variables redacted)
+    POST /api/sessions                        {"prompt", "env"?, "model"?, "effort"?, "repo"?,
+                                               "branch"?, "title"?, "permission_mode"?} → session
+    POST /api/sessions/{id}/answer            AskUserQuestion: {"request_id", "selections"?:
+                                               {index: label | [labels]}, "other"?: {index: text},
+                                               "skip"?: bool}
 """
 
 from __future__ import annotations
@@ -70,6 +76,14 @@ _R_PERM = re.compile(rf"^/api/sessions/{_SID}/permission_mode$")
 _R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_MARK = re.compile(rf"^/api/sessions/{_SID}/mark_read$")
 _R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
+_R_ANSWER = re.compile(rf"^/api/sessions/{_SID}/answer$")
+
+
+def _indexed(mapping: Any) -> dict:
+    """JSON object keys are strings; a numeric one names a question by index."""
+    if not isinstance(mapping, dict):
+        return {}
+    return {int(k) if str(k).isdigit() else k: v for k, v in mapping.items()}
 
 
 def event_to_dict(ev: Event) -> dict:
@@ -175,6 +189,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(self._whoami())
             if path == "/api/sessions":
                 return self._json({"sessions": self.rc.sessions()})
+            if path == "/api/environments":
+                from .environments import redact_environment
+
+                return self._json({"environments": [redact_environment(e) for e in self.rc.list_environments()]})
             m = _R_STREAM.match(path)
             if m:
                 return self._stream(m["sid"])
@@ -201,6 +219,11 @@ class _Handler(BaseHTTPRequestHandler):
         # desync the next request on this keep-alive connection.
         body = self._body()
         try:
+            if path == "/api/sessions":
+                return self._json(self._create(body))
+            m = _R_ANSWER.match(path)
+            if m:
+                return self._answer(m["sid"], body)
             m = _R_SEND.match(path)
             if m:
                 text = (body.get("text") or "").strip()
@@ -265,6 +288,42 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(exc)
 
     # -- handlers ----------------------------------------------------------
+    def _create(self, body: dict) -> dict:
+        from .environments import default_environment
+
+        env_id = body.get("env")
+        if not env_id:
+            env = default_environment(self.rc.list_environments())
+            if not env:
+                raise ValueError("no environment available")
+            env_id = env.get("environment_id") or env.get("id")
+        return self.rc.create_session(
+            env_id,
+            (body.get("prompt") or "").strip() or None,
+            title=body.get("title") or None,
+            repo=body.get("repo") or None,
+            branch=body.get("branch") or None,
+            model=body.get("model") or None,
+            effort_level=body.get("effort") or None,
+            permission_mode=body.get("permission_mode") or None,
+        )
+
+    def _answer(self, sid: str, body: dict) -> None:
+        rid = body.get("request_id")
+        req = next((p for p in self.rc.pending_requests(sid) if p.request_id == rid), None)
+        if req is None or req.kind != "question":
+            return self._json({"error": "no pending question with that request_id"}, status=404)
+        if body.get("skip"):
+            self.rc.skip_questions(sid, req)
+        else:
+            try:
+                self.rc.answer_questions(
+                    sid, req, _indexed(body.get("selections")), other=_indexed(body.get("other")) or None
+                )
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=400)
+        return self._json({"ok": True})
+
     def _serve_page(self) -> None:
         try:
             html = _PAGE.read_bytes()

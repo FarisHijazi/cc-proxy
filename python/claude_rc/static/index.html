@@ -150,6 +150,10 @@
     padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0;
     transition: opacity .2s; pointer-events: none; max-width: 70%; z-index: 20; }
   #toast.show { opacity: 1; }
+  .questions { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  .question { display: flex; flex-direction: column; gap: 3px; }
+  .q-text { font-weight: 600; }
+  .q-opt { font-weight: normal; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -165,6 +169,7 @@
       <div class="aside-head">
         <h2>Sessions</h2>
         <span class="spacer"></span>
+        <button class="icon-btn" id="new-session" title="New cloud session">＋</button>
         <button class="icon-btn" id="refresh-sessions" title="Refresh">⟳</button>
       </div>
       <div id="session-list"></div>
@@ -483,9 +488,11 @@ function eventNode(ev) {
 }
 function promptNode(ev) {
   const row = el("div", "attention", "⚠ needs you: " + (ev.tool_name || ev.blocking_subtype || "input"));
-  // Tool permissions are answerable here; questions (AskUserQuestion, dialogs)
-  // still need claude.ai or the terminal.
-  if (ev.blocking_subtype === "can_use_tool" && ev.tool_name !== "AskUserQuestion") {
+  // Tool permissions and AskUserQuestion cards are answerable here; other
+  // dialogs still need claude.ai or the terminal.
+  if (ev.blocking_subtype === "can_use_tool" && ev.tool_name === "AskUserQuestion") {
+    row.appendChild(questionForm(ev));
+  } else if (ev.blocking_subtype === "can_use_tool") {
     for (const [label, allow] of [["Allow", true], ["Deny", false]]) {
       const b = el("button", allow ? "primary" : "danger", label);
       b.onclick = () => steer(label, "permission", {
@@ -495,6 +502,62 @@ function promptNode(ev) {
     }
   }
   return row;
+}
+function questionForm(ev) {
+  // One block per question: radio (single) or checkbox (multi) options plus an
+  // "Other" free-text box; Submit sends selections/other by index, Skip skips.
+  const form = el("div", "questions");
+  const qs = ((ev.tool_input || {}).questions) || [];
+  qs.forEach((q, i) => {
+    const box = el("div", "question");
+    box.appendChild(el("div", "q-text", (q.header ? "[" + q.header + "] " : "") + (q.question || "")));
+    for (const o of q.options || []) {
+      const lab = el("label", "q-opt");
+      const inp = document.createElement("input");
+      inp.type = q.multiSelect ? "checkbox" : "radio";
+      inp.name = `q-${ev.request_id}-${i}`; inp.value = o.label; inp.dataset.q = i;
+      lab.appendChild(inp);
+      lab.appendChild(document.createTextNode(" " + o.label + (o.description ? " — " + o.description : "")));
+      box.appendChild(lab);
+    }
+    const other = document.createElement("input");
+    other.placeholder = "Other…"; other.dataset.other = i;
+    box.appendChild(other);
+    form.appendChild(box);
+  });
+  const submit = el("button", "primary", "Submit");
+  submit.onclick = () => {
+    const selections = {}, other = {};
+    form.querySelectorAll("input[data-q]:checked").forEach(inp => {
+      const q = qs[inp.dataset.q];
+      if (q.multiSelect) (selections[inp.dataset.q] ||= []).push(inp.value);
+      else selections[inp.dataset.q] = inp.value;
+    });
+    form.querySelectorAll("input[data-other]").forEach(inp => {
+      if (inp.value.trim()) {
+        other[inp.dataset.other] = inp.value.trim();
+        if (!qs[inp.dataset.other].multiSelect) delete selections[inp.dataset.other];
+      }
+    });
+    steer("Answer", "answer", { request_id: ev.request_id, selections, other }, "Answered");
+  };
+  const skip = el("button", "danger", "Skip");
+  skip.onclick = () => steer("Skip", "answer", { request_id: ev.request_id, skip: true }, "Skipped");
+  form.appendChild(submit); form.appendChild(skip);
+  return form;
+}
+async function newSession() {
+  // Cheap create flow: the default environment, the model picked above.
+  const prompt = window.prompt("First message for the new cloud session:");
+  if (!prompt) return;
+  const repo = window.prompt("GitHub repo (owner/name), blank for none:") || "";
+  const model = $("sel-model").value || "";
+  try {
+    const s = await post("/api/sessions", { prompt, repo, model });
+    toast("Created " + (s.id || "session"));
+    await loadSessions();
+    if (s.id) selectSession(s.id);
+  } catch (e) { toast("Create failed: " + e.message); }
 }
 function argPreview(input) {
   if (input == null) return "";
@@ -554,6 +617,7 @@ function autoGrow(ta) { ta.style.height = "42px"; ta.style.height = Math.min(180
 
 // ---- wire up -------------------------------------------------------------
 $("refresh-sessions").onclick = loadSessions;
+$("new-session").onclick = newSession;
 $("btn-send").onclick = sendMessage;
 $("btn-aside").onclick = askAside;
 $("composer-text").addEventListener("input", (e) => autoGrow(e.target));
