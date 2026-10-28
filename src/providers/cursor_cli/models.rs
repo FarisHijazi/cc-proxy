@@ -137,69 +137,101 @@ const FALLBACK_MODELS: &[&str] = &[
     "cursor-grok-4.5-high",
 ];
 
-struct ModelCache {
+struct Discovery {
     models: Vec<String>,
-    fetched_at: Instant,
+    expires_at: Instant,
 }
 
-static MODEL_CACHE: once_cell::sync::Lazy<Mutex<Option<ModelCache>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(None));
+static DISCOVERY: Mutex<Option<Discovery>> = Mutex::new(None);
 
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(600);
+const SUCCESS_TTL: Duration = Duration::from_secs(600);
+/// Long enough that a missing or signed-out CLI is not respawned on every
+/// listing, short enough that signing in shows up within a minute.
+const FAILURE_TTL: Duration = Duration::from_secs(30);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Ask the CLI which models exist.
+/// Ask the CLI which models exist, blocking for at most [`DISCOVERY_TIMEOUT`].
 ///
-/// Only reached from `claude-codex cursor-cli auth status`; the registry no
-/// longer shells out at startup. Cached anyway, since the answer changes
-/// rarely.
+/// Reached from `/v1/models` (on a blocking thread) and from `claude-codex
+/// cursor-cli auth status`.
 pub fn discover_models() -> Vec<String> {
-    if let Ok(guard) = MODEL_CACHE.lock()
-        && let Some(cache) = guard.as_ref()
-        && cache.fetched_at.elapsed() < MODEL_CACHE_TTL
+    cached(&DISCOVERY, || {
+        list_models(&super::process::cursor_agent_binary(), DISCOVERY_TIMEOUT)
+    })
+}
+
+fn cached(
+    cache: &Mutex<Option<Discovery>>,
+    fetch: impl FnOnce() -> Option<Vec<String>>,
+) -> Vec<String> {
+    // Held across the fetch so concurrent misses share one CLI run.
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = guard.as_ref()
+        && Instant::now() < entry.expires_at
     {
-        return cache.models.clone();
+        return entry.models.clone();
     }
-
-    let models = fetch_models().unwrap_or_else(|| {
-        FALLBACK_MODELS
-            .iter()
-            .map(|model| (*model).to_string())
-            .collect()
+    let (models, ttl) = match fetch() {
+        Some(models) => (models, SUCCESS_TTL),
+        None => (
+            FALLBACK_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
+            FAILURE_TTL,
+        ),
+    };
+    *guard = Some(Discovery {
+        models: models.clone(),
+        expires_at: Instant::now() + ttl,
     });
-
-    if let Ok(mut guard) = MODEL_CACHE.lock() {
-        *guard = Some(ModelCache {
-            models: models.clone(),
-            fetched_at: Instant::now(),
-        });
-    }
     models
 }
 
-/// Discovery runs during registry construction, which happens at server
-/// startup, so it must not be able to block indefinitely. The call is made on a
-/// detached thread and abandoned past the deadline; the fallback list covers a
-/// missing or wedged CLI.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Run `<binary> --list-models`, killing and reaping it past `timeout`.
+fn list_models(binary: &str, timeout: Duration) -> Option<Vec<String>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
 
-fn fetch_models() -> Option<Vec<String>> {
+    let mut child = Command::new(binary)
+        .arg("--list-models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(list_models_blocking());
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        let _ = sender.send(text);
     });
-    receiver.recv_timeout(DISCOVERY_TIMEOUT).ok().flatten()
-}
 
-fn list_models_blocking() -> Option<Vec<String>> {
-    let output = std::process::Command::new(crate::config::cursor_cli_binary())
-        .arg("--list-models")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let parsed = parse_model_list(&String::from_utf8_lossy(&output.stdout));
+    // A grandchild can hold the pipe open after the CLI exits.
+    let text = receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?;
+    let parsed = parse_model_list(&text);
     (!parsed.is_empty()).then_some(parsed)
 }
 
@@ -227,15 +259,8 @@ pub fn parse_model_list(stdout: &str) -> Vec<String> {
     models
 }
 
-/// Ids advertised over `/v1/models`.
-///
-/// Deliberately just the bare mode selectors. Cursor offers a few hundred
-/// models, and advertising `cursor-cli:<model>` for each would bury Claude
-/// Code's `/model` picker under hundreds of near-identical entries — the same
-/// reason the API-backed `cursor` backend advertises only its short list.
-/// Any `cursor-cli:<model>` still routes, because routing matches the prefix;
-/// `cursor-agent --list-models` (or `claude-codex cursor-cli auth status`)
-/// lists what can go after the colon.
+/// Bare mode selectors. These are what the registry holds for routing and
+/// summarizes; `/v1/models` adds the per-model [`discovered_model_ids`].
 ///
 /// The write-capable id appears only once write access is enabled, so an
 /// unconfigured install cannot pick a file-editing agent from the menu by
@@ -250,6 +275,19 @@ pub fn supported_models() -> Vec<String> {
         out.push("cursor-cli-agent".to_string());
     }
     out
+}
+
+/// Every model the signed-in CLI offers, as a read-only `cursor-cli:<id>`.
+///
+/// The prefix keeps each id unambiguous: `cursor-cli:claude-opus-5-5-high` can
+/// never be mistaken for the Anthropic passthrough or the API-backed `cursor`
+/// backend. Plan and write variants still route by prefix but are not listed,
+/// so the menu offers each Cursor model once and never a file-editing agent.
+pub fn discovered_model_ids() -> Vec<String> {
+    discover_models()
+        .into_iter()
+        .map(|model| format!("cursor-cli:{model}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -371,5 +409,98 @@ mod tests {
     fn model_list_ignores_prose_and_duplicates() {
         let stdout = "Available models\nSome descriptive sentence here\nauto - Auto\nauto - Auto\n";
         assert_eq!(parse_model_list(stdout), vec!["auto"]);
+    }
+
+    #[test]
+    fn a_failed_listing_serves_the_fallback_without_respawning() {
+        let cache = Mutex::new(None);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        assert_eq!(cached(&cache, fetch), FALLBACK_MODELS);
+        assert_eq!(cached(&cache, fetch), FALLBACK_MODELS);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let expires_at = cache.lock().unwrap().as_ref().unwrap().expires_at;
+        assert!(expires_at <= Instant::now() + FAILURE_TTL);
+    }
+
+    #[test]
+    fn an_expired_entry_is_fetched_again() {
+        let cache = Mutex::new(Some(Discovery {
+            models: vec!["stale".into()],
+            expires_at: Instant::now(),
+        }));
+        assert_eq!(cached(&cache, || Some(vec!["fresh".into()])), vec!["fresh"]);
+        assert_eq!(cached(&cache, || panic!("cached")), vec!["fresh"]);
+    }
+
+    #[test]
+    fn concurrent_misses_share_one_listing() {
+        let cache = Mutex::new(None);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    cached(&cache, || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        Some(vec!["auto".into()])
+                    })
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    fn fake_cli(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("cursor-agent");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_parses_a_successful_run_and_rejects_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = fake_cli(dir.path(), "printf 'auto - Auto\\ncomposer-2.5 - C\\n'");
+        assert_eq!(
+            list_models(&ok, Duration::from_secs(5)),
+            Some(vec!["auto".into(), "composer-2.5".into()])
+        );
+        let failing = fake_cli(dir.path(), "printf 'auto - Auto\\n'; exit 1");
+        assert_eq!(list_models(&failing, Duration::from_secs(5)), None);
+        assert_eq!(
+            list_models("/nonexistent/cursor-agent", Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_listing_is_killed_and_reaped_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let hung = fake_cli(
+            dir.path(),
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        );
+        let started = Instant::now();
+        assert_eq!(list_models(&hung, Duration::from_millis(300)), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        // Reaped, not a zombie: the pid no longer exists at all.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "child {pid} still present"
+        );
     }
 }

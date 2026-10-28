@@ -33,7 +33,8 @@ impl Drop for Upstream {
     }
 }
 
-/// Anthropic stand-in: any bearer starting with `Bearer dead` is out of quota.
+/// Anthropic stand-in: any bearer starting with `Bearer dead` is out of quota, and
+/// `Bearer basic` has no `claude-mythos-*` models.
 async fn anthropic_upstream() -> Upstream {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
@@ -48,6 +49,9 @@ async fn anthropic_upstream() -> Upstream {
             let model = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
             if auth.starts_with("Bearer invalid") {
                 return (StatusCode::UNAUTHORIZED, axum::Json(json!({"type":"error","error":{"type":"authentication_error","message":"expired"}}))).into_response();
+            }
+            if auth.starts_with("Bearer basic") && model.as_deref().is_some_and(|m| m.starts_with("claude-mythos")) {
+                return (StatusCode::NOT_FOUND, axum::Json(json!({"type":"error","error":{"type":"not_found_error","message":format!("model: {}", model.unwrap())}}))).into_response();
             }
             if auth.starts_with("Bearer dead") {
                 return (
@@ -507,4 +511,274 @@ async fn without_a_pool_the_rejection_passes_through_unchanged() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(codex.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_model_missing_on_one_account_is_served_by_another() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let accounts = pool(&[("plain", "basic-a"), ("team", "live-b")]);
+    let (status, body) = send(
+        router.clone(),
+        "claude-mythos-5-1",
+        Some(accounts.clone()),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "Bearer live-b");
+    // A model rejection must not disable other models or hide newly granted access.
+    send(
+        router.clone(),
+        "claude-mythos-5-1",
+        Some(accounts.clone()),
+        false,
+    )
+    .await;
+    let (_, body) = send(router, "claude-opus-5-5", Some(accounts), false).await;
+    assert_eq!(body["servedBy"], "Bearer basic-a");
+    let seen: Vec<_> = upstream
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(auth, _)| auth.clone())
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            "Bearer basic-a",
+            "Bearer live-b",
+            "Bearer basic-a",
+            "Bearer live-b",
+            "Bearer basic-a"
+        ]
+    );
+    assert!(codex.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn model_unavailable_fallback_can_be_switched_off() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let (status, body) = send_with(
+        router,
+        "claude-mythos-5-1",
+        Some(pool(&[("plain", "basic-a"), ("team", "live-b")])),
+        false,
+        Some(json!({"on": {"model_unavailable": false}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_model_unavailable_thread_never_reaches_a_backup_without_full_history() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("plain", "basic-a"), ("team", "live-b")]);
+    let (status, body) = send(
+        router.clone(),
+        "claude-mythos-5-1",
+        Some(accounts.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"]["details"]["error_code"],
+        "thread_unsupported_request"
+    );
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    let (status, body) = send(router, "claude-mythos-5-1", Some(accounts), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "Bearer live-b");
+}
+
+#[tokio::test]
+async fn a_model_rejection_does_not_hide_another_accounts_quota_limit() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("no-access", "basic-a"), ("with-access", "dead-b")]);
+    for _ in 0..2 {
+        let (status, body) = send(
+            router.clone(),
+            "claude-mythos-5-1",
+            Some(accounts.clone()),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+    }
+}
+
+#[tokio::test]
+async fn a_model_rejection_does_not_hide_another_accounts_expired_login() {
+    let upstream = anthropic_upstream().await;
+    let (status, body) = send(
+        gateway(&upstream.base, vec![]),
+        "claude-mythos-5-1",
+        Some(pool(&[("no-access", "basic-a"), ("expired", "invalid-b")])),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["type"], "authentication_error");
+}
+
+#[tokio::test]
+async fn a_model_missing_everywhere_returns_the_404() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("a", "basic-a"), ("b", "basic-b")]);
+    for _ in 0..2 {
+        let (status, body) = send(
+            router.clone(),
+            "claude-mythos-5-1",
+            Some(accounts.clone()),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "not_found_error");
+    }
+}
+
+async fn count(
+    router: Router,
+    model: &str,
+    pool: Option<String>,
+    thread: bool,
+) -> (StatusCode, Value) {
+    let mut payload = json!({"model": model, "messages": [{"role":"user","content":"hi"}]});
+    if thread {
+        payload["thread"] = json!({"type": "continue", "previous_message_id": "msg_toy"});
+    }
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens?beta=true")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer own-session-token");
+    if let Some(pool) = pool {
+        request = request.header(POOL, pool);
+    }
+    let response = router
+        .oneshot(request.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+fn seen_auths(upstream: &Upstream) -> Vec<String> {
+    upstream
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(auth, _)| auth.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_count_for_a_model_missing_on_one_account_is_answered_by_another() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let (status, body) = count(
+        router,
+        "claude-mythos-5-1",
+        Some(pool(&[("plain", "basic-a"), ("team", "live-b")])),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "Bearer live-b");
+    assert_eq!(body["model"], "claude-mythos-5-1");
+    assert_eq!(seen_auths(&upstream), ["Bearer basic-a", "Bearer live-b"]);
+    assert!(
+        upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, pooled)| !pooled)
+    );
+    assert!(
+        codex.seen.lock().unwrap().is_empty(),
+        "counts never change vendor"
+    );
+}
+
+#[tokio::test]
+async fn a_count_for_a_model_missing_everywhere_returns_the_404() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("a", "basic-a"), ("b", "basic-b")]);
+    for _ in 0..2 {
+        let (status, body) = count(
+            router.clone(),
+            "claude-mythos-5-1",
+            Some(accounts.clone()),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "not_found_error");
+    }
+    assert_eq!(
+        seen_auths(&upstream).len(),
+        4,
+        "a 404 never cools an account down"
+    );
+}
+
+#[tokio::test]
+async fn counts_neither_cool_down_messages_nor_move_thread_deltas() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("spent", "dead-a"), ("fresh", "live-b")]);
+    let (status, body) = count(
+        router.clone(),
+        "claude-opus-5-5",
+        Some(accounts.clone()),
+        false,
+    )
+    .await;
+    assert_eq!(
+        (status, body["servedBy"].clone()),
+        (StatusCode::OK, json!("Bearer live-b"))
+    );
+    // The count's 429 recorded nothing: the message still tries the first account.
+    send(
+        router.clone(),
+        "claude-opus-5-5",
+        Some(accounts.clone()),
+        false,
+    )
+    .await;
+    assert_eq!(
+        seen_auths(&upstream),
+        [
+            "Bearer dead-a",
+            "Bearer live-b",
+            "Bearer dead-a",
+            "Bearer live-b"
+        ]
+    );
+    let mythos = pool(&[("plain", "basic-a"), ("team", "live-b")]);
+    let (status, _) = count(router, "claude-mythos-5-1", Some(mythos), true).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a contextless delta stays on its own account"
+    );
+    assert_eq!(seen_auths(&upstream).len(), 5);
 }

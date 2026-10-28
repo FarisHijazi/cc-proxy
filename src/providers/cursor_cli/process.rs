@@ -27,7 +27,7 @@ impl RunOptions {
     /// [`super::workspace`] for why a request may pick it at all.
     pub fn from_request(parsed: &ParsedModel, req: &MessagesRequest) -> Self {
         Self {
-            binary: crate::config::cursor_cli_binary(),
+            binary: cursor_agent_binary(),
             model: parsed.model.clone(),
             mode: parsed.mode,
             workspace: super::workspace::resolve(req),
@@ -247,6 +247,27 @@ mod tests {
     }
 }
 
+/// The configured `cursor-agent`, falling back to the Cursor installer's
+/// `~/.local/bin/cursor-agent` when the default name is not on `PATH`. A
+/// systemd user unit gets a bare `PATH` without `~/.local/bin`, which hid this
+/// backend on a host where the CLI was installed and signed in.
+pub fn cursor_agent_binary() -> String {
+    resolve_binary(
+        crate::config::cursor_cli_binary(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+    )
+}
+
+fn resolve_binary(configured: String, home: Option<std::path::PathBuf>) -> String {
+    if configured != "cursor-agent" || binary_is_runnable(&configured) {
+        return configured;
+    }
+    home.map(|home| home.join(".local/bin/cursor-agent"))
+        .filter(|path| is_executable_file(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(configured)
+}
+
 /// Whether `binary` can actually be spawned: an explicit path that exists and is
 /// executable, or a bare name resolvable on `PATH`.
 ///
@@ -279,7 +300,31 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod availability_tests {
-    use super::binary_is_runnable;
+    use super::{binary_is_runnable, resolve_binary};
+
+    #[cfg(unix)]
+    #[test]
+    fn default_binary_falls_back_to_the_installer_location() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let agent = bin.join("cursor-agent");
+        std::fs::write(&agent, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let home = Some(home.path().to_path_buf());
+
+        assert_eq!(
+            resolve_binary("cursor-agent".into(), home.clone()),
+            agent.to_string_lossy()
+        );
+        // An explicit choice is never second-guessed.
+        assert_eq!(
+            resolve_binary("/opt/cursor-agent".into(), home),
+            "/opt/cursor-agent"
+        );
+        assert_eq!(resolve_binary("cursor-agent".into(), None), "cursor-agent");
+    }
 
     #[test]
     fn a_bare_name_resolves_through_path() {

@@ -155,15 +155,22 @@ different Claude account. Select a main account with remaining quota and a separ
 RC owner rather than rewriting usage percentages. Live TUI and regression evidence is in
 `docs/devlog/claude_20261024-usage-account-routing.md` (plain path).
 
+Model access differs across Claude accounts: `fallback.on.model_unavailable` defaults to true and
+tries the same requested model on the next account after a 404. A model rejection never disables
+that account or creates a cooldown; quota/auth errors take precedence over model-not-found errors.
+Cursor CLI discovery advertises signed-in CLI models as `cursor-cli:<id>`; the legacy `cursor-agent`
+id remains a Cursor API alias. See `docs/devlog/claude_20261028-model-access-and-cursor-cli.md` (plain path).
+
 Quota fallback: `account_inject` (the credential owner) attaches every usable login,
-session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages`;
+session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages` and `/v1/messages/count_tokens`;
 `src/fallback.rs` (the routing owner) strips it and walks the tier chain on 429,
 plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
 still reaches other vendors. The explicit primary-account marker prevents a filtered
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
 Claude model: accounts, then Codex, then Cursor. Codex model: Codex, then Claude
 accounts, then Cursor. Both are defaults: the accounts file's `fallback` section (`chains` per family
-`claude`/`codex`/provider name, `on` = `rate_limit`/`auth`/`server_error`, `threshold` %) overrides them.
+`claude`/`codex`/provider name; `accounts:N` = the next N pool accounts, so another backend can sit between accounts,
+and `accounts` = the rest, `on` = `rate_limit`/`auth`/`server_error`, `threshold` %) overrides them.
 `account_inject` attaches it as `x-claude-codex-fallback` beside the pool (stripped the same way) and alone
 applies `threshold`, putting accounts whose last reply reported 5h/7d utilization at or over it last in
 the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`. Never relay the pool header upstream, never retry after
@@ -212,8 +219,22 @@ Run tests as CI does with an empty `HOME`: tests that read the machine's Codex l
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days`, `fallback` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback`, `session_models` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
+`GET /api/sessions` lists recent inference sessions from the traffic DB, not proof of running processes.
+`session_models` maps session IDs to forced model IDs; dashboard updates patch only named sessions and `null`
+clears one. `account_inject` strips client-supplied `x-claude-codex-session-model` and attaches the configured
+model for inference/counts; `server.rs` strips it and rewrites only an actual model change before routing.
+A changed-model thread delta must negotiate full-history resend. The client's `/model` state is unchanged.
+Source-labeled non-Claude usage cards use `scripts/account_providers.py` (24-hour traffic window,
+newest 2,000 replies for token totals). `scripts/account_cursor_quota.py` reads Cursor's own quota RPCs
+and `scripts/account_codex_quota.py` reads ChatGPT's `wham/usage` (Codex CLI `/status`), each with its
+CLI's access token, never refreshing or writing it. Vendor failures are sanitized and isolated;
+other providers' unknown remaining quota must not become zero. Provider ordering stays in fallback chains.
+`scripts/account_remote_links.py` links each session to HQ (cchq) and its claude.ai mirror (`--hq`/`--hq-public-url`
+on `account_ui.py`). Remote Control traffic never carries the Claude session id, and folder/time matching was
+measured wrong live; the exact key is the reply `msg_…` id that a worker event relays and the inference response
+recorded.
 cswap slots may hold `claude setup-token`s (no `expiresAt`, no refresh, inference scope only): `slot_token()` uses them
 as-is; they cannot answer usage/profile, so the dashboard reads their usage from recorded reply headers.
 

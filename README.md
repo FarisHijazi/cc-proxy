@@ -161,6 +161,38 @@ Claude token. Like the proxy it has no login and shows full conversations, so bi
 a private address only. To keep it running, use the systemd or launchd snippet above with
 this command in place of `cc-proxy --serve`.
 
+The Sessions section lists recent Claude Code sessions observed in recorded
+inference traffic, separately from requests. It shows their machine, folder,
+requested model and last serving account/model; traffic is not proof that a
+session's process is still running. Force model overrides that session's next
+request at the proxy, without restarting it or changing the client's `/model`
+setting. Clear restores the model the client requests. An exact-model input
+accepts unlisted models too. The override applies to every request carrying that
+session ID, including background calls; it does not change the client's context
+window or compaction settings.
+
+Accounts and providers are stacked vertically. Claude accounts have drag handles
+and up/down buttons; cross-provider order stays in each model family's failover
+chain. Provider cards show recorded calls and reported tokens over 24 hours.
+Token totals decode at most the latest 2,000 replies, with a visible cap notice.
+Cursor CLI quota is read from the same read-only DashboardService calls as its
+`/usage` screen; included USD spend, named-model/API and Auto percentages remain
+separate measures. Codex quota is read from ChatGPT's usage endpoint, the one the
+Codex CLI's `/status` uses, with the dashboard host's Codex login; it shows each
+plan window (for example 5-hour and weekly) as a percentage with its reset time.
+Both readers use the CLI's own token read-only (Cursor's macOS Keychain entry or
+its Linux auth file; `$CODEX_HOME/auth.json`) and never refresh or write it.
+Other remaining quotas are labeled unknown when not reported. Recorded traffic
+refreshes at most once a minute, vendor quota once every five minutes, with
+source and snapshot time shown. A forced session older than the recent list
+still shows its last activity.
+
+Overrides live in the same accounts file under `session_models`. The dashboard's
+`POST /api/config` treats this field as a per-session patch: a model sets an
+override, and `null` clears that session only. Other sessions and settings remain
+unchanged. A changed model on a thread delta negotiates a full-history resend
+rather than sending incomplete context to a different model.
+
 ### Connect a client
 
 On every machine that runs Claude Code, save the server's CA and list the server in
@@ -286,6 +318,12 @@ accounts or another provider's remaining quota.
 When a request gets a 429 for quota, or a Claude account rejects its credential
 with 401, the shared proxy tries the next option before any output reaches Claude
 Code. Running sessions keep working without a relaunch or `cswap switch`.
+If an account answers 404 because its plan does not offer the requested Claude
+model, the proxy tries that same model on the next account too. This is enabled
+by default; `fallback.on.model_unavailable: false` or the dashboard toggle disables
+it. A model rejection does not disable that account or start a cooldown, so newly
+granted access works immediately. If another account is rate-limited or needs
+fresh credentials, that failure takes precedence over a model-not-found response.
 Credential storage and refresh still use `claude-swap`; request selection does not.
 An empty Claude account pool does not block Codex or Cursor inference:
 
@@ -588,8 +626,9 @@ session reads.
 Claude Code can also discover models from a gateway's `/v1/models`
 (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`), and this router serves that
 endpoint — but discovery keeps only ids containing `claude` or `anthropic`, so
-it will never surface `gemini-*`, `cursor-*` or `gpt-*`. For these backends the
-lineup above is the mechanism, not discovery.
+it will never surface `gemini-*` or `gpt-*`, and of Cursor only the
+`cursor-cli:claude-*` ids. For these backends the lineup above is the
+mechanism, not discovery.
 
 ### The unrecognized-model warning
 
@@ -621,7 +660,7 @@ Added by this fork:
 | `CCP_AUTH_TOKEN_FILE` | Read that token from a file instead of the environment. |
 | `CCP_GEMINI_BASE_URL` | gemini-web-api base URL. Default `http://localhost:8100/v1`. |
 | `CCP_GEMINI_API_KEY` | Key for that server, if it is deployed behind its own auth. |
-| `CCP_CURSOR_CLI_BINARY` | Path to `cursor-agent`. Default: found on `PATH`. |
+| `CCP_CURSOR_CLI_BINARY` | Path to `cursor-agent`. Default: found on `PATH`, then `~/.local/bin/cursor-agent`. |
 | `CCP_CURSOR_CLI_ALLOW_WRITE` | `1` lets `cursor-cli-agent:` edit files. Default off. |
 | `CCP_CURSOR_CLI_WORKSPACE` | Pin `cursor-agent` to one directory. Default: follow the caller's cwd. |
 | `CCP_CURSOR_CLI_TIMEOUT_SECS` | Kill a run after this long. Default `900`. |
@@ -652,7 +691,7 @@ are listed, never on the request path.
 | `anthropic` | always — Claude Code forwards its own subscription credentials |
 | `codex` | the Codex CLI has written `~/.codex/auth.json` |
 | `cursor` | signed in through this proxy, **or** `cursor-agent` is signed in |
-| `cursor-cli` | the `cursor-agent` binary is on `PATH` |
+| `cursor-cli` | the `cursor-agent` binary is on `PATH` or at `~/.local/bin/cursor-agent` |
 | `gemini` | something is listening at `gemini.baseUrl` |
 | `kimi`, `grok` | signed in through this proxy |
 
@@ -793,9 +832,15 @@ The model id carries the execution mode:
 | `cursor-cli-agent:<model>` | full agent | **yes**, and it is off by default |
 
 `<model>` is any id `cursor-agent --list-models` prints, e.g.
-`/model cursor-cli:composer-2.5`. Only the bare ids are advertised to Claude
-Code — Cursor offers a few hundred models and listing every combination would
-bury the `/model` picker — but any of them routes.
+`/model cursor-cli:claude-opus-5-5-high`. `/v1/models` lists every model the
+signed-in CLI offers as `cursor-cli:<model>` (read-only ask mode), refreshed
+from `--list-models` at most every 10 minutes. A failed lookup is retried after
+30 seconds; `claude-codex cursor-cli auth status` also prints the full CLI list.
+The plan and write prefixes route the same ids but are not listed. `cursor-agent` and
+`composer-2.5` are older ids of the API-backed `cursor` backend, not this one.
+
+If `cursor-agent` is not on `PATH` (a systemd unit's bare `PATH`), the proxy
+uses the installer's `~/.local/bin/cursor-agent`.
 
 **It follows the project you have open.** An Anthropic request has no working
 directory field, but Claude Code states its cwd in the environment block it

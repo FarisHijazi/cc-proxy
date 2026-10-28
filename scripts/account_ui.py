@@ -9,11 +9,13 @@ bind it to the same private address as the proxy.
 
 import argparse
 import json
+import re
 import runpy
 import shutil
 import socket
 import sqlite3
 import ssl
+import threading
 import time
 import urllib.request
 import zlib
@@ -29,8 +31,22 @@ WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
 CACHE_S = 60
 # The router's chains when the accounts file has no "fallback.chains" entry (src/fallback.rs).
 DEFAULT_CHAINS = {"claude": ["accounts", "codex", "cursor"], "codex": ["codex", "accounts", "cursor"]}
-TRIGGERS = ["rate_limit", "auth", "server_error"]
+TRIGGERS = ["rate_limit", "auth", "server_error", "model_unavailable"]
+# Same patterns account_inject.py accepts for "session_models" (they become a request header).
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
+# The Sessions panel: sessions with inference traffic in this window, newest first, at most this many.
+RECENT_SESSION_DAYS = 7
+RECENT_SESSION_LIMIT = 50
 PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "grok"]
+_providers = runpy.run_path(str(HERE / "account_providers.py"), run_name="account_providers")
+provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cursor_card_quota"]
+cursor_quota = runpy.run_path(str(HERE / "account_cursor_quota.py"), run_name="account_cursor_quota")["cursor_quota"]
+codex_quota = runpy.run_path(str(HERE / "account_codex_quota.py"), run_name="account_codex_quota")["codex_quota"]
+RemoteLinks = runpy.run_path(str(HERE / "account_remote_links.py"), run_name="account_remote_links")["RemoteLinks"]
+LINKS_CACHE_S = 60
+# Three blocking calls to Cursor per read, so read it less often than usage.
+QUOTA_CACHE_S = 300
 
 
 def checked_fallback(fallback):
@@ -50,6 +66,25 @@ def checked_fallback(fallback):
     if threshold is not None:
         result["threshold"] = threshold
     return result
+
+
+def checked_session_models(current, change):
+    """Apply {session id: model id, or None to clear} to the "session_models" mapping."""
+    if not isinstance(change, dict):
+        raise TypeError("session_models maps session ids to a model id or null")
+    result = dict(current)
+    for session, model in change.items():
+        if not isinstance(session, str) or not SESSION_ID.fullmatch(session):
+            raise ValueError(f"invalid session id {session!r}")
+        if model is None:
+            result.pop(session, None)
+        elif isinstance(model, str) and MODEL_ID.fullmatch(model.strip()):
+            result[session] = model.strip()
+        else:
+            raise ValueError(f"invalid model id {model!r}")
+    return result
+
+
 COLUMNS = "id, started, client_host, client_ip, client_user, cwd, launch_cwd, account, served_by, model, status, method, url"
 
 
@@ -78,8 +113,10 @@ def alias_of(placeholder):
 
 
 class Dashboard:
-    def __init__(self, accounts_file, proxy, ca):
+    def __init__(self, accounts_file, proxy, ca, hq=None, hq_public=None):
         self.accounts_file = accounts_file
+        self.links = RemoteLinks(hq, hq_public or hq) if hq else None
+        self.links_lock, self.links_at, self.links_result = threading.Lock(), 0, ({}, None)
         self.proxy = urlsplit(proxy)
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"https": proxy}),
@@ -159,6 +196,30 @@ class Dashboard:
             "disabled": alias in cfg.get("disabled", []),
         }
 
+    def recorded_provider_usage(self, cfg):
+        """Each non-Claude backend's last 24 h from the traffic database; None (unknown) without one."""
+        hit = self.cache.get("provider_usage")
+        if not hit or time.time() - hit[0] >= CACHE_S:
+            hit = self.cache["provider_usage"] = (time.time(), provider_usage(self.database(cfg)))
+        return hit[1]
+
+    def provider_quota(self):
+        """Vendor-reported quota per backend: the Codex CLI's and cursor-agent's own logins. The
+        `cursor` API backend may hold a different Cursor login, so it gets no snapshot."""
+        hit = self.cache.get("provider_quota")
+        if not hit or time.time() - hit[0] >= QUOTA_CACHE_S:
+            readers = {"codex": codex_quota, "cursor-cli": lambda: cursor_card_quota(cursor_quota())}
+            with ThreadPoolExecutor(len(readers)) as pool:
+                futures = {name: pool.submit(read) for name, read in readers.items()}
+            snapshots = {}
+            for name, future in futures.items():
+                try:
+                    snapshots[name] = future.result()
+                except Exception as error:  # noqa: BLE001 - optional provider data cannot take down the dashboard
+                    snapshots[name] = {"error": f"{name} quota: {type(error).__name__}"}
+            hit = self.cache["provider_quota"] = (time.time(), snapshots)
+        return hit[1]
+
     def database(self, cfg):
         path = cfg.get("traffic_db")
         path = Path(path).expanduser() if path else None
@@ -169,7 +230,9 @@ class Dashboard:
     def state(self):
         cfg = self.config()
         with ThreadPoolExecutor(8) as pool:
+            quota = pool.submit(self.provider_quota)
             accounts = list(pool.map(lambda item: self.account(*item, cfg), cfg["accounts"].items()))
+            quota = quota.result()
         db_path = Path(cfg["traffic_db"]).expanduser() if cfg.get("traffic_db") else None
         try:
             socket.create_connection((self.proxy.hostname, self.proxy.port), 1).close()
@@ -184,8 +247,11 @@ class Dashboard:
             "traffic_days": cfg.get("traffic_days"),
             "renamed": cfg.get("renamed", {}),
             "fallback": cfg.get("fallback", {}),
+            "session_models": cfg.get("session_models", {}),
             "default_chains": DEFAULT_CHAINS,
             "providers": self.providers(),
+            "provider_usage": self.recorded_provider_usage(cfg),
+            "provider_quota": quota,
             "proxy": {"address": f"{self.proxy.hostname}:{self.proxy.port}", "up": proxy_up},
             "db": {
                 "path": str(db_path) if db_path else None,
@@ -211,6 +277,47 @@ class Dashboard:
                           [*values, limit]).fetchall()
         names = COLUMNS.split(", ")
         return {"rows": [dict(zip(names, row), alias=alias_of(row[7])) for row in rows]}
+
+    def sessions(self):
+        """Claude Code sessions seen in recent inference traffic, each with its latest request.
+        A row proves only that the session sent traffic then, not that it is still running."""
+        cfg = self.config()
+        forced = cfg.get("session_models", {})
+        db = self.database(cfg)
+        # SQLite fills the bare columns from the row holding max(started): the latest request.
+        query = ("SELECT session_id, max(started), count(*), coalesce(client_host, client_ip), client_user, "
+                 "coalesce(cwd, launch_cwd), model, served_by, status FROM flows "
+                 "WHERE session_id IS NOT NULL AND model IS NOT NULL AND {} GROUP BY session_id ORDER BY max(started) DESC")
+        rows = db.execute(query.format("started > ?") + " LIMIT ?",
+                          (time.time() - RECENT_SESSION_DAYS * 86400, RECENT_SESSION_LIMIT)).fetchall() if db else []
+        # Overridden sessions outside that list keep their latest activity, or none, so they can be cleared.
+        extra = [sid for sid in forced if sid not in {row[0] for row in rows}]
+        if db and extra:
+            rows += db.execute(query.format(f"session_id IN ({','.join('?' * len(extra))})"), extra).fetchall()
+        names = ["session_id", "last_seen", "requests", "host", "user", "cwd", "requested_model", "served_by", "status"]
+        sessions = [dict(zip(names, row), forced_model=forced.get(row[0])) for row in rows]
+        seen = {row[0] for row in rows}
+        sessions += [{"session_id": sid, "forced_model": model, "last_seen": None} for sid, model in forced.items()
+                     if sid not in seen]
+        links, links_error = self.remote_links(db)
+        for session in sessions:
+            session["remote"] = links.get(session["session_id"])
+        return {"days": RECENT_SESSION_DAYS, "limit": RECENT_SESSION_LIMIT, "traffic_db": db is not None,
+                "remote_links": None if self.links is None or db is None else {"error": links_error},
+                "sessions": sessions}
+
+    def remote_links(self, db):
+        """Remote Control links per session from HQ, at most once a minute; HQ failures stay isolated."""
+        if self.links is None or db is None:
+            return {}, None
+        with self.links_lock:
+            if time.time() - self.links_at >= LINKS_CACHE_S:
+                try:
+                    self.links_result = (self.links(db, RECENT_SESSION_DAYS), None)
+                except Exception as error:  # noqa: BLE001 - HQ down must not hide the sessions
+                    self.links_result = ({}, f"cchq unreachable: {type(error).__name__}")
+                self.links_at = time.time()
+            return self.links_result
 
     def stats(self, hours):
         db = self.database(self.config())
@@ -272,6 +379,12 @@ class Dashboard:
             if days is not None and (not isinstance(days, int) or days < 1):
                 raise ValueError("traffic_days must be a positive whole number or empty")
             cfg["traffic_days"] = days
+        if "session_models" in change:
+            session_models = checked_session_models(cfg.get("session_models", {}), change["session_models"])
+            if session_models:
+                cfg["session_models"] = session_models
+            else:
+                cfg.pop("session_models", None)
         if "fallback" in change:
             fallback = checked_fallback(change["fallback"])
             if fallback is None:
@@ -307,6 +420,8 @@ def handler(dashboard):
                     return self.reply(200, dashboard.state())
                 if url.path == "/api/traffic":
                     return self.reply(200, dashboard.traffic(query))
+                if url.path == "/api/sessions":
+                    return self.reply(200, dashboard.sessions())
                 if url.path == "/api/stats":
                     return self.reply(200, dashboard.stats(int(query.get("hours", 24))))
                 if url.path.startswith("/api/flow/"):
@@ -338,8 +453,10 @@ def main():
     parser.add_argument("--accounts-file", type=Path, required=True, help="the --serve proxy's accounts file")
     parser.add_argument("--proxy", required=True, help="the --serve proxy, http://HOST:PORT")
     parser.add_argument("--proxy-ca", type=Path, required=True, help="the --serve proxy's CA certificate")
+    parser.add_argument("--hq", help="HQ (cchq) API origin, e.g. http://127.0.0.1:8389, for Remote Control links")
+    parser.add_argument("--hq-public-url", help="HQ's browser URL, e.g. https://hq.example.com (default: --hq)")
     args = parser.parse_args()
-    dashboard = Dashboard(args.accounts_file.expanduser(), args.proxy, args.proxy_ca.expanduser())
+    dashboard = Dashboard(args.accounts_file.expanduser(), args.proxy, args.proxy_ca.expanduser(), args.hq, args.hq_public_url)
     server = ThreadingHTTPServer((args.listen_host, args.port), handler(dashboard))
     print(f"cc-proxy dashboard on http://{args.listen_host}:{args.port}", flush=True)
     server.serve_forever()

@@ -38,6 +38,12 @@ UNUSABLE_RETRY_S = 300
 # round-robin / least-sessions = spread new sessions, then stick to that account.
 STRATEGIES = {"session", "prefer", "round-robin", "least-sessions"}
 SESSION_HEADER = "x-claude-code-session-id"
+# The accounts file's "session_models" (session id -> model id, set in the dashboard) for the
+# router, which applies it before choosing a provider. Only this addon sets it; the router strips it.
+SESSION_MODEL_HEADER = "x-claude-codex-session-model"
+MODEL_PATHS = {"/v1/messages", "/v1/messages/count_tokens"}
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # Prompt caches last at most an hour, so an idle session may be reassigned.
 STICKY_IDLE_S = 3600
 
@@ -106,6 +112,7 @@ class AccountInject:
         self.traffic_days = None
         self.disabled = set()
         self.fallback = {}
+        self.session_models = {}
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
@@ -145,6 +152,11 @@ class AccountInject:
         if threshold is not None and not 0 < float(threshold) <= 100:
             raise ValueError("fallback.threshold must be a percentage")
         self.fallback = fallback
+        session_models = data.get("session_models", {})
+        if not all(isinstance(s, str) and SESSION_ID.fullmatch(s) and isinstance(m, str) and MODEL_ID.fullmatch(m)
+                   for s, m in session_models.items()):
+            raise ValueError("session_models maps session ids to model ids")
+        self.session_models = dict(session_models)
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
@@ -354,6 +366,12 @@ class AccountInject:
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
         flow.request.headers.pop(POLICY_HEADER, None)
+        flow.request.headers.pop(SESSION_MODEL_HEADER, None)
+        if flow.request.method == "POST" and flow.request.path.split("?")[0] in MODEL_PATHS:
+            self.reload_accounts()
+            forced = self.session_models.get(flow.request.headers.get(SESSION_HEADER, ""))
+            if forced:
+                flow.request.headers[SESSION_MODEL_HEADER] = forced
         if self.upstream and flow.request.host == "bridge.claudeusercontent.com":
             # The router reaches Anthropic through the next proxy; the Chrome bridge must too.
             flow.server_conn.via = self.upstream
@@ -365,7 +383,8 @@ class AccountInject:
         try:
             if self.cascades(placeholder, flow.request.path):
                 return  # the next proxy swaps it
-            if flow.request.method == "POST" and flow.request.path.split("?")[0] == "/v1/messages":
+            # Counts carry the pool too: an account lacking the model 404s a count as well.
+            if flow.request.method == "POST" and flow.request.path.split("?")[0] in MODEL_PATHS:
                 alias, _, private = parse(placeholder)
                 alias = self.name(alias)
                 if alias not in self.accounts:

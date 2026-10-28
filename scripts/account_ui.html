@@ -40,7 +40,10 @@
   .seg button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
   .seg button:last-child { border-right: 0; }
   .seg button.on { background: var(--accent); color: #fff; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .handle { cursor: grab; user-select: none; touch-action: none; color: var(--muted); padding: 0 4px; line-height: 1; }
+  #accounts .card:not(.off) { cursor: grab; } #accounts .card button, #accounts .card label { cursor: pointer; }
+  .card.dragging { opacity: .35; } .card.over { outline: 2px dashed var(--accent); outline-offset: 2px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px;
           display: flex; flex-direction: column; gap: 10px; }
   .card.off { opacity: .55; }
@@ -117,6 +120,18 @@
   .trigger { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
   .trigger div { flex: 1; } .trigger small { display: block; color: var(--muted); font-size: 11px; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
+  #sessions td { cursor: default; } #sessions tbody tr:hover td { background: none; }
+  #sessions td { vertical-align: top; max-width: 220px; } #sessions td .small { display: block; overflow: hidden; text-overflow: ellipsis; }
+  #sessions td.force { overflow: visible; white-space: normal; max-width: none; min-width: 230px; }
+  #sessions select, #sessions input[type=text] { padding: 3px 6px; font-size: 12px; max-width: 200px; }
+  #sessions input[type=text] { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .forced { color: var(--warn); font-weight: 600; }
+  .subhead { font-size: 12px; color: var(--muted); margin: 16px 0 8px; }
+  .provider-card .card-head > .dot { background: var(--c); flex: none; }
+  .provider-card .name { word-break: normal; white-space: nowrap; }
+  .tiles { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr); gap: 8px; }
+  .tiles div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .tiles strong { font-size: 15px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -143,14 +158,20 @@
     <div class="panel" id="triggers"><div class="skeleton">Loading triggers…</div></div>
   </div>
 
-  <h2>Accounts <span class="muted" style="text-transform:none;letter-spacing:0">in fallback order</span></h2>
+  <h2>Accounts &amp; providers</h2>
+  <div class="subhead">Fallback order for Claude models: a session starts on its own account (or the preferred one), then walks this list. Drag a card or use the arrows.</div>
   <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
+  <div class="subhead">Other backends: used when one of their models is requested, or from a Failover chain above</div>
+  <div class="grid" id="provider-cards"><div class="skeleton">Loading providers…</div></div>
 
   <h2>Activity</h2>
   <div class="row" style="margin-bottom:10px">
     <div class="seg" id="range"><button data-h="1">1h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button></div>
   </div>
   <div class="stats" id="stats"><div class="panel skeleton">Loading activity…</div></div>
+
+  <h2>Sessions <span class="muted" style="text-transform:none;letter-spacing:0" id="sessions-note">Claude Code sessions seen in recent traffic</span></h2>
+  <div class="panel scroll" style="padding:0" id="sessions"><div class="skeleton">Loading sessions…</div></div>
 
   <h2>Requests</h2>
   <div class="row" style="margin-bottom:10px">
@@ -166,7 +187,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const WINDOW = {five_hour: "5 hours", seven_day: "7 days", seven_day_opus: "7d Opus", seven_day_sonnet: "7d Sonnet"};
-let state = null, hours = 24, saving = false;
+let state = null, hours = 24, saving = false, sessions = null;
 
 async function api(path, body) {
   const res = await fetch(path, body ? {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)} : {});
@@ -234,38 +255,136 @@ function meter(name, w) {
     <div class="small muted" style="margin:-6px 0 0 72px">${esc(until(w.resets_at))}</div>`;
 }
 
+// One list in the order a Claude-model request tries things: the accounts (the `order`) interleaved with the
+// other backends of the `claude` failover chain, where `accounts:N` stands for the next N enabled accounts.
+const LISTED_BACKENDS = ["codex", "cursor"];
+function fallbackItems() {
+  const accounts = state.accounts, items = [];
+  let next = 0;
+  const take = (n) => {
+    for (let taken = 0; next < accounts.length && taken < n; next++) {
+      if (!accounts[next].disabled) taken++;
+      items.push({a: accounts[next]});
+    }
+  };
+  const chain = chainOf("claude");
+  for (const t of chain) {
+    const n = t === "accounts" ? Infinity : /^accounts:\d+$/.test(t) ? +t.slice(9) : null;
+    n === null ? items.push({target: t}) : take(n);
+  }
+  take(Infinity);
+  LISTED_BACKENDS.filter((t) => !chain.includes(t)).forEach((t) => items.push({target: t, off: true}));
+  return items;
+}
+function saveItems(items) {
+  const runs = [];
+  for (const x of items.filter((x) => !x.off)) {
+    if (!x.a) runs.push(x.target);
+    else if (typeof runs.at(-1) === "number") runs[runs.length - 1] += x.a.disabled ? 0 : 1;
+    else runs.push(x.a.disabled ? 0 : 1);
+  }
+  const lastRun = runs.findLastIndex((r) => typeof r === "number" && r > 0);
+  const chain = runs.flatMap((r, i) => typeof r !== "number" ? [r] : i === lastRun ? ["accounts"] : r ? [`accounts:${r}`] : []);
+  if (lastRun < 0) chain.unshift("accounts");
+  const f = failover();
+  if (JSON.stringify(chain) === JSON.stringify(state.default_chains.claude)) delete f.chains.claude;
+  else f.chains.claude = chain;
+  save({order: items.filter((x) => x.a).map((x) => x.a.alias), fallback: f});
+}
+
+function accountBody(a) {
+  const windows = Object.entries(a.usage);
+  return `${a.email && a.email !== a.alias ? `<div class="small muted">${esc(a.alias)}</div>` : ""}
+      ${windows.length ? windows.map(([n, w]) => meter(n, w)).join("") : `<div class="small muted">${a.error ? "usage unavailable: " + esc(a.error) : a.token_only ? "no replies recorded yet; usage appears after its first one" : "no usage reported"}</div>`}
+      ${windows.length && a.usage_at ? `<div class="small muted">from its last reply, ${ago(a.usage_at)} ago</div>` : ""}`;
+}
+
 function renderAccounts() {
-  const b = state.balance, list = state.accounts, disabled = list.filter((a) => a.disabled).map((a) => a.alias);
-  const threshold = state.fallback.threshold ?? null;
-  $("accounts").innerHTML = list.map((a, i) => {
-    const preferred = b.strategy === "prefer" && b.prefer === a.alias;
-    const windows = Object.entries(a.usage);
-    return `<div class="card ${a.disabled ? "off" : ""} ${preferred ? "pref" : ""}">
+  const b = state.balance, threshold = state.fallback.threshold ?? null, items = fallbackItems();
+  const live = items.filter((x) => !x.off).length;
+  let rank = 0;
+  $("accounts").innerHTML = items.map((x, i) => {
+    const a = x.a, off = x.off || a?.disabled, n = x.off ? null : ++rank;
+    if (!a) {
+      const provider = providerOf(x.target, "claude");
+      return `<div class="card provider-card p-${esc(provider || "none")} ${off ? "off" : ""}" data-i="${i}" data-target="${esc(x.target)}" data-provider="${esc(provider || "")}">
       <div class="card-head">
+        ${off ? "" : `<span class="handle" role="img" aria-label="Drag to reorder ${esc(targetLabel(x.target, "claude"))}" title="Drag to reorder (or use the arrows)">⠿</span>`}
+        <span class="dot"></span><span class="name">${esc(PROVIDER[x.target] || x.target)}</span><span class="spacer"></span>
+        <span class="badge">${esc(LISTED_BACKENDS.includes(x.target) ? "same tier as the requested Claude model" : "exact model")}</span>
+      </div>
+      ${provider && PROVIDER[provider] && provider !== "anthropic" ? providerBody(provider, true) : ""}
+      <div class="card-foot">
+        <span class="small muted">${off ? "off: Claude-model requests never fall back to it" : `#${n} of ${live}`}</span><span class="spacer"></span>
+        ${off ? "" : `<button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>
+        <button data-down="${i}" ${n === live ? "disabled" : ""} title="Try later">↓</button>`}
+        <label class="switch" title="${off ? "Off: never tried" : "In the fallback order"}"><input type="checkbox" data-backend="${i}" ${off ? "" : "checked"}><span></span></label>
+      </div></div>`;
+    }
+    const preferred = b.strategy === "prefer" && b.prefer === a.alias;
+    const windows = Object.values(a.usage);
+    return `<div class="card ${off ? "off" : ""} ${preferred ? "pref" : ""}" data-i="${i}">
+      <div class="card-head">
+        <span class="handle" role="img" aria-label="Drag to reorder ${esc(a.email || a.alias)}" title="Drag to reorder (or use the arrows)">⠿</span>
         <span class="name">${esc(a.email || a.alias)}</span><span class="spacer"></span>
-        ${preferred ? `<span class="badge accent">preferred</span>` : ""}
-        ${threshold != null && windows.some(([, w]) => w.utilization >= threshold) ? `<span class="badge" style="color:var(--warn)" title="At or above the ${threshold}% usage threshold: tried after every other account">tried last</span>` : ""}
+        ${preferred ? `<span class="badge accent" title="New sessions start on this account">preferred</span>`
+          : a.disabled ? "" : `<button class="small" data-prefer="${esc(a.alias)}" title="Start every new session on this account">Make preferred</button>`}
+        ${threshold != null && windows.some((w) => w.utilization >= threshold) ? `<span class="badge" style="color:var(--warn)" title="At or above the ${threshold}% usage threshold: tried after every other account">tried last</span>` : ""}
         ${a.plan ? `<span class="badge">${esc(a.plan)}</span>` : ""}
         ${a.token_only ? `<span class="badge" title="claude setup-token: model calls only, no usage or profile API">setup-token</span>` : ""}
       </div>
-      ${a.email && a.email !== a.alias ? `<div class="small muted">${esc(a.alias)}</div>` : ""}
-      ${windows.length ? windows.map(([n, w]) => meter(n, w)).join("") : `<div class="small muted">${a.error ? "usage unavailable: " + esc(a.error) : a.token_only ? "no replies recorded yet; usage appears after its first one" : "no usage reported"}</div>`}
-      ${windows.length && a.usage_at ? `<div class="small muted">from its last reply, ${ago(a.usage_at)} ago</div>` : ""}
+      ${accountBody(a)}
       <div class="card-foot">
-        <span class="small muted">#${i + 1} · slot ${esc(a.slot)}</span><span class="spacer"></span>
+        <span class="small muted">${off ? "off: never tried" : `#${n} of ${live}`} · Claude slot ${esc(a.slot)}</span><span class="spacer"></span>
         <button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>
-        <button data-down="${i}" ${i === list.length - 1 ? "disabled" : ""} title="Try later">↓</button>
+        <button data-down="${i}" ${n === live || i === items.length - 1 ? "disabled" : ""} title="Try later">↓</button>
         <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>
       </div></div>`;
   }).join("");
-  const order = list.map((a) => a.alias);
-  const move = (i, j) => { [order[i], order[j]] = [order[j], order[i]]; save({order}); };
-  $("accounts").querySelectorAll("[data-up]").forEach((x) => x.onclick = () => move(+x.dataset.up, +x.dataset.up - 1));
-  $("accounts").querySelectorAll("[data-down]").forEach((x) => x.onclick = () => move(+x.dataset.down, +x.dataset.down + 1));
+  const moveTo = (from, to) => { const next = [...items], [moved] = next.splice(from, 1); next.splice(to, 0, moved); saveItems(next); };
+  // Pointer drag works for mouse and touch alike. A mouse drags from anywhere on the card except its controls;
+  // touch drags only from the handle, so the page still scrolls. Drops save like the arrows and re-render from
+  // the server's reply, never optimistically.
+  const cards = [...$("accounts").querySelectorAll(".card")];
+  let drag = null;
+  const targetAt = (e) => { const c = document.elementFromPoint(e.clientX, e.clientY)?.closest("#accounts .card"); return c && !items[+c.dataset.i].off ? c : null; };
+  cards.forEach((card) => {
+    const i = +card.dataset.i;
+    if (items[i].off) return;
+    card.onpointerdown = (e) => {
+      if (e.button !== 0 || e.target.closest("button, input, label, a, select")) return;
+      if (e.pointerType !== "mouse" && !e.target.closest(".handle")) return;
+      e.preventDefault();
+      drag = {from: i, x: e.clientX, y: e.clientY, moving: false};
+      try { card.setPointerCapture(e.pointerId); } catch { /* a synthetic pointer has nothing to capture */ }
+    };
+    card.onpointermove = (e) => {
+      if (drag?.from !== i || (!drag.moving && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 6)) return;
+      drag.moving = true; card.classList.add("dragging");
+      const over = targetAt(e);
+      cards.forEach((c) => c.classList.toggle("over", c === over && c !== card));
+    };
+    const end = (e, drop) => {
+      if (drag?.from !== i) return;
+      const over = drop && drag.moving ? targetAt(e) : null, to = over ? +over.dataset.i : i;
+      drag = null; cards.forEach((c) => c.classList.remove("over", "dragging"));
+      if (to !== i) moveTo(i, to);
+    };
+    card.onpointerup = (e) => end(e, true);
+    card.onpointercancel = (e) => end(e, false);
+  });
+  $("accounts").querySelectorAll("[data-up]").forEach((x) => x.onclick = () => moveTo(+x.dataset.up, +x.dataset.up - 1));
+  $("accounts").querySelectorAll("[data-down]").forEach((x) => x.onclick = () => moveTo(+x.dataset.down, +x.dataset.down + 1));
+  $("accounts").querySelectorAll("[data-prefer]").forEach((x) => x.onclick = () => save({balance: {strategy: "prefer", prefer: x.dataset.prefer}}));
   $("accounts").querySelectorAll("[data-alias]").forEach((x) => x.onchange = () => {
-    const off = new Set(disabled);
+    const off = new Set(state.accounts.filter((a) => a.disabled).map((a) => a.alias));
     x.checked ? off.delete(x.dataset.alias) : off.add(x.dataset.alias);
     save({disabled: [...off]});
+  });
+  $("accounts").querySelectorAll("[data-backend]").forEach((x) => x.onchange = () => {
+    const i = +x.dataset.backend, next = items.filter((_, j) => j !== i);
+    next.splice(x.checked ? live : next.length, 0, {target: items[i].target, off: !x.checked});
+    saveItems(next);
   });
 }
 
@@ -330,21 +449,22 @@ const PROVIDER = {anthropic: "Claude", codex: "Codex", cursor: "Cursor API", "cu
                   gemini: "Gemini", kimi: "Kimi", grok: "Grok"};
 const TRIGGERS = [["rate_limit", "Rate limited (429)", "Quota used up: try the next target, skip this one until it resets"],
                   ["auth", "Login rejected (401)", "A Claude account's login failed: skip it for a minute"],
-                  ["server_error", "Server error (5xx)", "Backend down or overloaded: try the next target right away"]];
+                  ["server_error", "Server error (5xx)", "Backend down or overloaded: try the next target right away"],
+                  ["model_unavailable", "Model not on this account (404)", "Try the same model on the next Claude account without disabling this account"]];
 const TIERED = ["claude", "codex", "cursor"];
 // The target that serves a family's own request untouched ("accounts" for Claude).
 const own = (family) => family === "claude" ? "accounts" : family;
 
 function failover() {
   const f = state.fallback || {};
-  return {chains: {...(f.chains || {})}, on: {rate_limit: true, auth: true, server_error: false, ...(f.on || {})},
+  return {chains: {...(f.chains || {})}, on: {rate_limit: true, auth: true, server_error: false, model_unavailable: true, ...(f.on || {})},
           threshold: f.threshold ?? null};
 }
 function chainOf(family) {
   return (state.fallback.chains || {})[family] ?? state.default_chains[family] ?? [own(family)];
 }
 function providerOf(target, family) {
-  if (target === "accounts") return "anthropic";
+  if (target === "accounts" || /^accounts:\d+$/.test(target)) return "anthropic";
   if (target === family) return family;
   if (target === "codex" || target === "cursor") return target;
   const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(target));
@@ -352,6 +472,7 @@ function providerOf(target, family) {
 }
 function targetLabel(target, family) {
   if (target === "accounts") return family === "claude" ? "Claude accounts · as requested" : "Claude accounts · same tier";
+  if (/^accounts:\d+$/.test(target)) return `next ${target.slice(9)} Claude account${target.slice(9) === "1" ? "" : "s"}`;
   if (target === family) return "as requested";
   return {codex: "Codex · same tier", cursor: "Cursor · same tier"}[target] || target;
 }
@@ -367,6 +488,61 @@ function renderProviders() {
   $("providers").innerHTML = Object.entries(p.models).map(([name, ids]) => `<span class="provider ${ids.length ? "" : "off"}" title="${esc(ids.join("\n") || "not signed in on the proxy host")}">
       <span class="dot ${ids.length ? "ok" : ""}"></span><strong>${esc(PROVIDER[name] || name)}</strong>
       <span class="small muted">${ids.length ? `${ids.length} model${ids.length === 1 ? "" : "s"}` : "unavailable"}</span></span>`).join("");
+}
+
+// No vendor quota reaches the dashboard for these backends, so a card says so instead of drawing a meter.
+const QUOTA = {codex: "no Codex CLI login found on the dashboard host",
+               cursor: "this backend may use its own Cursor login; cursor-agent's quota is on the cursor-agent CLI card",
+               "cursor-cli": "no readable cursor-agent login on the dashboard host",
+               gemini: "gemini-web-api exposes no quota", kimi: "Kimi reports no quota through the router",
+               grok: "Grok reports no quota through the router"};
+const ESTIMATED = {gemini: "gemini-web-api reports no usage, so token counts are the router's estimate"};
+const compact = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+function chainSpots(provider, skip) {
+  return FAMILIES.filter(([family]) => family !== skip).flatMap(([family, title]) => {
+    const chain = chainOf(family), i = chain.findIndex((t) => providerOf(t, family) === provider);
+    return i < 0 ? [] : [`#${i + 1} of ${chain.length} for ${title}`];
+  });
+}
+function providerUsage(u, r) {
+  // A missing provider_usage (no traffic database, or an older server) is unknown, never zero.
+  if (!u) return `<div class="small muted">Traffic recording is off: usage unknown.</div>`;
+  const tokens = r.tokens_reported
+    ? `<div><span class="small muted">Tokens in / cached / out</span><strong>${compact(r.tokens.input)} / ${compact(r.tokens.cache_read)} / ${compact(r.tokens.output)}</strong></div>`
+    : `<div><span class="small muted">Tokens</span><strong class="muted">${r.requests ? "not reported" : "none"}</strong></div>`;
+  const notes = [u.tokens_capped && "tokens from the newest replies only", ESTIMATED[r.name]].filter(Boolean);
+  return `<div class="tiles">
+      <div><span class="small muted">Answered</span><strong>${r.requests.toLocaleString()}</strong></div>
+      <div><span class="small muted">Failed</span><strong class="${r.errors ? "status-bad" : ""}">${r.errors.toLocaleString()}</strong></div>${tokens}</div>
+    <div class="small muted">${r.last_at ? `last answered ${ago(r.last_at)} ago · ${esc(r.last_model)} · HTTP ${esc(r.last_status ?? "…")}` : `no model calls answered in the last ${u.hours} h`}</div>
+    <div class="small muted">Recorded by the ${esc(u.source)}, last ${u.hours} h, as of ${esc(new Date(u.at * 1000).toLocaleTimeString())}${notes.length ? "; " + esc(notes.join("; ")) : ""}.</div>`;
+}
+// A vendor-reported quota snapshot; a meter only when the vendor gave both used and limit.
+function providerQuota(name, q) {
+  if (!q || q.error || !(q.windows || []).length) {
+    return `<div class="small"><strong>Quota: unknown.</strong> <span class="muted">${esc(q?.error || QUOTA[name])}</span></div>`;
+  }
+  return q.windows.map((w) => w.used != null && w.limit
+      ? meter(w.label, {utilization: w.used / w.limit * 100, resets_at: w.resets_at}) + (w.unit === "%" ? "" :
+        `<div class="small muted" style="margin:-4px 0 0 72px">${esc(w.used)} of ${esc(w.limit)} ${esc(w.unit || "")} used</div>`)
+      : `<div class="small"><span class="muted">${esc(w.label)}</span> ${w.used != null ? `${esc(w.used)} ${esc(w.unit || "")} used, limit not reported` : "unknown"}</div>`).join("") +
+    `<div class="small muted">${q.note ? esc(q.note) + ". " : ""}Quota from ${esc(q.source)}, as of ${esc(new Date(q.at * 1000).toLocaleTimeString())}.</div>`;
+}
+function renderProviderCards() {
+  const p = state.providers, u = state.provider_usage ?? null;
+  $("provider-cards").innerHTML = Object.keys(PROVIDER).filter((name) => name !== "anthropic" && !LISTED_BACKENDS.includes(name)).map((name) =>
+    `<div class="card provider-card p-${esc(name)}" data-provider="${esc(name)}">
+      <div class="card-head"><span class="dot"></span><span class="name">${esc(PROVIDER[name])}</span></div>
+      ${providerBody(name)}</div>`).join("");
+}
+function providerBody(name, listed = false) {
+  const p = state.providers, u = state.provider_usage ?? null, ids = p.models[name] || [], spots = chainSpots(name, listed && "claude");
+  const [dot, status] = !p.reachable ? ["", "availability unknown: router unreachable"]
+    : ids.length ? ["ok", `signed in · ${ids.length} model${ids.length === 1 ? "" : "s"}`] : ["bad", "unavailable on the proxy host"];
+  return `<div class="small"><span title="${esc(ids.join("\n"))}"><span class="dot ${dot}" style="display:inline-block;width:6px;height:6px"></span> ${esc(status)}</span></div>
+      <div class="small">${spots.length ? `Failover: ${esc(spots.join(" · "))}` : `<span class="muted">${listed ? "In no other failover chain." : "In no failover chain: used only when one of its models is requested."}</span>`}</div>
+      ${providerUsage(u, u && {name, ...u.providers[name]})}
+      ${providerQuota(name, (state.provider_quota || {})[name])}`;
 }
 
 function addOptions(family) {
@@ -433,14 +609,99 @@ function renderTriggers() {
   $("th").onchange = (e) => saveFailover((f) => { f.threshold = +e.target.value; });
 }
 
-function render() { renderHeader(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); }
+const home = (path) => (path || "-").replace(/^\/(home|Users)\/[^/]+/, "~");
+// Equivalent tiers across vendors, so switching a session's provider keeps its weight class.
+const TIER_KEYS = [["opus", "sol"], ["fable", "astra"], ["sonnet", "haiku", "luna"]];
+function providerOfModel(model) {
+  if (!model) return "";
+  const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(model));
+  return hit ? hit[0] : model.startsWith("claude-") ? "anthropic" : model.startsWith("gemini-") ? "gemini" : "";
+}
+function sameTier(provider, model) {
+  if (model && providerOfModel(model) === provider) return model;
+  const newest = (a, b) => b.localeCompare(a, undefined, {numeric: true});
+  const ids = [...(state.providers.models[provider] || [])].sort(newest), m = (model || "").toLowerCase();
+  const keys = TIER_KEYS.find((k) => k.some((key) => m.includes(key)));
+  const plain = (id) => !/fast|low|spark|-mini/.test(id);
+  return (keys && (ids.find((id) => plain(id) && keys.some((k) => id.includes(k))) || ids.find((id) => keys.some((k) => id.includes(k)))))
+    || ids.find(plain) || ids[0] || "";
+}
+function providerOptions(current) {
+  return Object.entries(state.providers.models).filter(([, ids]) => ids.length).map(([name]) =>
+    `<option value="${esc(name)}" ${name === current ? "selected" : ""}>${esc(PROVIDER[name] || name)}</option>`).join("");
+}
+function modelOptions(provider, current) {
+  const ids = state.providers.models[provider] || [];
+  return ids.map((id) => `<option ${id === current ? "selected" : ""}>${esc(id)}</option>`).join("") +
+    `<option value="exact" ${current && !ids.includes(current) ? "selected" : ""}>exact model id…</option>`;
+}
+function remoteLinks(s) {
+  if (!sessions.remote_links) return "";
+  const r = s.remote;
+  if (!r) return `<span class="small muted">${esc(sessions.remote_links.error || "no Remote Control session found")}</span>`;
+  return `<span class="small"><a href="${esc(r.cchq)}" target="_blank" rel="noopener">cchq</a> · ${r.claude
+    ? `<a href="${esc(r.claude)}" target="_blank" rel="noopener">claude.ai</a>` : `<span class="muted" title="HQ has not mirrored this session to claude.ai">no claude.ai link</span>`}</span>`;
+}
+
+function renderSessions() {
+  // Both the settings (model list, overrides) and the session list must have arrived before anything is shown,
+  // and a refresh never replaces the table while someone is choosing or typing a model in it.
+  if (!state || !sessions || $("sessions").contains(document.activeElement) && document.activeElement.matches("select, input")) return;
+  const forced = state.session_models || {};
+  $("sessions-note").textContent = `seen in the last ${sessions.days} days (newest ${sessions.limit}); seen is not proof a session is still running. A forced model replaces the session's own model on the proxy from its next request; Clear goes back to what the session asks for.`;
+  const rows = sessions.sessions.filter((s) => s.last_seen != null || forced[s.session_id]);
+  if (!rows.length) {
+    $("sessions").innerHTML = `<div class="skeleton">${sessions.traffic_db ? "No sessions in recent traffic." : "Traffic recording is off, so no sessions are known."}</div>`;
+    return;
+  }
+  $("sessions").innerHTML = `<table><thead><tr><th>Session</th><th>Last seen</th><th>Where</th><th>Model asked · answered by</th>
+    <th>Forced model</th></tr></thead><tbody>
+    ${rows.map((s) => {
+      const model = forced[s.session_id], asked = model || s.requested_model;
+      const provider = providerOfModel(asked) || Object.keys(state.providers.models).find((n) => state.providers.models[n].length) || "";
+      const pickModel = sameTier(provider, asked);
+      return `<tr data-sid="${esc(s.session_id)}" data-asked="${esc(s.requested_model || "")}"><td title="${esc(s.session_id)}"><span class="mono">${esc(s.session_id.slice(0, 8))}</span>${remoteLinks(s)}</td>
+      <td title="${s.last_seen ? esc(new Date(s.last_seen * 1000).toLocaleString()) : ""}">${s.last_seen ? `${ago(s.last_seen)} ago<span class="small muted">${s.requests} req</span>` : "not seen recently"}</td>
+      <td title="${esc(s.cwd)}">${esc([s.user, s.host].filter(Boolean).join("@") || "-")}<span class="small muted">${esc(home(s.cwd))}</span></td>
+      <td>${esc(s.requested_model || "-")}<span class="small ${s.status >= 400 ? "status-bad" : "muted"}">${esc(s.served_by || (s.status ? `HTTP ${s.status}` : "-"))}</span></td>
+      <td class="force"><div class="row" style="gap:6px;flex-wrap:wrap">
+        ${model ? `<span class="forced" title="Proxy override">${esc(model)}</span>` : `<span class="muted">none</span>`}
+        <select data-provider title="Provider">${providerOptions(provider)}</select>
+        <select data-pick title="Model">${modelOptions(provider, pickModel)}</select>
+        <input type="text" data-exact placeholder="exact model id" value="${esc(pickModel || "")}" hidden>
+        <button data-force>Force</button>
+        <button data-clear ${model ? "" : "disabled"}>Clear</button></div></td></tr>`;
+    }).join("")}</tbody></table>`;
+  $("sessions").querySelectorAll("tr[data-sid]").forEach((tr) => {
+    const sid = tr.dataset.sid, pick = tr.querySelector("[data-pick]"), exact = tr.querySelector("[data-exact]");
+    const showExact = () => { exact.hidden = pick.value !== "exact"; };
+    showExact();
+    pick.onchange = showExact;
+    tr.querySelector("[data-provider]").onchange = (e) => {
+      pick.innerHTML = modelOptions(e.target.value, sameTier(e.target.value, tr.dataset.asked));
+      showExact();
+    };
+    tr.querySelector("[data-force]").onclick = () => {
+      const model = pick.value === "exact" ? exact.value.trim() : pick.value;
+      if (model) save({session_models: {[sid]: model}}); else showError("Choose a model or type an exact model id first.");
+    };
+    tr.querySelector("[data-clear]").onclick = () => save({session_models: {[sid]: null}});
+  });
+}
+
+async function loadSessions() {
+  try { sessions = await api("/api/sessions"); renderSessions(); }
+  catch (e) { showError(e); }
+}
+
+function render() { renderHeader(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
 
 async function loadState() {
   try { state = await api("/api/state"); render(); showError(null); }
   catch (e) { showError(e); }
 }
 
-$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); };
+$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); loadSessions(); };
 $("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
   $("range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
   hours = +b.dataset.h; loadStats();
@@ -448,9 +709,9 @@ $("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
 let typing;
 $("q").oninput = () => { clearTimeout(typing); typing = setTimeout(loadTraffic, 250); };
 $("inference").onchange = loadTraffic;
-loadState(); loadStats(); loadTraffic();
+loadState(); loadStats(); loadTraffic(); loadSessions();
 setInterval(loadState, 60000);
-setInterval(() => { loadStats(); loadTraffic(); }, 15000);
+setInterval(() => { loadStats(); loadTraffic(); loadSessions(); }, 15000);
 </script>
 </body>
 </html>

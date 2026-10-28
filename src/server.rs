@@ -53,6 +53,42 @@ use uuid::Uuid;
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+/// A dashboard-forced model for this session, set only by `scripts/account_inject.py`
+/// (which strips any client copy) and removed here before logging or relaying.
+const SESSION_MODEL_HEADER: &str = "x-claude-codex-session-model";
+
+fn is_thread_continue(body: &crate::anthropic::schema::MessagesRequest) -> bool {
+    body.extra
+        .get("thread")
+        .and_then(|thread| thread.get("type"))
+        == Some(&json!("continue"))
+}
+
+/// Applies a forced session model to the parsed body and the raw passthrough bytes.
+/// Returns `Err` for a thread delta, which must not continue under another model.
+fn apply_session_model(
+    body: &mut crate::anthropic::schema::MessagesRequest,
+    raw: &mut axum::body::Bytes,
+    forced: &str,
+    count_tokens: bool,
+) -> Result<bool, ()> {
+    let forced = normalize_incoming_model(forced);
+    let requested = body.model.as_deref().map(normalize_incoming_model);
+    if requested.as_deref() == Some(forced.as_str()) {
+        return Ok(false);
+    }
+    if !count_tokens && is_thread_continue(body) {
+        return Err(());
+    }
+    let mut value: Value = serde_json::from_slice(raw).map_err(|_| ())?;
+    value
+        .as_object_mut()
+        .ok_or(())?
+        .insert("model".into(), json!(&forced));
+    *raw = serde_json::to_vec(&value).map_err(|_| ())?.into();
+    body.model = Some(forced);
+    Ok(true)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -349,9 +385,11 @@ async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
-    let mut data: Vec<Value> = state
-        .registry
-        .all_supported_models()
+    let registry = state.registry.clone();
+    let models = tokio::task::spawn_blocking(move || registry.all_supported_models())
+        .await
+        .unwrap_or_default();
+    let mut data: Vec<Value> = models
         .into_iter()
         .map(|(model, provider)| {
             json!({
@@ -1418,6 +1456,10 @@ async fn dispatch_request(
     let uri = req.uri().clone();
     let mut headers = req.headers().clone();
     let account_pool = crate::fallback::take_pool(&mut headers);
+    let forced_model = headers
+        .remove(SESSION_MODEL_HEADER)
+        .and_then(|value| value.to_str().ok().map(str::to_string))
+        .filter(|model| !model.is_empty());
     let conversation_identity = (!count_tokens)
         .then(|| ConversationIdentity::from_headers(&headers))
         .flatten();
@@ -1530,6 +1572,23 @@ async fn dispatch_request(
             return response;
         }
     };
+
+    let mut body_bytes = body_bytes;
+    if let Some(forced) = forced_model.as_deref() {
+        let requested = body.model.clone();
+        match apply_session_model(&mut body, &mut body_bytes, forced, count_tokens) {
+            Ok(true) => log.info(
+                "session model override",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(&req_id)),
+                    ("requestedModel".to_string(), json!(requested)),
+                    ("overrideModel".to_string(), json!(&body.model)),
+                ])),
+            ),
+            Ok(false) => {}
+            Err(()) => return thread_unsupported_response(),
+        }
+    }
 
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
@@ -1675,14 +1734,7 @@ async fn dispatch_request(
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
 
-    if !count_tokens
-        && !provider.supports_message_threads()
-        && body
-            .extra
-            .get("thread")
-            .and_then(|thread| thread.get("type"))
-            == Some(&json!("continue"))
-    {
+    if !count_tokens && !provider.supports_message_threads() && is_thread_continue(&body) {
         return thread_unsupported_response();
     }
 
@@ -1780,9 +1832,8 @@ async fn dispatch_request(
         auto_review_route.is_none()
             && crate::fallback::handles(provider.name(), &normalized_model, &pool.policy)
     });
-    let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
-    } else if let Some(pool) = fallback_pool {
+    let used_fallback = fallback_pool.is_some();
+    let mut response = if let Some(pool) = fallback_pool {
         crate::fallback::dispatch(
             &state.registry,
             provider.clone(),
@@ -1792,8 +1843,11 @@ async fn dispatch_request(
             pool,
             &log,
             thread_unsupported_response,
+            count_tokens,
         )
         .await
+    } else if count_tokens {
+        provider.handle_count_tokens(body, context).await
     } else {
         provider
             .handle_messages_with_conversation_identity(
@@ -1807,6 +1861,14 @@ async fn dispatch_request(
             )
             .await
     };
+    if !used_fallback && provider.name() != "anthropic" {
+        let served = format!("{}/{normalized_model}", provider.name());
+        if let Ok(value) = http::HeaderValue::from_str(&served) {
+            response
+                .headers_mut()
+                .insert(crate::fallback::SERVED_BY_HEADER, value);
+        }
+    }
     log_request_completed(
         &log,
         RequestLogContext {

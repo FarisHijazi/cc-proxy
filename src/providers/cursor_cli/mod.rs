@@ -92,7 +92,7 @@ impl Provider for CursorCliProvider {
     /// The CLI has to be there to spawn. Whether it is signed in is left to the
     /// run itself — asking would cost a subprocess every time models are listed.
     fn availability(&self) -> crate::provider::Availability {
-        if process::binary_is_runnable(&crate::config::cursor_cli_binary()) {
+        if process::binary_is_runnable(&process::cursor_agent_binary()) {
             crate::provider::Availability::Ready
         } else {
             crate::provider::Availability::unavailable(
@@ -428,7 +428,7 @@ impl CliHandlers for CursorCliCli {
     }
 
     fn status(&self) -> anyhow::Result<()> {
-        let binary = crate::config::cursor_cli_binary();
+        let binary = process::cursor_agent_binary();
         println!("Binary: {binary}");
         let output = std::process::Command::new(&binary)
             .arg("status")
@@ -457,8 +457,6 @@ impl CliHandlers for CursorCliCli {
         if let Some(workspace) = crate::config::cursor_cli_workspace() {
             println!("Workspace: {workspace}");
         }
-        // Printed here rather than advertised over /v1/models: there are a few
-        // hundred, and any of them works as `cursor-cli:<model>`.
         let discovered = models::discover_models();
         println!(
             "Models ({}): use any as cursor-cli:<model>",

@@ -69,8 +69,8 @@ impl Registry {
             "gemini".into(),
             GEMINI_MODELS.iter().map(|m| (*m).to_string()).collect(),
         );
-        // Discovered from `cursor-agent --list-models`, so this list reflects
-        // whatever the installed CLI actually offers.
+        // Bare selectors only; `all_supported_models` adds the per-model ids
+        // from `cursor-agent --list-models` for `/v1/models`, never at startup.
         models.insert(
             "cursor-cli".into(),
             crate::providers::cursor_cli::models::supported_models(),
@@ -175,10 +175,17 @@ impl Registry {
             .collect()
     }
 
+    /// The full `/v1/models` listing, including every `cursor-cli:<id>` the
+    /// signed-in CLI offers. That can spawn `cursor-agent`, so async callers
+    /// run it on a blocking thread. The grouped summaries stay static.
     pub fn all_supported_models(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for provider in self.listable_providers() {
-            for model in self.supported_models_for(&provider) {
+            let mut models = self.supported_models_for(&provider);
+            if provider == "cursor-cli" {
+                models.extend(crate::providers::cursor_cli::models::discovered_model_ids());
+            }
+            for model in models {
                 out.push((model, provider.clone()));
             }
         }

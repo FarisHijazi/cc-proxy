@@ -291,10 +291,9 @@ def test_empty_credential_pool_still_reaches_inference_routing(monkeypatch):
 
 def test_pool_is_only_for_inference_and_never_taken_from_the_client(monkeypatch):
     inject = addon(monkeypatch, [])
-    for path in ("/v1/messages/count_tokens?beta=true", "/api/oauth/usage"):
-        flow = inference("Bearer proxy-account-personal", path)
-        inject.requestheaders(flow)
-        assert module.POOL_HEADER not in flow.request.headers, path
+    flow = inference("Bearer proxy-account-personal", "/api/oauth/usage")
+    inject.requestheaders(flow)
+    assert module.POOL_HEADER not in flow.request.headers
     for authorization in ("Bearer own-real-token", "Bearer proxy-account-personal"):
         flow = inference(authorization, "/api/oauth/profile", pool='[{"alias":"x","authorization":"Bearer stolen"}]')
         inject.requestheaders(flow)
@@ -548,3 +547,18 @@ def test_fallback_section_is_read_and_a_bad_threshold_is_refused(monkeypatch, tm
     path.write_text(json.dumps({"accounts": {"a": 1}, "fallback": {"threshold": 150}}))
     with pytest.raises(ValueError):
         inject.read_accounts(path)
+
+
+def test_counts_carry_the_same_pool_as_messages(monkeypatch):
+    """A model one login lacks 404s its count too, so counts fall back like messages."""
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2"}
+    pools = []
+    for path in ("/v1/messages?beta=true", "/v1/messages/count_tokens?beta=true"):
+        flow = inference("Bearer proxy-account-b", path, pool='[{"alias":"x","authorization":"Bearer stolen"}]')
+        inject.requestheaders(flow)
+        assert flow.request.headers["authorization"] == "Bearer real-2"
+        assert flow.metadata["account_pool"] is True
+        pools.append(json.loads(flow.request.headers[module.POOL_HEADER]))
+    assert pools[0] == pools[1]
+    assert [entry["alias"] for entry in pools[1]] == ["b", "a"]

@@ -56,10 +56,12 @@ def test_invalid_settings_are_refused_and_nothing_is_written(tmp_path, change):
 def test_failover_settings_are_saved_and_cleared(tmp_path):
     board, accounts = dashboard(tmp_path)
     fallback = {"chains": {"claude": ["accounts", " gemini-3-pro "], "gemini": ["gemini", "accounts"]},
-                "on": {"rate_limit": True, "auth": True, "server_error": True}, "threshold": 90}
+                "on": {"rate_limit": True, "auth": True, "server_error": True, "model_unavailable": True}, "threshold": 90}
     saved = board.update({"fallback": fallback})
     assert saved["fallback"]["chains"]["claude"] == ["accounts", "gemini-3-pro"]
     assert saved["fallback"]["threshold"] == 90 and saved["fallback"]["on"]["server_error"] is True
+    assert saved["fallback"]["on"]["model_unavailable"] is True
+    assert board.update({"fallback": {"on": {"model_unavailable": False}}})["fallback"]["on"]["model_unavailable"] is False
     assert "threshold" not in board.update({"fallback": {**fallback, "threshold": None}})["fallback"]
     assert "fallback" not in board.update({"fallback": None})
     assert list(json.loads(accounts.read_text())["accounts"]) == ["a", "b"]

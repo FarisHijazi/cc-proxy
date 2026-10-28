@@ -6,8 +6,10 @@
 //! chain for its model family. Without a configured chain, a Claude model tries each
 //! account in order, then the Codex equivalent, then Cursor, and a Codex model tries
 //! Codex, then the Claude equivalent on each account, then Cursor. A 429 or
-//! Claude-account 401 moves on before output (5xx too when enabled). Nothing is
-//! replayed after the client saw a token.
+//! Claude-account 401 moves on before output, as does an account answering 404 for
+//! a model it does not offer (5xx too when enabled). Nothing is
+//! replayed after the client saw a token. Token counts walk only the same model
+//! across the accounts, with the same triggers and no cooldowns.
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::Logger;
@@ -44,6 +46,8 @@ pub struct Triggers {
     pub rate_limit: bool,
     pub auth: bool,
     pub server_error: bool,
+    /// A Claude account answering 404 for the model (another plan may offer it).
+    pub model_unavailable: bool,
 }
 
 impl Default for Triggers {
@@ -52,6 +56,7 @@ impl Default for Triggers {
             rate_limit: true,
             auth: true,
             server_error: false,
+            model_unavailable: true,
         }
     }
 }
@@ -136,10 +141,22 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
     };
     let tier = tier(model);
     let mut steps = Vec::new();
+    let mut next_account = 0;
     for target in targets {
+        if let Some(count) = account_count(target, accounts) {
+            let model = if family == "claude" {
+                Some(model.to_string())
+            } else {
+                tier.map(|t| t.claude.to_string())
+            };
+            let end = (next_account + count).min(accounts);
+            if let Some(model) = model {
+                steps.extend((next_account..end).map(|index| Step::Account(index, model.clone())));
+            }
+            next_account = end;
+            continue;
+        }
         let substitute = match target {
-            "accounts" if family == "claude" => Some(model.to_string()),
-            "accounts" => tier.map(|t| t.claude.to_string()),
             own if own == family => {
                 steps.push(Step::Original);
                 continue;
@@ -151,13 +168,23 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
         let Some(substitute) = substitute else {
             continue;
         };
-        if target == "accounts" || substitute.starts_with("claude-") {
+        if substitute.starts_with("claude-") {
             steps.extend((0..accounts).map(|index| Step::Account(index, substitute.clone())));
         } else {
             steps.push(Step::Substitute(substitute));
         }
     }
     steps
+}
+
+/// `accounts` takes every Claude account not yet in the chain; `accounts:N` the next N in pool order,
+/// so another backend can sit between accounts while the session's own account stays first.
+fn account_count(target: &str, accounts: usize) -> Option<usize> {
+    match target.strip_prefix("accounts") {
+        Some("") => Some(accounts),
+        Some(rest) => rest.strip_prefix(':')?.parse().ok(),
+        None => None,
+    }
 }
 
 /// Whether the chain does anything beyond serving the request as routed.
@@ -256,6 +283,8 @@ fn note(log: &Logger, req_id: &str, requested: &str, served: &str) {
 }
 
 /// Serve a request from the first account or backend in its tier with quota left.
+/// A token count (`count_tokens`) tries only the requested model on each account:
+/// counts are model-specific, and their limits must not cool messages down.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     registry: &Registry,
@@ -269,13 +298,21 @@ pub async fn dispatch(
     }: Pool,
     log: &Logger,
     thread_unsupported: fn() -> Response,
+    count_tokens: bool,
 ) -> Response {
     let requested = body.model.clone().unwrap_or_default();
     let threaded = is_thread_continue(&body);
     let anthropic = registry.provider_for_model(TIERS[0].claude, None);
     let mut rejection: Option<Response> = None;
+    let mut skipped_cooling = false;
 
-    let steps = chain(provider.name(), &requested, pool.len(), &policy);
+    let mut steps = chain(provider.name(), &requested, pool.len(), &policy);
+    if count_tokens {
+        steps.retain(|step| matches!(step, Step::Account(_, model) if *model == requested));
+        if steps.is_empty() {
+            return provider.handle_count_tokens(body, ctx).await;
+        }
+    }
     let last = steps.len().saturating_sub(1);
     for (position, step) in steps.into_iter().enumerate() {
         let (owner, model, target, attempt_body) = match &step {
@@ -311,7 +348,8 @@ pub async fn dispatch(
                 (target.name().to_string(), model.clone(), target, substitute)
             }
         };
-        if registry.cooldowns.cooling(&owner, &model) {
+        if !count_tokens && registry.cooldowns.cooling(&owner, &model) {
+            skipped_cooling = true;
             continue;
         }
         let first_choice = matches!(step, Step::Original)
@@ -319,6 +357,9 @@ pub async fn dispatch(
         // Thread state lives with the account that started it. Anything else gets
         // the full conversation, which Claude Code resends on this refusal.
         if threaded && !first_choice {
+            if count_tokens {
+                break;
+            }
             return thread_unsupported();
         }
         let mut attempt = ctx.clone();
@@ -338,14 +379,19 @@ pub async fn dispatch(
             }
         }
         // Only the chain's final option may wait out its provider's own retries.
-        let response = crate::retry::fail_fast(
-            position < last,
-            target.handle_messages_with_conversation_identity(
-                attempt_body,
-                attempt,
-                identity.clone(),
-            ),
-        )
+        let response = crate::retry::fail_fast(position < last, async {
+            if count_tokens {
+                target.handle_count_tokens(attempt_body, attempt).await
+            } else {
+                target
+                    .handle_messages_with_conversation_identity(
+                        attempt_body,
+                        attempt,
+                        identity.clone(),
+                    )
+                    .await
+            }
+        })
         .await;
         let status = response.status();
         let quota = status == StatusCode::TOO_MANY_REQUESTS && policy.on.rate_limit;
@@ -353,7 +399,10 @@ pub async fn dispatch(
             && status == StatusCode::UNAUTHORIZED
             && policy.on.auth;
         let server_error = status.is_server_error() && policy.on.server_error;
-        if !quota && !credential_rejected && !server_error {
+        let unavailable = matches!(step, Step::Account(_, _))
+            && status == StatusCode::NOT_FOUND
+            && policy.on.model_unavailable;
+        if !quota && !credential_rejected && !server_error && !unavailable {
             let served = format!("{owner}/{model}");
             if !first_choice && response.status().is_success() {
                 note(log, &ctx.req_id, &requested, &served);
@@ -365,22 +414,29 @@ pub async fn dispatch(
             }
             return response;
         }
-        // A server error is transient: try the next target now, the same one next time.
-        if !server_error {
+        // Model access can change without a reset header. Only quota/auth failures cool down.
+        if !count_tokens && !server_error && !unavailable {
             registry
                 .cooldowns
                 .record_rejection(&owner, &model, response.headers());
         }
-        rejection.get_or_insert(response);
+        // Lack of model access must not hide a usable account's quota/auth failure.
+        if rejection.as_ref().is_none_or(|prior| {
+            prior.status() == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND
+        }) {
+            rejection = Some(response);
+        }
     }
 
-    rejection.unwrap_or_else(|| {
-        crate::anthropic::json_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "Every Claude account and fallback provider is rate limited",
-        )
-    })
+    rejection
+        .filter(|response| response.status() != StatusCode::NOT_FOUND || !skipped_cooling)
+        .unwrap_or_else(|| {
+            crate::anthropic::json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Every Claude account and fallback provider is rate limited",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -439,6 +495,42 @@ mod tests {
         assert_eq!(
             default_chain("anthropic", "claude-unknown", 1),
             [Step::Account(0, "claude-unknown".into())]
+        );
+    }
+
+    #[test]
+    fn other_backends_can_sit_between_claude_accounts() {
+        let policy: Policy = serde_json::from_value(json!({"chains": {
+            "claude": ["accounts:1", "codex", "accounts:1", "cursor", "accounts"],
+            "codex": ["codex", "accounts:5", "cursor", "accounts"],
+        }}))
+        .unwrap();
+        let opus = |i| Step::Account(i, "claude-opus-5-5".into());
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 3, &policy),
+            [
+                opus(0),
+                sub("gpt-6.1-sol"),
+                opus(1),
+                sub("cursor:claude-opus-5"),
+                opus(2)
+            ]
+        );
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 2, &policy),
+            [
+                Step::Original,
+                opus(0),
+                opus(1),
+                sub("cursor:claude-opus-5")
+            ]
+        );
+        let bad: Policy =
+            serde_json::from_value(json!({"chains": {"claude": ["accounts:x", "accountsy"]}}))
+                .unwrap();
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &bad),
+            [sub("accounts:x"), sub("accountsy")]
         );
     }
 
