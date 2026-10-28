@@ -18,21 +18,34 @@ officially supported interface; endpoints and headers can change without notice.
 from __future__ import annotations
 
 import json
+import os
+from contextlib import closing
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable, Iterator, Optional
+from email.utils import parsedate_to_datetime
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 import httpx
 
 from ._version import __version__
 from .credentials import (
+    CLAUDE_AI_BASE_URL,
+    ENV_TRUSTED_DEVICE_TOKEN,
+    OAUTH_BETA,
+    AuthSource,
     CredentialsError,
     OAuthCredentials,
-    load_credentials,
     load_org_uuid,
+    org_uuid_from_profile,
     refresh_credentials,
+    resolve_auth,
 )
+from .environments import EnvironmentsMixin
+from .files import FilesMixin
+from .interaction import InteractionMixin
+from .lifecycle import LifecycleMixin
+from .triggers import TriggersMixin
 from .events import (
     RC,
     Event,
@@ -47,9 +60,16 @@ from .events import (
 from .sse import parse_sse
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
-# Beta headers observed in the CLI. The /v1/code/* paths need none; CCR_BETA rides
-# only the CLI's older /v1/sessions compat path for the same sessions.
+# Beta headers. The CLI sends none on /v1/code/*, but the claude.ai web app sends
+# CCR_BETA on every /v1/code/* call (HAR 2026-10-28), so the web header set
+# carries it; the CLI also uses it on the older /v1/sessions compat path.
 CCR_BETA = "ccr-byoc-2025-07-29"
+# Scheduled tasks ("routines") under /v1/code/triggers.
+TRIGGERS_BETA = "ccr-triggers-2026-01-30"
+# File uploads (Files API with an OAuth bearer).
+FILES_BETAS = ("files-api-2025-04-14", OAUTH_BETA)
+# The web app's `anthropic-client-feature` on /v1/code/* (HAR 2026-10-28).
+CLIENT_FEATURE = "ccr"
 MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 ANTHROPIC_VERSION = "2023-06-01"
 # anthropic-client-platform value the claude.ai web app sends. Since Claude Code
@@ -64,6 +84,15 @@ ANTHROPIC_VERSION = "2023-06-01"
 CLIENT_PLATFORM = "web_claude_ai"
 USER_AGENT = f"claude-rc-api-python/{__version__}"
 
+# Retries (spec §9): idempotent requests retry transient failures (network,
+# 5xx) after 2/4/8/16 s; a 429 is retried for any method (it was not accepted),
+# honouring `retry-after` up to _MAX_RETRY_AFTER. A non-idempotent POST that
+# failed in flight is never resent — it may already be stored.
+_MAX_RETRIES = 4
+_RETRY_BASE = 2.0
+_MAX_RETRY_AFTER = 60.0
+_IDEMPOTENT = frozenset({"GET", "HEAD", "OPTIONS"})
+
 # Waiting for a control verdict: the history page size each poll scans, and how
 # far the poll interval backs off for slow verdicts (a side question can take
 # minutes).
@@ -73,6 +102,89 @@ _MAX_POLL_INTERVAL = 2.0
 
 def _backoff_sleep(attempt: int, base: float = 0.5, cap: float = 30.0) -> None:
     time.sleep(min(cap, base * (2 ** (attempt - 1))))
+
+
+def _retry_delay(attempt: int, resp: httpx.Response | None = None) -> float:
+    """Seconds before retry ``attempt`` (1-based): the server's ``retry-after``
+    when it gave one (seconds or HTTP date, capped), else 2/4/8/16 s."""
+    header = resp.headers.get("retry-after") if resp is not None else None
+    if header:
+        try:
+            return max(0.0, min(_MAX_RETRY_AFTER, float(header)))
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(header)
+                return max(0.0, min(_MAX_RETRY_AFTER, when.timestamp() - time.time()))
+            except (TypeError, ValueError):
+                pass
+    return _RETRY_BASE * (2 ** (attempt - 1))
+
+
+def _dedupe(items: Iterable[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for item in items:
+        for part in str(item).split(","):
+            if part.strip():
+                seen.setdefault(part.strip(), None)
+    return list(seen)
+
+
+def build_headers(
+    *,
+    token: str | None = None,
+    session_key: str | None = None,
+    org_uuid: str | None = None,
+    web: bool = True,
+    betas: Sequence[str] = (),
+    client_platform: str | None = None,
+    trusted_device_token: str | None = None,
+    json_body: bool = True,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The one header set every RemoteControlClient request uses.
+
+    ``web=True`` (the default) is what claude.ai/code sends on every
+    ``/v1/code/*`` call: ``anthropic-version``, ``anthropic-beta:
+    ccr-byoc-2025-07-29`` (+ ``betas``), ``anthropic-client-platform:
+    web_claude_ai`` (what makes a worker treat a message as a human's, spec
+    §8), ``anthropic-client-feature: ccr``. ``web=False`` is the bare OAuth set
+    (``/api/oauth/profile``): no platform, feature or CCR beta — only ``betas``.
+    Auth is ``Authorization: Bearer`` or, with ``session_key``, the claude.ai
+    ``sessionKey`` cookie. ``x-organization-uuid`` rides when ``org_uuid`` is
+    given. ``json_body=False`` leaves ``Content-Type`` to httpx (multipart).
+    ``extra`` is applied last and wins.
+    """
+    h: dict[str, str] = {"anthropic-version": ANTHROPIC_VERSION, "User-Agent": USER_AGENT}
+    if session_key is not None:
+        h["Cookie"] = f"sessionKey={session_key}"
+    elif token is not None:
+        h["Authorization"] = f"Bearer {token}"
+    if json_body:
+        h["Content-Type"] = "application/json"
+    beta = _dedupe([CCR_BETA, *betas] if web else betas)
+    if beta:
+        h["anthropic-beta"] = ",".join(beta)
+    if web or client_platform:
+        h["anthropic-client-platform"] = client_platform or CLIENT_PLATFORM
+    if web:
+        h["anthropic-client-feature"] = CLIENT_FEATURE
+    if org_uuid:
+        h["x-organization-uuid"] = org_uuid
+    if trusted_device_token:
+        h["X-Trusted-Device-Token"] = trusted_device_token
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _parse(resp: httpx.Response) -> Any:
+    """A checked response's body: JSON, else text, ``None`` when empty."""
+    if resp.status_code == 204 or not resp.content:
+        return None
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return resp.text
 
 
 def _ack_sequence(ack: Any) -> Optional[int]:
@@ -94,11 +206,34 @@ def _unwrap_session(body: Any) -> Any:
 
 
 class APIError(RuntimeError):
+    """A non-accepted HTTP status. ``error`` is the Anthropic error envelope's
+    ``error`` object when the body was one (``{type, message, resource?,
+    sub_reason?, …}``, spec §9), else ``{}``."""
+
     def __init__(self, status: int, body: str, request_id: Optional[str] = None):
         self.status = status
         self.body = body
         self.request_id = request_id
         super().__init__(f"HTTP {status}{f' [{request_id}]' if request_id else ''}: {body[:300]}")
+
+    @property
+    def error(self) -> dict:
+        try:
+            parsed = json.loads(self.body)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        err = parsed.get("error") if isinstance(parsed, dict) else None
+        return err if isinstance(err, dict) else {}
+
+    @property
+    def error_type(self) -> Optional[str]:
+        """``error.type``, e.g. ``session_not_active`` (409 on a send)."""
+        return self.error.get("type")
+
+    @property
+    def resource(self) -> Optional[str]:
+        """``error.resource``, e.g. ``untrusted_device`` / ``session_stale_relogin`` (403)."""
+        return self.error.get("resource")
 
 
 class ControlRejected(RuntimeError):
@@ -122,11 +257,16 @@ class ControlTimeout(TimeoutError):
 # ---------------------------------------------------------------------------
 # OAuth (Remote Control) client
 # ---------------------------------------------------------------------------
-class RemoteControlClient:
+class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, InteractionMixin, FilesMixin):
     """Controller-side client for Remote Control sessions (``/v1/code/sessions``).
 
     This plays the same role as the browser at claude.ai/code: it does not run
     Claude, it *steers* a session that is running on someone's machine.
+
+    Every HTTP call goes through :meth:`_send` (headers from
+    :func:`build_headers`, 401 recovery, §9 retries, :class:`APIError`);
+    :meth:`_request` is the same call returning the parsed body. Feature
+    groups live in the mixins this class inherits.
     """
 
     def __init__(
@@ -134,24 +274,48 @@ class RemoteControlClient:
         credentials: OAuthCredentials | None = None,
         org_uuid: str | None = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
+        token: str | None = None,
+        session_key: str | None = None,
+        cswap_slot: str | int | None = None,
+        auth: AuthSource | None = None,
+        base_url: str | None = None,
+        transport: httpx.BaseTransport | None = None,
         credentials_path: str | None = None,
         config_path: str | None = None,
         auto_refresh: bool = True,
         persist_refresh: bool = True,
         client_id: str | None = None,
+        client_platform: str = CLIENT_PLATFORM,
         timeout: float = 30.0,
     ):
-        self.base_url = base_url.rstrip("/")
-        self._creds = credentials or load_credentials(credentials_path)
+        """Credentials come from :func:`~claude_rc.credentials.resolve_auth`
+        (``credentials`` / ``token`` / ``session_key`` / ``cswap_slot``, then the
+        environment, then ``~/.claude/.credentials.json``), or ``auth`` as
+        resolved. ``base_url`` defaults to ``https://api.anthropic.com``, or
+        ``https://claude.ai`` under cookie auth. ``transport`` replaces httpx's
+        network transport (``httpx.MockTransport`` in tests). The org UUID is
+        ``org_uuid``, else env / ``~/.claude.json``, else looked up from
+        ``/api/oauth/profile`` on first use (:attr:`org_uuid`)."""
+        self._auth = auth or resolve_auth(
+            token,
+            credentials=credentials,
+            session_key=session_key,
+            cswap_slot=cswap_slot,
+            credentials_path=credentials_path,
+        )
+        self._creds = self._auth.credentials
+        default_base = CLAUDE_AI_BASE_URL if self._auth.is_cookie else DEFAULT_BASE_URL
+        self.base_url = (base_url or default_base).rstrip("/")
         self._creds_path = credentials_path
         self._org_uuid = org_uuid or load_org_uuid(config_path)
+        self._org_looked_up = bool(self._org_uuid)
         self._auto_refresh = auto_refresh
         self._persist_refresh = persist_refresh
+        self.client_platform = client_platform
         # A stable per-instance id for presence, like the web client.
         self.client_id = client_id or str(uuid.uuid4())
-        self._http = httpx.Client(timeout=httpx.Timeout(timeout, read=timeout))
-        self._refresher = httpx.Client(timeout=30.0)
+        self._http = httpx.Client(timeout=httpx.Timeout(timeout, read=timeout), transport=transport)
+        self._refresher = httpx.Client(timeout=30.0, transport=transport)
 
     # -- context management ------------------------------------------------
     def __enter__(self) -> "RemoteControlClient":
@@ -166,18 +330,19 @@ class RemoteControlClient:
 
     # -- auth --------------------------------------------------------------
     def _reload_credentials(self) -> bool:
-        """Re-read the credentials file; ``True`` if it held different tokens.
+        """Re-read the credential source; ``True`` if it held different tokens.
 
         Tokens are rotated *in place* by whichever process refreshes first (the
-        Claude Code CLI itself, another client of this library, …), and a
+        Claude Code CLI itself, another client of this library, cswap …), and a
         refresh token is single-use — once someone else has spent ours, the
-        disk copy is the only valid one. A long-lived client must therefore
-        treat the file, not its memory, as the source of truth. No-op when the
-        credentials didn't come from a file (env var / explicit object)."""
-        if not self._creds.source_path:
+        source is the only valid copy. A long-lived client must therefore
+        treat the file (or cswap slot), not its memory, as the source of truth.
+        No-op when there is nothing to re-read (env var / explicit token)."""
+        reload = self._auth.reload
+        if reload is None or self._creds is None:
             return False
         try:
-            fresh = load_credentials(self._creds_path)
+            fresh = reload()
         except CredentialsError:
             return False
         if (
@@ -185,18 +350,23 @@ class RemoteControlClient:
             and fresh.refresh_token == self._creds.refresh_token
         ):
             return False
-        self._creds = fresh
+        self._creds = self._auth.credentials = fresh
         return True
 
+    def _refresh(self) -> None:
+        self._creds = self._auth.credentials = refresh_credentials(
+            self._creds, persist=self._persist_refresh, client=self._refresher
+        )
+
     def _token(self) -> str:
+        if self._creds is None:
+            raise CredentialsError("cookie-authenticated client has no bearer token")
         if self._auto_refresh and self._creds.is_expired():
-            # Prefer the disk copy: another process may already have rotated
+            # Prefer the source copy: another process may already have rotated
             # the tokens, which invalidated our (single-use) refresh token.
             if not self._reload_credentials() or self._creds.is_expired():
                 try:
-                    self._creds = refresh_credentials(
-                        self._creds, persist=self._persist_refresh, client=self._refresher
-                    )
+                    self._refresh()
                 except CredentialsError:
                     # Our refresh token was already spent (invalid_grant) —
                     # someone else may have written fresh tokens meanwhile.
@@ -204,60 +374,185 @@ class RemoteControlClient:
                         raise
         return self._creds.access_token
 
-    def _headers(self, extra: dict | None = None) -> dict:
-        h = {
-            "Authorization": f"Bearer {self._token()}",
-            "Content-Type": "application/json",
-            "anthropic-version": ANTHROPIC_VERSION,
-            "anthropic-client-platform": CLIENT_PLATFORM,
-            "User-Agent": USER_AGENT,
-        }
-        if self._org_uuid:
-            h["x-organization-uuid"] = self._org_uuid
-        if self._creds.trusted_device_token:
-            h["X-Trusted-Device-Token"] = self._creds.trusted_device_token
-        if extra:
-            h.update(extra)
-        return h
+    def _renew_after_401(self) -> bool:
+        """Recover from a 401 once, mirroring the CLI's bridge client: fresh
+        tokens at the source (rotated by another process) win; otherwise spend
+        our refresh token. ``False`` when nothing changed (cookie / bare token)."""
+        if not self._auto_refresh or self._creds is None:
+            return False
+        if self._reload_credentials():
+            return True
+        if not self._creds.refresh_token:
+            return False
+        try:
+            self._refresh()
+            return True
+        except CredentialsError:
+            if self._reload_credentials():
+                return True
+            raise
 
-    def _url(self, *parts: str) -> str:
-        tail = "/".join(str(p).strip("/") for p in parts if p != "")
-        return f"{self.base_url}/v1/code/sessions" + (f"/{tail}" if tail else "")
-
-    # -- low-level request with one 401->refresh retry ---------------------
-    def _request(self, method: str, url: str, **kw) -> httpx.Response:
-        resp = self._http.request(method, url, headers=self._headers(kw.pop("extra_headers", None)), **kw)
-        if resp.status_code == 401 and self._auto_refresh:
-            # Recover and retry once, mirroring the CLI's bridge client. Fresh
-            # tokens on disk (rotated by another process) win; otherwise spend
-            # our refresh token.
-            renewed = self._reload_credentials()
-            if not renewed and self._creds.refresh_token:
-                try:
-                    self._creds = refresh_credentials(
-                        self._creds, persist=self._persist_refresh, client=self._refresher
+    @property
+    def org_uuid(self) -> Optional[str]:
+        """The organization UUID for ``x-organization-uuid``: explicit, env
+        (``CLAUDE_AI_ORG_UUID`` / ``CLAUDE_RC_ORG_UUID``), ``~/.claude.json``,
+        else fetched once and cached — ``GET /api/oauth/profile``
+        (``organization.uuid``, needs ``user:profile``) for a bearer, or
+        ``GET /api/organizations`` (first entry's ``uuid``; **unverified**
+        shape) under cookie auth. ``None`` when the lookup fails."""
+        if not self._org_looked_up:
+            self._org_looked_up = True
+            try:
+                if self._auth.is_cookie:
+                    body = self._request("GET", "/api/organizations", org=False, web=False)
+                    first = body[0] if isinstance(body, list) and body else {}
+                    self._org_uuid = first.get("uuid") if isinstance(first, dict) else None
+                else:
+                    body = self._request(
+                        "GET", "/api/oauth/profile", org=False, web=False,
+                        headers={"Cache-Control": "no-cache"},
                     )
-                    renewed = True
-                except CredentialsError:
-                    renewed = self._reload_credentials()
-                    if not renewed:
-                        raise
-            if renewed:
-                resp = self._http.request(method, url, headers=self._headers(), **kw)
-        return resp
+                    self._org_uuid = org_uuid_from_profile(body)
+            except (APIError, CredentialsError, httpx.HTTPError):
+                self._org_uuid = None
+        return self._org_uuid
+
+    def _headers(
+        self,
+        extra: Mapping[str, str] | None = None,
+        *,
+        web: bool = True,
+        betas: Sequence[str] = (),
+        client_platform: str | None = None,
+        org: bool = True,
+        json_body: bool = True,
+    ) -> dict:
+        """Headers for one request under the given route policy (see
+        :meth:`_send`); also what a websocket upgrade (TTS) should send."""
+        trusted = (self._creds.trusted_device_token if self._creds else None) or os.environ.get(
+            ENV_TRUSTED_DEVICE_TOKEN
+        )
+        return build_headers(
+            token=None if self._auth.is_cookie else self._token(),
+            session_key=self._auth.session_key,
+            org_uuid=self.org_uuid if org else None,
+            web=web,
+            betas=betas,
+            client_platform=client_platform or (self.client_platform if web else None),
+            trusted_device_token=trusted,
+            json_body=json_body,
+            extra=extra,
+        )
+
+    def _path(self, *parts: Any) -> str:
+        """``/v1/code/sessions[/part…]`` — the path form :meth:`_send` takes."""
+        tail = "/".join(str(p).strip("/") for p in parts if p != "")
+        return "/v1/code/sessions" + (f"/{tail}" if tail else "")
+
+    def _url(self, *parts: Any) -> str:
+        """Absolute URL of :meth:`_path` (kept for callers of 0.3.0)."""
+        return self.base_url + self._path(*parts)
+
+    def _abs(self, path: str) -> str:
+        return path if path.startswith(("http://", "https://")) else self.base_url + "/" + path.lstrip("/")
+
+    # -- the narrow waist ---------------------------------------------------
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        content: bytes | str | None = None,
+        data: Mapping[str, Any] | None = None,
+        files: Any = None,
+        headers: Mapping[str, str] | None = None,
+        web: bool = True,
+        betas: Sequence[str] = (),
+        client_platform: str | None = None,
+        org: bool = True,
+        accept: Sequence[int] = (200, 201, 204),
+        retry: bool | None = None,
+        stream: bool = False,
+        timeout: httpx.Timeout | float | None = None,
+    ) -> httpx.Response:
+        """Send one request; the only place this client touches HTTP.
+
+        ``path`` is relative to :attr:`base_url` (``/v1/code/...``) or an
+        absolute URL. Route policy: ``web`` / ``betas`` / ``client_platform`` /
+        ``org`` pick the headers (:func:`build_headers`); ``headers`` adds or
+        overrides. Bodies: ``json``, or ``content`` / ``data`` / ``files``
+        (multipart — pass bytes, not file objects, so a retry can resend).
+
+        A 401 triggers one credential renewal and resend. A 429 is retried for
+        any method; network errors and 5xx only when ``retry`` (default: GET /
+        HEAD / OPTIONS). Any status outside ``accept`` raises :class:`APIError`.
+        With ``stream=True`` the body is left unread: iterate it, then close the
+        response (``with contextlib.closing(client._send(..., stream=True)) as resp:``).
+        """
+        method = method.upper()
+        idempotent = method in _IDEMPOTENT if retry is None else retry
+        json_body = files is None and data is None and content is None
+        attempt = 0
+        renewed = False
+        while True:
+            request = self._http.build_request(
+                method,
+                self._abs(path),
+                params=params,
+                json=json,
+                content=content,
+                data=data,
+                files=files,
+                headers=self._headers(
+                    headers, web=web, betas=betas, client_platform=client_platform, org=org, json_body=json_body
+                ),
+                **({"timeout": timeout} if timeout is not None else {}),
+            )
+            try:
+                resp = self._http.send(request, stream=stream)
+            except httpx.TransportError:
+                if not idempotent or attempt >= _MAX_RETRIES:
+                    raise
+                attempt += 1
+                time.sleep(_retry_delay(attempt))
+                continue
+            status = resp.status_code
+            again = None
+            if status == 401 and not renewed and self._renew_after_401():
+                renewed, again = True, 0.0
+            elif status == 429 and attempt < _MAX_RETRIES:
+                attempt += 1
+                again = _retry_delay(attempt, resp)
+            elif status >= 500 and idempotent and attempt < _MAX_RETRIES:
+                attempt += 1
+                again = _retry_delay(attempt, resp)
+            if again is not None:
+                resp.close()
+                if again:
+                    time.sleep(again)
+                continue
+            if status not in accept:
+                body = resp.read().decode(errors="replace") if stream else resp.text
+                resp.close()
+                rid = resp.headers.get("request-id") or resp.headers.get("x-request-id")
+                raise APIError(status, body, rid)
+            return resp
+
+    def _request(self, method: str, path: str, **kw: Any) -> Any:
+        """:meth:`_send` (same arguments), returning the parsed body: JSON,
+        else text, ``None`` when empty."""
+        return _parse(self._send(method, path, **kw))
 
     @staticmethod
     def _ok(resp: httpx.Response, *accept: int) -> Any:
+        """Check-and-parse for an already received response (0.3.0 helper)."""
         accepted = accept or (200, 201, 204)
         if resp.status_code not in accepted:
             rid = resp.headers.get("request-id") or resp.headers.get("x-request-id")
             raise APIError(resp.status_code, resp.text, rid)
-        if resp.status_code == 204 or not resp.content:
-            return None
-        try:
-            return resp.json()
-        except json.JSONDecodeError:
-            return resp.text
+        return _parse(resp)
 
     # -- sessions ----------------------------------------------------------
     def list_sessions(self, *, limit: int | None = None, cursor: str | None = None) -> dict:
@@ -269,7 +564,7 @@ class RemoteControlClient:
             params["limit"] = limit
         if cursor is not None:
             params["cursor"] = cursor
-        return self._ok(self._request("GET", self._url(), params=params))
+        return self._request("GET", self._path(), params=params)
 
     def sessions(self, **kw) -> list[dict]:
         """Convenience: just the list of session objects from :meth:`list_sessions`."""
@@ -284,12 +579,12 @@ class RemoteControlClient:
     def get_session(self, session_id: str) -> dict:
         """``GET /v1/code/sessions/{id}`` — the session object (unwrapped from the
         ``response_shape`` envelope the endpoint returns)."""
-        return _unwrap_session(self._ok(self._request("GET", self._url(session_id))))
+        return _unwrap_session(self._request("GET", self._path(session_id)))
 
     def update_session(self, session_id: str, **fields: Any) -> dict:
         """``PUT /v1/code/sessions/{id}`` — change ``title``, or ``add_tags`` /
         ``remove_tags``. Returns the updated session."""
-        return _unwrap_session(self._ok(self._request("PUT", self._url(session_id), json=fields)))
+        return _unwrap_session(self._request("PUT", self._path(session_id), json=fields))
 
     def rename_session(self, session_id: str, title: str) -> dict:
         """Retitle a session where every controller's list shows it (a connected
@@ -298,11 +593,8 @@ class RemoteControlClient:
 
     def archive_session(self, session_id: str) -> bool:
         """``POST /v1/code/sessions/{id}/archive`` — end/hide a session. 409 = already archived."""
-        resp = self._request("POST", self._url(session_id, "archive"), json={})
-        if resp.status_code in (200, 409):
-            return True
-        self._ok(resp)  # raises
-        return False
+        self._send("POST", self._path(session_id, "archive"), json={}, accept=(200, 201, 204, 409))
+        return True
 
     # -- sending events (steering) ----------------------------------------
     def send_events(self, session_id: str, events: Iterable[dict]) -> dict:
@@ -318,7 +610,7 @@ class RemoteControlClient:
                 e = {**e, "uuid": str(uuid.uuid4())}
             wrapped.append({"payload": e})
         body = {"session_id": session_id, "events": wrapped}
-        return self._ok(self._request("POST", self._url(session_id, "events"), json=body), 200, 201)
+        return self._request("POST", self._path(session_id, "events"), json=body, accept=(200, 201))
 
     def send_message(self, session_id: str, text: str, *, message_uuid: str | None = None) -> dict:
         """Send a user message (Claude Code stream-json ``user`` event) — what you
@@ -589,12 +881,20 @@ class RemoteControlClient:
         task reports ``task_notification`` with ``status: stopped``."""
         self.request_control(session_id, "stop_task", task_id=task_id, timeout=timeout)
 
-    def mark_read(self, session_id: str, up_to_sequence_num: int | None = None) -> Any:
-        """``POST /v1/code/sessions/{id}/mark_read`` — mark the session read."""
-        body = {}
+    def mark_read(
+        self, session_id: str, up_to_sequence_num: int | None = None, *, event_id: str | None = None
+    ) -> Any:
+        """``POST /v1/code/sessions/{id}/mark_read`` — mark the session read.
+
+        The web app sends ``{event_id}`` (the newest event's uuid) and gets
+        ``{unread: false}`` (HAR 2026-10-28); ``up_to_sequence_num`` sends the
+        0.3.0 ``{sequence_num}`` form instead (unverified)."""
+        body: dict[str, Any] = {}
+        if event_id is not None:
+            body["event_id"] = event_id
         if up_to_sequence_num is not None:
             body["sequence_num"] = up_to_sequence_num
-        return self._ok(self._request("POST", self._url(session_id, "mark_read"), json=body), 200, 204)
+        return self._request("POST", self._path(session_id, "mark_read"), json=body, accept=(200, 204))
 
     # -- reading events: polling ------------------------------------------
     def list_events(
@@ -619,7 +919,7 @@ class RemoteControlClient:
             params["sort_order"] = sort_order
         if cursor is not None:
             params["cursor"] = cursor
-        body = self._ok(self._request("GET", self._url(session_id, "events"), params=params))
+        body = self._request("GET", self._path(session_id, "events"), params=params)
         rows = body if isinstance(body, list) else body.get("data") or body.get("events") or []
         return [Event.from_wire(r) for r in rows]
 
@@ -649,18 +949,14 @@ class RemoteControlClient:
         attempts = 0
         while True:
             params: dict[str, Any] = {"from_sequence_num": last_seq}
-            headers = self._headers({"Accept": "text/event-stream"})
+            headers = {"Accept": "text/event-stream"}
             if last_seq:
                 headers["Last-Event-ID"] = str(last_seq)
-            url = self._url(session_id, "events", "stream")
             try:
-                with self._http.stream(
-                    "GET", url, headers=headers, params=params,
-                    timeout=httpx.Timeout(30.0, read=None),
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = resp.read().decode(errors="replace")
-                        raise APIError(resp.status_code, body, resp.headers.get("request-id"))
+                with closing(self._send(
+                    "GET", self._path(session_id, "events", "stream"), headers=headers, params=params,
+                    accept=(200,), retry=False, stream=True, timeout=httpx.Timeout(30.0, read=None),
+                )) as resp:
                     attempts = 0
                     for frame in parse_sse(resp.iter_lines()):
                         if frame.is_heartbeat:
@@ -709,7 +1005,7 @@ class RemoteControlClient:
                 "client_id": self.client_id,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
             }
-        self._ok(self._request("POST", self._url(session_id, "client", "presence"), json=payload), 200, 204)
+        self._request("POST", self._path(session_id, "client", "presence"), json=payload, accept=(200, 204))
 
     # -- high-level convenience -------------------------------------------
     def send_and_collect(

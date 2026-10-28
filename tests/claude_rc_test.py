@@ -495,21 +495,18 @@ def test_initialize_merges_pending_prompts(monkeypatch):
 
 
 def test_session_reads_and_updates_are_unwrapped(monkeypatch):
-    import httpx
-
     rc = _bare_rc()
     seen = []
 
-    def fake_request(method, url, **kw):
-        seen.append((method, url, kw.get("json")))
-        body = {"response_shape": {"id": "cse_x", "title": "a"}} if method == "GET" else {"session": {"id": "cse_x", "title": "b"}}
-        return httpx.Response(200, json=body)
+    # `_request` takes a base-relative path and returns the parsed body.
+    def fake_request(method, path, **kw):
+        seen.append((method, path, kw.get("json")))
+        return {"response_shape": {"id": "cse_x", "title": "a"}} if method == "GET" else {"session": {"id": "cse_x", "title": "b"}}
 
     monkeypatch.setattr(rc, "_request", fake_request)
-    rc.base_url = "https://api.example"
     assert rc.get_session("cse_x") == {"id": "cse_x", "title": "a"}
     assert rc.rename_session("cse_x", "b") == {"id": "cse_x", "title": "b"}
-    assert seen[1] == ("PUT", "https://api.example/v1/code/sessions/cse_x", {"title": "b"})
+    assert seen[1] == ("PUT", "/v1/code/sessions/cse_x", {"title": "b"})
 
 
 def test_send_message_message_uuid(monkeypatch):

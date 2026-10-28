@@ -19,12 +19,14 @@ All of the constants below were reverse-engineered from the CLI binary:
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -36,14 +38,38 @@ OAUTH_BETA = "oauth-2025-04-20"
 # The CLI's own refresh User-Agent, for parity.
 OAUTH_USER_AGENT = "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
 
+# Import-time snapshots kept for compatibility; lookups use the functions below,
+# which follow ``$HOME`` at call time.
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".claude.json"
 
+# The claude.ai origin: serves the same ``/v1/code/*`` routes to a browser's
+# ``sessionKey`` cookie (plus ``/api/organizations/...`` web routes).
+CLAUDE_AI_BASE_URL = "https://claude.ai"
+
 # Environment overrides (handy in CI / other machines).
+ENV_CLAUDE_AI_ACCESS_TOKEN = "CLAUDE_AI_ACCESS_TOKEN"
 ENV_ACCESS_TOKEN = "CLAUDE_RC_ACCESS_TOKEN"
+ENV_CLAUDE_AI_ORG_UUID = "CLAUDE_AI_ORG_UUID"
 ENV_ORG_UUID = "CLAUDE_RC_ORG_UUID"
 # The CLI's own env override for a bare access token.
 ENV_CLI_OAUTH_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
+# A claude.ai browser ``sessionKey`` cookie; selects cookie auth on claude.ai.
+ENV_SESSION_KEY = "CLAUDE_AI_SESSION_KEY"
+# A claude-swap (cswap) slot whose stored login to borrow (access token only).
+ENV_CSWAP_SLOT = "CLAUDE_RC_CSWAP_SLOT"
+# The CLI's trusted-device override (orgs that enforce Trusted Devices).
+ENV_TRUSTED_DEVICE_TOKEN = "CLAUDE_TRUSTED_DEVICE_TOKEN"
+
+
+def default_credentials_path() -> Path:
+    """``~/.claude/.credentials.json`` under the current ``$HOME``."""
+    return Path.home() / ".claude" / ".credentials.json"
+
+
+def default_config_path() -> Path:
+    """``~/.claude.json`` under the current ``$HOME``."""
+    return Path.home() / ".claude.json"
 
 
 def _now_ms() -> int:
@@ -119,7 +145,7 @@ def load_credentials(path: os.PathLike | str | None = None) -> OAuthCredentials:
     if env_token:
         return OAuthCredentials(access_token=env_token)
 
-    p = Path(path) if path else DEFAULT_CREDENTIALS_PATH
+    p = Path(path) if path else default_credentials_path()
     if not p.exists():
         raise CredentialsError(
             f"credentials file not found at {p}. Run `claude` and `/login` first, "
@@ -144,15 +170,19 @@ def load_credentials(path: os.PathLike | str | None = None) -> OAuthCredentials:
 
 
 def load_org_uuid(config_path: os.PathLike | str | None = None) -> Optional[str]:
-    """Read ``oauthAccount.organizationUuid`` from ``~/.claude.json``.
+    """The organization UUID from the environment or ``~/.claude.json``.
 
-    Returns ``None`` if it cannot be found (fall back to ``CLAUDE_RC_ORG_UUID``).
+    Priority: ``CLAUDE_AI_ORG_UUID``, ``CLAUDE_RC_ORG_UUID``,
+    ``oauthAccount.organizationUuid`` in ``~/.claude.json``, a top-level
+    ``organizationUuid`` in ``.credentials.json``. ``None`` when none has it —
+    :class:`~claude_rc.client.RemoteControlClient` then asks
+    ``/api/oauth/profile`` (see :func:`org_uuid_from_profile`).
     """
-    env_org = os.environ.get(ENV_ORG_UUID)
+    env_org = os.environ.get(ENV_CLAUDE_AI_ORG_UUID) or os.environ.get(ENV_ORG_UUID)
     if env_org:
         return env_org
 
-    p = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    p = Path(config_path) if config_path else default_config_path()
     if p.exists():
         try:
             data = json.loads(p.read_text())
@@ -163,7 +193,7 @@ def load_org_uuid(config_path: os.PathLike | str | None = None) -> Optional[str]
             pass
 
     # Fallback: a top-level `organizationUuid` sibling in .credentials.json.
-    cp = DEFAULT_CREDENTIALS_PATH
+    cp = default_credentials_path()
     if cp.exists():
         try:
             data = json.loads(cp.read_text())
@@ -251,3 +281,143 @@ def _persist(creds: OAuthCredentials) -> None:
     tmp.write_text(json.dumps(data, indent=2))
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+def org_uuid_from_profile(body: Any) -> Optional[str]:
+    """``organization.uuid`` out of a ``GET /api/oauth/profile`` reply (the
+    CLI's last-resort org lookup; needs the ``user:profile`` scope)."""
+    org = body.get("organization") if isinstance(body, dict) else None
+    uuid = org.get("uuid") if isinstance(org, dict) else None
+    return uuid if isinstance(uuid, str) and uuid else None
+
+
+# --- cswap (claude-swap) slots ---------------------------------------------
+# cc-proxy's mitmproxy addon owns the slot logic (`slot_token` in
+# scripts/account_inject.py). That module wires mitmproxy addons at import, so
+# instead of importing it whole we compile just `slot_token` (and the constants
+# it reads) out of its source: one implementation, no side effects.
+_SLOT_TOKEN_NAMES = {"slot_token", "MARGIN_MS", "SETUP_TOKEN_REREAD_MS"}
+
+
+def _account_inject_path() -> Optional[Path]:
+    """scripts/account_inject.py in a repo checkout, else inside the installed
+    ``cc_proxy`` wheel (``cc_proxy/scripts``)."""
+    checkout = Path(__file__).resolve().parents[2] / "scripts" / "account_inject.py"
+    if checkout.exists():
+        return checkout
+    try:
+        spec = importlib.util.find_spec("cc_proxy")
+    except (ImportError, ValueError):
+        spec = None
+    for root in (spec.submodule_search_locations or []) if spec else []:
+        candidate = Path(root) / "scripts" / "account_inject.py"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_slot_token() -> Callable[[str], tuple[str, float]]:
+    """cc-proxy's ``slot_token(slot) -> (access_token, expires_at_ms)``.
+
+    Reads the live default login as-is and refreshes any other slot only
+    through cswap's ``consume_backup_grant`` (cswap owns every refresh grant;
+    nothing here writes credentials). Needs ``claude_swap`` importable when
+    called."""
+    path = _account_inject_path()
+    if path is None:
+        raise CredentialsError("cswap slots need cc-proxy's scripts/account_inject.py (repo checkout or cc-proxy wheel)")
+    tree = ast.parse(path.read_text(), str(path))
+    keep = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in _SLOT_TOKEN_NAMES:
+            keep.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in _SLOT_TOKEN_NAMES for t in node.targets
+        ):
+            keep.append(node)
+    namespace: dict[str, Any] = {"time": time}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), str(path), "exec"), namespace)
+    if "slot_token" not in namespace:
+        raise CredentialsError(f"{path} defines no slot_token")
+    return namespace["slot_token"]
+
+
+def cswap_credentials(slot: str, slot_token: Callable[[str], tuple[str, float]] | None = None) -> OAuthCredentials:
+    """An access-token-only :class:`OAuthCredentials` for a cswap slot (no
+    refresh token: the client re-asks cswap when it expires)."""
+    try:
+        token, expires_at = (slot_token or load_slot_token())(str(slot))
+    except ImportError as exc:
+        raise CredentialsError(f"cswap slot {slot}: claude_swap is not installed ({exc})") from exc
+    except ValueError as exc:
+        raise CredentialsError(str(exc)) from exc
+    return OAuthCredentials(access_token=token, expires_at_ms=int(expires_at) if expires_at else None)
+
+
+# --- one resolver for the client --------------------------------------------
+@dataclass
+class AuthSource:
+    """What a client authenticates with, and how to re-read it.
+
+    Exactly one of ``credentials`` (Bearer OAuth) or ``session_key`` (claude.ai
+    ``sessionKey`` cookie) is set. ``reload`` re-reads the source (credentials
+    file, cswap slot) for a rotated or expired token; ``None`` when there is
+    nothing to re-read (explicit token, env var, cookie). ``origin`` names where
+    it came from, for messages (never the secret itself).
+    """
+
+    credentials: Optional[OAuthCredentials] = None
+    session_key: Optional[str] = None
+    origin: str = ""
+    reload: Optional[Callable[[], OAuthCredentials]] = None
+
+    @property
+    def is_cookie(self) -> bool:
+        return self.session_key is not None
+
+
+def resolve_auth(
+    token: str | None = None,
+    *,
+    credentials: OAuthCredentials | None = None,
+    session_key: str | None = None,
+    cswap_slot: str | int | None = None,
+    credentials_path: os.PathLike | str | None = None,
+    slot_token: Callable[[str], tuple[str, float]] | None = None,
+) -> AuthSource:
+    """Pick the client's identity. First match wins:
+
+    1. explicit arguments: ``credentials``, ``token``, ``session_key``, ``cswap_slot``;
+    2. env ``CLAUDE_AI_ACCESS_TOKEN``, then ``CLAUDE_RC_ACCESS_TOKEN``, then the
+       CLI's ``CLAUDE_CODE_OAUTH_TOKEN`` (bare tokens: no refresh);
+    3. env ``CLAUDE_AI_SESSION_KEY`` (cookie auth; the client moves to claude.ai);
+    4. env ``CLAUDE_RC_CSWAP_SLOT`` (cswap slot, access token only, never written back);
+    5. ``~/.claude/.credentials.json`` (or ``credentials_path``), refreshed and
+       written back when it expires.
+
+    ``slot_token`` replaces cc-proxy's slot reader (tests).
+    """
+    if credentials is not None:
+        return AuthSource(credentials=credentials, origin="explicit credentials")
+    if token:
+        return AuthSource(credentials=OAuthCredentials(access_token=token), origin="explicit token")
+    if session_key:
+        return AuthSource(session_key=session_key, origin="explicit session key")
+    slot = cswap_slot if cswap_slot not in (None, "") else None
+    if slot is None:
+        for env in (ENV_CLAUDE_AI_ACCESS_TOKEN, ENV_ACCESS_TOKEN, ENV_CLI_OAUTH_TOKEN):
+            if os.environ.get(env):
+                return AuthSource(credentials=OAuthCredentials(access_token=os.environ[env]), origin=f"env:{env}")
+        if os.environ.get(ENV_SESSION_KEY):
+            return AuthSource(session_key=os.environ[ENV_SESSION_KEY], origin=f"env:{ENV_SESSION_KEY}")
+        slot = os.environ.get(ENV_CSWAP_SLOT) or None
+    if slot is not None:
+        def reload_slot(slot: str = str(slot)) -> OAuthCredentials:
+            return cswap_credentials(slot, slot_token)
+
+        return AuthSource(credentials=reload_slot(), origin=f"cswap slot {slot}", reload=reload_slot)
+
+    def reload_file() -> OAuthCredentials:
+        return load_credentials(credentials_path)
+
+    return AuthSource(credentials=reload_file(), origin="credentials file", reload=reload_file)
