@@ -29,6 +29,7 @@ from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 import httpx
 
 from ._version import __version__
+from .webauth import claude_ai_mounts
 from .credentials import (
     CLAUDE_AI_BASE_URL,
     ENV_CLAUDE_AI_ORG_UUID,
@@ -335,7 +336,9 @@ class RemoteControlClient(LifecycleMixin, EnvironmentsMixin, TriggersMixin, Inte
         self.client_platform = client_platform
         # A stable per-instance id for presence, like the web client.
         self.client_id = client_id or str(uuid.uuid4())
-        self._http = httpx.Client(timeout=httpx.Timeout(timeout, read=timeout), transport=transport)
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(timeout, read=timeout), transport=transport, mounts=claude_ai_mounts(transport)
+        )
         self._refresher = httpx.Client(timeout=30.0, transport=transport)
 
     # -- context management ------------------------------------------------

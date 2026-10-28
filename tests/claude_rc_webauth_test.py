@@ -14,7 +14,7 @@ from claude_rc.client import RemoteControlClient
 from claude_rc.credentials import CredentialsError, resolve_auth
 
 ENV = (
-    "CLAUDE_AI_SESSION_KEY", "CLAUDE_AI_COOKIES", "CLAUDE_AI_COOKIE", "CLAUDE_AI_AUTO_REFRESH",
+    "CLAUDE_AI_SESSION_KEY", "CLAUDE_AI_COOKIES", "CLAUDE_AI_COOKIE", "CLAUDE_AI_PROXY", "CLAUDE_AI_AUTO_REFRESH",
     "CLAUDE_AI_CHROME_ACCOUNT", "CLAUDE_AI_CHROME_PROFILE", "CLAUDE_AI_CHROME_DIR",
     "CLAUDE_AI_CDP_URL", "CLAUDE_AI_USER_AGENT", "CLAUDE_AI_ACCESS_TOKEN",
     "CLAUDE_RC_ACCESS_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_RC_CSWAP_SLOT",
@@ -313,3 +313,10 @@ def test_session_key_sent_under_both_names(monkeypatch):
     monkeypatch.delenv("CLAUDE_AI_SESSION_KEY")
     monkeypatch.setenv("CLAUDE_AI_COOKIE", "sessionKeyV3=sk-v3")
     assert webauth.from_env().session_key == "sk-v3"
+
+
+def test_claude_ai_proxy_routes_only_claude_ai(monkeypatch):
+    assert webauth.claude_ai_mounts() is None
+    monkeypatch.setenv("CLAUDE_AI_PROXY", "http://user:pw@proxy.example.com:8080")
+    assert set(webauth.claude_ai_mounts()) == {"all://claude.ai", "all://*.claude.ai"}
+    assert webauth.claude_ai_mounts(httpx.MockTransport(lambda r: httpx.Response(200))) is None

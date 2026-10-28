@@ -72,6 +72,7 @@ BROWSER_USER_AGENT = (
 ENV_SESSION_KEY = "CLAUDE_AI_SESSION_KEY"
 ENV_COOKIES = "CLAUDE_AI_COOKIES"
 ENV_COOKIE_ALIAS = "CLAUDE_AI_COOKIE"  # singular spelling, accepted too
+ENV_PROXY = "CLAUDE_AI_PROXY"  # e.g. a home-IP proxy, so Cloudflare does not challenge claude.ai
 ENV_AUTO_REFRESH = "CLAUDE_AI_AUTO_REFRESH"
 ENV_CHROME_ACCOUNT = "CLAUDE_AI_CHROME_ACCOUNT"
 ENV_CHROME_PROFILE = "CLAUDE_AI_CHROME_PROFILE"
@@ -90,6 +91,19 @@ class CloudflareChallenge(CredentialsError):
 def user_agent() -> str:
     return os.environ.get(ENV_USER_AGENT) or BROWSER_USER_AGENT
 
+
+def proxy_url() -> Optional[str]:
+    """The proxy for claude.ai traffic only (HTTP and the TTS websocket)."""
+    return os.environ.get(ENV_PROXY) or None
+
+
+def claude_ai_mounts(transport: Optional[httpx.BaseTransport] = None) -> Optional[dict]:
+    """httpx ``mounts`` routing just claude.ai through :func:`proxy_url`;
+    api.anthropic.com stays direct. ``None`` with a test transport or no proxy."""
+    url = proxy_url()
+    if transport is not None or not url:
+        return None
+    return {"all://claude.ai": httpx.HTTPTransport(proxy=url), "all://*.claude.ai": httpx.HTTPTransport(proxy=url)}
 
 def is_claude_domain(domain: str) -> bool:
     d = (domain or "").lstrip(".").lower()
