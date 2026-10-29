@@ -256,8 +256,10 @@ The 0.6.0 canonical integration and consumer pin/lock verification are recorded 
 `docs/devlog/claude_2026-10-28-canonical-web-client-sync.json` (deliberately a plain
 path, not an include). Read the canonical `docs/web-api.md` for live versus
 fixture-only capabilities; the dependency pin is not a full browser-parity claim.
-The current 0.9.0 pin is `75a0f37a70e8890fc556c4793a6b3d65034fadaa` over SSH.
-`docs/devlog/claude_2026-10-29-final-web-client-sync.json` records the generated
+The current 0.10.0 pin is `f0581dcb9bd64f5194acd278a7e0719606c37861` over SSH; its
+consumer record is `docs/devlog/claude_2026-10-29-0.10.0-web-client-sync.json` (adds
+session-scoped `set_worker_mcp_servers` and queued-result ownership; plain path).
+The 0.9.0 record `docs/devlog/claude_2026-10-29-final-web-client-sync.json` records the generated
 lock, consumer test results and installed-package live CLI create/send/capability
 discovery with independent durable-history readback and exact deletion (GET 404).
 The prior 0.8.0 record is `docs/devlog/claude_2026-10-29-core-web-client-sync.json`.
@@ -266,6 +268,6 @@ exact queue cancellation and legacy interrupt effects. API core and extended web
 API gaps are separate from optional panel/local CLI presentation; use canonical
 `docs/web-api.md`, not a blanket full-parity claim. Continuous authentication
 requires signed-in reachable Chrome/CDP. Owned OAuth rotation/natural expiry,
-standalone blob deletion, actual cloud hooks, routine execution and MCP mutation
-qualification remain incomplete. These evidence paths are deliberately plain,
+standalone blob deletion, actual cloud hooks, routine execution, MCP override
+enforcement and remote MCP REST effects remain incomplete. These evidence paths are deliberately plain,
 not includes. No deployment or service restart is part of this dependency update.

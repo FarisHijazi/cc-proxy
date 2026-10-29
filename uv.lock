@@ -330,7 +330,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-rc-api", extras = ["web", "cli"], git = "ssh://git@github.com/FarisHijazi/claude-rc-api?rev=75a0f37a70e8890fc556c4793a6b3d65034fadaa" },
+    { name = "claude-rc-api", extras = ["web", "cli"], git = "ssh://git@github.com/FarisHijazi/claude-rc-api?rev=f0581dcb9bd64f5194acd278a7e0719606c37861" },
     { name = "claude-swap", git = "https://github.com/FarisHijazi/claude-swap" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mitmproxy", specifier = ">=12.2,<13" },
@@ -433,8 +433,8 @@ wheels = [
 
 [[package]]
 name = "claude-rc-api"
-version = "0.9.0"
-source = { git = "ssh://git@github.com/FarisHijazi/claude-rc-api?rev=75a0f37a70e8890fc556c4793a6b3d65034fadaa#75a0f37a70e8890fc556c4793a6b3d65034fadaa" }
+version = "0.10.0"
+source = { git = "ssh://git@github.com/FarisHijazi/claude-rc-api?rev=f0581dcb9bd64f5194acd278a7e0719606c37861#f0581dcb9bd64f5194acd278a7e0719606c37861" }
 dependencies = [
     { name = "httpx" },
 ]
