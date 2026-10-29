@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-29",
+  "scope": "Update claude-rc-live consumer pin/lock to canonical 0.11.0; no proxy code change, deployment or restart",
+  "canonical_commit": "7966dbcfde15477e18e75c78cb9f30523d46a12d",
+  "previous_pin": "f0581dcb9bd64f5194acd278a7e0719606c37861",
+  "version": "0.11.0",
+  "changes": ["SSH pin bumped in pyproject.toml", "uv lock regenerated: only claude-rc-api v0.10.0 -> v0.11.0 source metadata changed (needed SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt in this sandbox)", "CLAUDE.md updated"],
+  "tests": {
+    "canonical": {"command": "uv run --offline --extra test --extra web --extra cli --with playwright --with 'mcp==1.30.0' pytest -q (installed node bin first on PATH)", "passed": 839, "skipped": 0, "exit_code": 0},
+    "consumer_python": {"command": "uv run --with pytest --with pytest-asyncio --with mcp --with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests", "passed": 162, "skipped": 1, "skip_reason": "CHROME_ACCOUNT_LIVE_MANIFEST absent", "exit_code": 0},
+    "consumer_rust": {"command": "HOME=<fresh-isolated-directory> cargo test --all -- --test-threads=1", "passed": 1071, "failed": 0, "ignored": 0, "exit_code": 0},
+    "installed_import": "uv run resolves claude_rc 0.11.0 with RemoteControlClient.fork_session, compare_refs and list_spaces"
+  },
+  "canonical_live": "Canonical docs/devlog/claude_2026-10-29-capture-integration.json: fresh SCM, lifecycle/fork and elicitation harnesses on merged main, sessions GET 404, environment excluded",
+  "no_deployment": true
+}
