@@ -256,11 +256,16 @@ The 0.6.0 canonical integration and consumer pin/lock verification are recorded 
 `docs/devlog/claude_2026-10-28-canonical-web-client-sync.json` (deliberately a plain
 path, not an include). Read the canonical `docs/web-api.md` for live versus
 fixture-only capabilities; the dependency pin is not a full browser-parity claim.
-The current 0.8.0 pin is `eb77674307c74f05df04b35a2428184ca88d01ed` over SSH.
-`docs/devlog/claude_2026-10-29-core-web-client-sync.json` records the generated
-lock, 162 passing consumer Python tests (one private-fixture skip), 1,071 passing
-single-threaded Rust tests with an isolated HOME, and installed-package live reads.
-Canonical core upload/permission/native-question effects passed separately;
-standalone blob deletion, hooks and extended panel parity remain incomplete.
-This evidence path is deliberately plain, not an include. No deployment or
-service restart is part of this dependency update.
+The current 0.9.0 pin is `75a0f37a70e8890fc556c4793a6b3d65034fadaa` over SSH.
+`docs/devlog/claude_2026-10-29-final-web-client-sync.json` records the generated
+lock, consumer test results and installed-package live CLI create/send/capability
+discovery with independent durable-history readback and exact deletion (GET 404).
+The prior 0.8.0 record is `docs/devlog/claude_2026-10-29-core-web-client-sync.json`.
+Canonical 0.9.0 also qualifies same-session auth recovery, two-model inference,
+exact queue cancellation and legacy interrupt effects. API core and extended web
+API gaps are separate from optional panel/local CLI presentation; use canonical
+`docs/web-api.md`, not a blanket full-parity claim. Continuous authentication
+requires signed-in reachable Chrome/CDP. Owned OAuth rotation/natural expiry,
+standalone blob deletion, actual cloud hooks, routine execution and MCP mutation
+qualification remain incomplete. These evidence paths are deliberately plain,
+not includes. No deployment or service restart is part of this dependency update.

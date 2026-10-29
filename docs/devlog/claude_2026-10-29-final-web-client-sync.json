@@ -1,0 +1,79 @@
+{
+  "date": "2026-10-29",
+  "scope": "Update existing claude-rc-live consumer pin/lock to canonical 0.9.0; no proxy implementation change, deployment or restart",
+  "canonical_commit": "75a0f37a70e8890fc556c4793a6b3d65034fadaa",
+  "canonical_branch": "main",
+  "consumer_branch": "claude-rc-live",
+  "version": "0.9.0",
+  "changes": [
+    "Pinned claude-rc-api[web,cli] over SSH to published canonical main",
+    "Generated uv.lock using uv lock; only claude-rc-api source revision/version metadata changed",
+    "Updated CLAUDE.md and retained previous qualification records"
+  ],
+  "tests": {
+    "canonical_exact_commit": {
+      "command": "uv --directory <canonical-worktree> run --extra test --extra web --extra cli --with playwright pytest -q",
+      "passed": 761,
+      "warnings": "3 existing legacy fire_routine deprecations",
+      "seconds": 72.33,
+      "exit_code": 0
+    },
+    "consumer_python": {
+      "command": "uv --directory <consumer-worktree> run --with pytest --with pytest-asyncio --with mcp --with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests",
+      "passed": 162,
+      "skipped": 1,
+      "skip_reason": "CHROME_ACCOUNT_LIVE_MANIFEST absent: requires private access-only snapshots",
+      "warnings": "2 existing ldap3/pyasn1 deprecations; pytest-asyncio also emits its unset loop-scope startup warning",
+      "seconds": 11.02,
+      "exit_code": 0
+    },
+    "consumer_rust": {
+      "command": "HOME=<fresh-isolated-directory> CARGO_HOME=<existing-cargo-cache> cargo test --manifest-path <consumer-worktree>/Cargo.toml --all -- --test-threads=1",
+      "isolated_HOME": true,
+      "single_threaded": true,
+      "passed": 1071,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0
+    },
+    "installed_package_live": {
+      "evidence": "claude_2026-10-29-final-installed-live.json",
+      "method": "Distribution direct_url.json verified exact published SSH commit and non-editable site-packages import; actual installed CLI plus independent library reader",
+      "commands": [
+        "claude-rc create --direct --json --model claude-haiku-5-5 --title <generated-title>",
+        "claude-rc dispatch <owned-session-id> --direct --capabilities --timeout 60",
+        "claude-rc send --direct <owned-session-id> 'Reply exactly CONSUMER_FINAL_OK. No tools.'"
+      ],
+      "result": "22-name web catalog enumerated, worker 2.1.312, exact assistant marker printed; independent paged durable-history readback confirms marker and successful completed turn",
+      "cleanup": "Exact owned session archived/deleted; GET returned 404",
+      "complete": true
+    }
+  },
+  "canonical_live": {
+    "evidence_index": "Canonical docs/devlog/claude_2026-10-29-final-integration.json",
+    "auth": "Real invalid-memory-cookie 401 -> account 200 -> GET 200; before/after completed replies in one session, fresh-client paged readback, explicit recovery CLI passed; not natural expiry",
+    "commands": "Fresh existing smoke harness passed two-model tagged inference, mode/flag readback, seed then Edit without Read, question continuation, exact queued cancellation and legacy interrupt preventing post-question file write",
+    "cleanup": "Both canonical sessions GET 404; owned command environment archived/excluded; consumer session independently GET 404"
+  },
+  "remaining_boundaries": [
+    "Continuous cookie auth requires signed-in reachable Chrome/CDP; cannot silently restore a revoked browser login",
+    "No isolated owned OAuth grant obtained; rotation/restart/concurrency simulated only; natural month-scale expiry unobserved",
+    "Flag storage/readback is not inference behavior; send-now/priority races/v1 interrupt receipts/task messaging/control cancellation unqualified",
+    "Routine actual execution/cron/active cancellation remains quota-blocked or unqualified; no new routine probe",
+    "Cloud hooks were not applied; dialogs/elicitation and MCP mutation/staging effects lack live qualification",
+    "Standalone attachment deletion unsupported; Files API mount/seed and nonempty prefetch unqualified",
+    "Prior controller-file 404 after successful worker read remains unexplained; arbitrary cwd/pool/repository/platform variants unqualified",
+    "Public shares/exports/feedback/network/connector writes not exercised; uncaptured fork/grouping/SCM contracts remain unsupported",
+    "Optional browser/panel/local CLI presentation remains separate backlog; missing renderers never relabel web API gaps as UI-only"
+  ],
+  "full_web_api_parity": false,
+  "safety": {
+    "shared_grants_refreshed": false,
+    "original_consumer_checkout_edited": false,
+    "existing_sessions_mutated": false,
+    "browser_login_or_cookies_modified": false,
+    "service_deployed_or_restarted": false,
+    "persistent_daemon_added": false,
+    "external_report_published": false
+  }
+}

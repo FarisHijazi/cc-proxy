@@ -12,7 +12,7 @@ dependencies = [
     "httpx>=0.27",
     "websockets>=13",
     # claude_rc (the `claude-rc` command) lives in its own repo; bump the pin to update.
-    "claude-rc-api[web,cli] @ git+ssh://git@github.com/FarisHijazi/claude-rc-api@eb77674307c74f05df04b35a2428184ca88d01ed",
+    "claude-rc-api[web,cli] @ git+ssh://git@github.com/FarisHijazi/claude-rc-api@75a0f37a70e8890fc556c4793a6b3d65034fadaa",
 ]
 
 [project.scripts]

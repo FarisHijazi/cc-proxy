@@ -1,0 +1,48 @@
+{
+  "canonical_commit": "75a0f37a70e8890fc556c4793a6b3d65034fadaa",
+  "version": "0.9.0",
+  "checks": [
+    {
+      "name": "installed_dependency",
+      "passed": true,
+      "ssh_commit_verified": true,
+      "version": "0.9.0",
+      "module_path": "/home/service/Projects/claude-code-with-codex/worktrees/claude-rc/.venv/lib/python3.12/site-packages/claude_rc/__init__.py",
+      "editable_override": false
+    },
+    {
+      "name": "read_only_preflight",
+      "passed": true,
+      "cookie_auth": true,
+      "environment_count": 4
+    },
+    {
+      "name": "installed_cli_capability_discovery",
+      "passed": true,
+      "web_menu_count": 22,
+      "worker_version": "2.1.312"
+    },
+    {
+      "name": "installed_cli_send",
+      "passed": true,
+      "exact_marker_printed": true
+    },
+    {
+      "name": "independent_library_readback",
+      "passed": true,
+      "exact_marker": true,
+      "completed_turns": 1,
+      "page_size": 2
+    }
+  ],
+  "created_sessions": [
+    "cse_0154EsXTHsh2CJAk33rb2T9c"
+  ],
+  "cleanup": [
+    {
+      "session_id": "cse_0154EsXTHsh2CJAk33rb2T9c",
+      "get_status": 404
+    }
+  ],
+  "complete": true
+}
