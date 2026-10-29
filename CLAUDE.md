@@ -244,10 +244,10 @@ into HQ). A caller's `--settings` merges under the launcher's. Read
 `docs/devlog/claude_20261023-rc-owner-private-mirror.md` on demand (plain path).
 
 `claude_rc` (the `claude-rc` command) is NOT vendored any more: it is the pinned git dependency
-`claude-rc-api @ git+https://github.com/FarisHijazi/claude-rc-api@<sha>` in `pyproject.toml`, the single source of
+`claude-rc-api @ git+ssh://git@github.com/FarisHijazi/claude-rc-api@<sha>` in `pyproject.toml`, the single source of
 truth (code, tests, `scripts/claude-rc-smoke`, its own `CLAUDE.md`) in `~/Projects/claude-rc-api`. Change it there,
 push, then bump the sha here and re-run `uv run --with pytest --with pytest-asyncio --with mcp
---with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests` plus `cargo test --all`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
+--with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests` plus `cargo test --all -- --test-threads=1`. It drives Claude Code on the web (sessions, environments, scheduled tasks, prompts,
 watch feed, uploads, TTS); cookie-only auth from dev Chrome (auto-probes `http://127.0.0.1:9222`, override
 `CLAUDE_AI_CDP_URL`) is live-verified. Shared CLI credentials are re-read but NEVER refreshed by this client.
 The client now reads cswap through its storage API only, never through this
@@ -256,3 +256,11 @@ The 0.6.0 canonical integration and consumer pin/lock verification are recorded 
 `docs/devlog/claude_2026-10-28-canonical-web-client-sync.json` (deliberately a plain
 path, not an include). Read the canonical `docs/web-api.md` for live versus
 fixture-only capabilities; the dependency pin is not a full browser-parity claim.
+The current 0.8.0 pin is `eb77674307c74f05df04b35a2428184ca88d01ed` over SSH.
+`docs/devlog/claude_2026-10-29-core-web-client-sync.json` records the generated
+lock, 162 passing consumer Python tests (one private-fixture skip), 1,071 passing
+single-threaded Rust tests with an isolated HOME, and installed-package live reads.
+Canonical core upload/permission/native-question effects passed separately;
+standalone blob deletion, hooks and extended panel parity remain incomplete.
+This evidence path is deliberately plain, not an include. No deployment or
+service restart is part of this dependency update.

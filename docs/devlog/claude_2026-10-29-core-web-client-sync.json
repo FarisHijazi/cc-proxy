@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-29",
+  "scope": "Existing claude-rc-live consumer worktree dependency update only; no Rust or launcher implementation changes, deployment or service restart",
+  "canonical_commit": "eb77674307c74f05df04b35a2428184ca88d01ed",
+  "canonical_branch": "main",
+  "consumer_branch": "claude-rc-live",
+  "version": "0.8.0",
+  "changes": [
+    "Pinned existing claude-rc-api[web,cli] dependency to published canonical SHA using git+ssh://git@github.com/FarisHijazi/claude-rc-api",
+    "Generated uv.lock with uv lock; only the dependency metadata, version and git source changed in the lock",
+    "Updated CLAUDE.md dependency contract, single-threaded Rust command and current evidence index"
+  ],
+  "tests": {
+    "canonical": {
+      "command": "uv run --extra test --extra web --extra cli --with playwright pytest -q tests",
+      "passed": 732,
+      "warnings": "3 existing fire_routine deprecation warnings"
+    },
+    "consumer_python": {
+      "command": "uv run --with pytest --with pytest-asyncio --with mcp --with claude-artifact-cli==0.3.0 --with fastmcp==4.1.1 pytest -q tests",
+      "passed": 162,
+      "skipped": 1,
+      "skip_reason": "Private native multi-account fixture CHROME_ACCOUNT_LIVE_MANIFEST not supplied",
+      "warnings": "2 existing ldap3/pyasn1 deprecation warnings",
+      "exit_code": 0
+    },
+    "consumer_rust": {
+      "command": "cargo test --all -- --test-threads=1",
+      "isolated_HOME": true,
+      "passed": 1071,
+      "failed": 0,
+      "exit_code": 0
+    },
+    "installed_dependency": {
+      "commit_verified_from_direct_url_metadata": true,
+      "ssh_source_verified": true,
+      "installed_site_packages_not_editable": true,
+      "version": "0.8.0",
+      "live_read_only_cookie_session_and_environment_listing": true,
+      "environments_returned": 4,
+      "shared_credentials_refreshed": false,
+      "resource_mutations": 0
+    }
+  },
+  "core_live_acceptance": {
+    "evidence": "Canonical docs/devlog/claude_2026-10-29-core-integrated-live.json",
+    "upload": "Generated binary downloaded byte-for-byte; correlated successful worker Bash sha256sum equals original f2ce0f26aa6980058380968096e8dfc9d336e1e1ea82e769e287f3740570923b",
+    "permissions": "Actual cloud prompts: allow-once writes X, identical repetition prompts again, denial prevents writes, exact session-rule reuse writes XX without prompting, another path prompts",
+    "questions": "Actual native text/number yields Ada/3; followUp produces a second native text question, Confirmed tool result and FOLLOW_UP_OK",
+    "cleanup": "All three disposable canonical acceptance sessions GET 404; native-question environment archived and excluded",
+    "hook_boundary": "Question wrapper exits 1 after passing native/follow-up checks because the already-rejected hook registration is deliberately intercepted before HTTP; not hook acceptance",
+    "blob_boundary": "Upload remains downloadable after session deletion; no captured standalone deletion contract"
+  },
+  "extended_panel_parity": false,
+  "remaining": [
+    "Standalone attachment deletion unsupported; Files API mount/seed and nonempty prefetch unqualified",
+    "Rendered permission/native-form acceptance, dialogs/elicitation and actual hook continuation unqualified",
+    "Persistent/restart rule reuse and exact redirection-rule behavior unqualified",
+    "Routine marker/cron/cancellation acceptance remains blocked by previously observed quota; no new routine completion claim",
+    "Owned OAuth rotation/enrollment, dedicated MCP mutation/staged-effect fixtures, remaining management/local-slash variants and uncaptured contracts remain explicit in canonical docs/web-api.md",
+    "No public shares, support submissions, network/connector mutations, paid-key calls or persistent daemons"
+  ],
+  "safety": {
+    "original_consumer_checkout_edited": false,
+    "canonical_existing_untracked_review_evidence_preserved": true,
+    "user_existing_sessions_mutated": false,
+    "shared_grants_refreshed": false,
+    "services_deployed_or_restarted": false
+  }
+}
