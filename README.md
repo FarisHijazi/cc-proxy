@@ -161,6 +161,22 @@ Claude token. Like the proxy it has no login and shows full conversations, so bi
 a private address only. To keep it running, use the systemd or launchd snippet above with
 this command in place of `cc-proxy --serve`.
 
+The sidebar separates Overview, Accounts, Routing, Models, Sessions, and Requests.
+It uses locally bundled Pico CSS, with no frontend build or CDN requirement. The mobile menu
+keeps the same views available. Models edits the equivalent-model groups used by fallback
+and session-provider selection. Unsaved edits survive refresh and rejected saves.
+
+`fallback.tiers` stores an ordered list of groups with `name`, `match`, and `models`.
+A key equal to the whole model ID takes precedence over a family key contained in its name.
+The first matching group supplies destinations for `anthropic`, `codex`, and `cursor`.
+Missing destinations skip that equivalent. Nonempty custom groups replace all built-ins;
+Reset removes the override. The router publishes its defaults in `/v1/models`, rather than
+the dashboard keeping another list. If defaults are unavailable, the editor says so.
+Claude destinations need full upstream `claude-*` IDs without `[1m]`; Codex destinations
+also accept aliases such as `sol`. These destination IDs do not change the client's context budget.
+Defining a Cursor equivalent does not add Cursor to a fallback chain. Cursor is excluded
+from the built-in defaults and remains available only through explicit selection or configuration.
+
 The Sessions section lists recent Claude Code sessions observed in recorded
 inference traffic, separately from requests. It shows their machine, folder,
 requested model and last serving account/model; traffic is not proof that a
@@ -289,7 +305,30 @@ Sessions launched with `scripts/claude-account-router` default custom models to 
 1,000,000-token context window, so `/model gpt-6.1-sol` needs no `[1m]` suffix.
 This is a client setting, not a separate upstream model. Existing sessions keep
 their launch environment; use `[1m]` there or start a new launcher process.
-The launcher's default custom picker option is `gpt-6.1-sol[1m]`.
+The launcher adds `astra[1m]`, `sol[1m]`, `luna[1m]`, `terra[1m]`, and native
+Claude family rows to `modelPicker`, preserving your existing rows and settings.
+Its default custom option is `sol[1m]`. An explicit `--model` gets `[1m]` unless
+it already has a context suffix. This is client budgeting only. It does not
+increase or guarantee the upstream model's context window.
+
+The short Codex aliases select the highest numeric version in their family
+from the shared catalog. For example, `astra` selects `gpt-6-astra` until discovery
+reports a newer available Astra version. Explicit versioned IDs stay pinned;
+`astra-fast` selects the same latest model with Priority service tier.
+`opus`, `sonnet`, `haiku`, and `fable` retain native Claude routing.
+
+Family requests and model listings refresh Codex discovery on demand at most
+once every 300 seconds. Discovery uses `GET /models?client_version=0.165.0` beside
+the configured Codex Responses endpoint, with a three-second timeout and the
+CLI's existing access token. It never refreshes or writes credentials.
+If discovery fails, the catalog retains its last successful result and reads
+`$CODEX_HOME/models_cache.json` or `~/.codex/models_cache.json` as a fallback.
+CLI caches with an opaque provider/account identity are not assumed to match
+this reader. Observed credential replacement invalidates the memory catalog and
+prevents reuse of its old CLI fallback. The compatibility baseline remains
+available. Hidden or non-API discovery rows are excluded. Existing explicit
+baseline IDs need no discovery request. Async requests await a shared refresh
+without blocking Tokio timers or health checks.
 
 Reasoning is carried across a switch. When you move a conversation from one plan
 to the other, the earlier turn's thinking is kept and shown to the next model as
@@ -329,8 +368,8 @@ An empty Claude account pool does not block Codex or Cursor inference:
 
 | Requested | Tries, in order |
 | --- | --- |
-| A Claude model | each Claude account in the accounts file, then the Codex model of the same tier, then Cursor |
-| A Codex model | Codex, then the Claude model of the same tier on each account, then Cursor |
+| A Claude model | each Claude account in the accounts file, then the Codex model of the same tier |
+| A Codex model | Codex, then the Claude model of the same tier on each account |
 
 The accounts file can choose which account a session starts on. The proxy
 reloads it on the next request:
@@ -545,10 +584,9 @@ pass `--accounts-file /path/to/accounts.json` containing:
 
 `--main-account personal` overrides that default for a new session. Each main
 account gets separate session state. Remote Control belongs to that account;
-selecting another browser does not change it. The `account-chrome` MCP browser
-list labels each account, and subsequent actions use the selected browser's
-native connection. Ask Claude to use `account-chrome` to list or select a browser
-across accounts. Native `/chrome` uses main by default. To choose a different
+selecting another browser does not change it. Browsers use only the built-in
+Chrome tools. With `--via`, the `--serve` proxy merges every account's browsers
+into the native Chrome bridge. Without `--via`, native `/chrome` sees main's browsers. To choose a different
 account for the native picker, add `--chrome-account personal` before `--`:
 
 ```sh
@@ -630,27 +668,17 @@ it will never surface `gemini-*` or `gpt-*`, and of Cursor only the
 `cursor-cli:claude-*` ids. For these backends the lineup above is the
 mechanism, not discovery.
 
-### The unrecognized-model warning
+### Custom-model context budgeting
 
-Claude Code only knows the context window of models in its own catalog, so a
-router model it has never heard of prints a warning and is assumed to hold
-200k tokens — which silently caps auto-compact below what the model can take.
-The reply itself is unaffected. Three measured ways to settle it, best first:
+Claude Code may warn about a model outside its native catalog. The account launcher
+adds stable `[1m]` picker rows and sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` for new
+processes, including bare custom aliases. Explicit launch selections default to `[1m]`.
+The launcher preserves existing custom picker rows and does not invent `behavesAs` metadata.
 
-```sh
-# 1. a modelPicker row with behavesAs — also puts the model in the picker
-# 2. the [1m] suffix, for a model that really holds 1M
-claude --model 'gemini-3-flash[1m]'
-# 3. declare the window outright
-claude --settings '{"env":{"CLAUDE_CODE_MAX_CONTEXT_TOKENS":"1000000"}}'
-```
-
-The `modelPicker` row silences it completely — both the banner and the
-`unrecognized_model` line — measured by running the same prompt with and
-without the row.
-
-The `[1m]` suffix is Claude Code's own and never reaches a backend — the router
-strips it while resolving the model.
+`[1m]` controls client budgeting, not the upstream model's actual capacity. It is stripped
+before provider resolution. An already-running client can explicitly select `astra[1m]`.
+A smaller upstream context limit remains smaller regardless of this client hint. The measured
+CLI behavior and provider limits are recorded in `docs/devlog/claude_20261029-model-family-aliases.md`.
 
 Added by this fork:
 
@@ -665,6 +693,8 @@ Added by this fork:
 | `CCP_CURSOR_CLI_WORKSPACE` | Pin `cursor-agent` to one directory. Default: follow the caller's cwd. |
 | `CCP_CURSOR_CLI_TIMEOUT_SECS` | Kill a run after this long. Default `900`. |
 | `CCP_CURSOR_CLI_DEFAULT_MODEL` | Model for bare `cursor-cli`. Default `auto`. |
+| `CCP_CURSOR_MESSAGES_BASE_URL` | Optional loopback Anthropic Messages broker for exact `cursor:<catalog-id>` models. Unset keeps the legacy Cursor path. |
+| `CCP_CURSOR_MESSAGES_API_KEY` | Local broker key sent only to that loopback broker. It is not a Cursor or paid vendor key. |
 
 The same settings can live in `config.json` under `auth`, `gemini`, and
 `cursorCli`.

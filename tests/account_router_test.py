@@ -154,7 +154,7 @@ def test_client_has_first_party_url_and_isolated_storage(tmp_path, monkeypatch):
     assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"]
     assert env["REQUESTS_CA_BUNDLE"] == env["SSL_CERT_FILE"]
     assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(tmp_path / "secure")
-    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "gpt-6.1-sol[1m]"
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "sol[1m]"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1000000"
     assert settings["env"]["ANTHROPIC_BASE_URL"] == env["ANTHROPIC_BASE_URL"]
     assert settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] == env["ANTHROPIC_CUSTOM_MODEL_OPTION"]
@@ -754,10 +754,10 @@ def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
     )
     assert args.count("--chrome") == 1 and "--no-chrome" not in args
     assert "existing.json" in args
-    # Only the aggregate's tools stay visible, so the model sees every account's browsers.
-    assert args[args.index("--disallowedTools") + 1] == "mcp__claude-in-chrome"
+    # The proxy aggregates the native Chrome bridge; no custom Chrome MCP hides it.
+    assert "--disallowedTools" not in args
     config = json.loads((login / "mcp.json").read_text())
-    assert set(config["mcpServers"]) == {"account-chrome", "account-artifacts"}
+    assert set(config["mcpServers"]) == {"account-artifacts"}
     # The main client moves its own login into the keychain; Chrome reads a copy.
     copy = login / "work-chrome-secure"
     written = json.loads((login / "accounts.json").read_text())
@@ -1012,7 +1012,7 @@ def test_via_native_chrome_is_opted_in_without_broadening_mcp_children(tmp_path,
     assert captured["children"] == {
         "work": "proxy-account-work+chrome=work", "personal": "proxy-account-personal+chrome=personal",
     }
-    assert captured["servers"] == ({"account-chrome", "account-artifacts"} if selected is None else {"account-artifacts"})
+    assert captured["servers"] == {"account-artifacts"}
 
 
 def test_reach_tries_addresses_in_order_and_skips_closed_ones(tmp_path):
@@ -1028,3 +1028,92 @@ def test_reach_tries_addresses_in_order_and_skips_closed_ones(tmp_path):
         with (tmp_path / "log").open("w") as log:
             url, tunnel = launcher["reach"]([f"http://127.0.0.1:{dead}", f"http://127.0.0.1:{port}"], log)
     assert (url, tunnel) == (f"http://127.0.0.1:{port}", None)
+
+
+def test_reach_tunnel_resolves_with_the_system_resolver(tmp_path):
+    argv_file = tmp_path / "argv.json"
+    fake = tmp_path / "wstunnel"
+    fake.write_text(f"""#!{shutil.which("python3")}
+import json, socket, sys, time
+json.dump(sys.argv[1:], open({str(argv_file)!r}, "w"))
+port = int(sys.argv[sys.argv.index("-L") + 1].split(":")[2])
+listener = socket.create_server(("127.0.0.1", port))
+time.sleep(30)
+""")
+    fake.chmod(0o755)
+    candidate = {"tunnel": "wss://proxy.example.com", "target": "127.0.0.1:18790",
+                 "headers_file": str(tmp_path / "gate.headers"), "wstunnel": str(fake)}
+    with (tmp_path / "log").open("w") as log:
+        url, tunnel = launcher["reach"]([candidate, "http://127.0.0.1:9"], log)
+    try:
+        args = json.loads(argv_file.read_text())
+        assert url.startswith("http://127.0.0.1:")
+        assert args[args.index("--dns-resolver") + 1] == "system://0.0.0.0"
+    finally:
+        tunnel.terminate()
+        tunnel.wait()
+
+
+@pytest.mark.parametrize("model", ["astra", "sol-fast", "opus", "gpt-6-astra", "cursor-cli:auto"])
+def test_explicit_model_defaults_to_client_context_hint(model):
+    rest, _ = launcher["take_settings"](["--model", model, "-p", "hello"])
+    assert rest == ["--model", model + "[1m]", "-p", "hello"]
+    rest, _ = launcher["take_settings"](["--model=" + model])
+    assert rest == ["--model=" + model + "[1m]"]
+
+
+def test_explicit_context_and_user_picker_are_preserved(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "source"))
+    picker = {"options": [{"model": "custom[200k]", "label": "Mine"}], "replaceBuiltInOptions": True}
+    rest, extra = launcher["take_settings"]([
+        "--model", "custom[200k]", "--settings", json.dumps({"modelPicker": picker}),
+    ])
+    _, serialized = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure", extra=extra)
+    settings = json.loads(serialized)
+    assert rest == ["--model", "custom[200k]"]
+    assert settings["modelPicker"]["replaceBuiltInOptions"] is True
+    assert settings["modelPicker"]["options"][0] == picker["options"][0]
+    models = {row["model"] for row in settings["modelPicker"]["options"]}
+    assert {family + "[1m]" for family in ("astra", "sol", "luna", "terra", "opus", "sonnet", "haiku", "fable")} <= models
+    assert all("behavesAs" not in row for row in settings["modelPicker"]["options"][1:])
+
+
+def test_user_profile_picker_is_merged_without_writing_profile(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    raw = json.dumps({"modelPicker": {"options": [{"model": "profile-model", "label": "Profile"}]}})
+    (profile / "settings.json").write_text(raw)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    _, serialized = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure")
+    assert json.loads(serialized)["modelPicker"]["options"][0]["model"] == "profile-model"
+    assert (profile / "settings.json").read_text() == raw
+
+
+def test_picker_keeps_profile_and_cli_rows_with_cli_labels_winning(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "settings.json").write_text(json.dumps({"modelPicker": {
+        "options": [{"model": "mine", "label": "Saved"}, {"model": "sol[1m]", "label": "Old"}],
+        "replaceBuiltInOptions": True,
+    }}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    extra = {"modelPicker": {"options": [{"model": "sol[1m]", "label": "Chosen"}]}}
+    _, serialized = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure", extra=extra)
+    picker = json.loads(serialized)["modelPicker"]
+    assert picker["replaceBuiltInOptions"] is True
+    rows = {row["model"]: row for row in picker["options"]}
+    assert rows["mine"]["label"] == "Saved"
+    assert rows["sol[1m]"]["label"] == "Chosen"
+    assert len(picker["options"]) == len(rows)
+    assert extra["modelPicker"]["options"] == [{"model": "sol[1m]", "label": "Chosen"}]
+
+
+@pytest.mark.parametrize("prompt", [
+    ["--model=astra"], ["--model", "astra"],
+    ["--settings", '{"model":"astra"}'], ["--settings=not-a-file"],
+])
+def test_settings_and_model_parsing_stops_at_prompt_separator(prompt):
+    forwarded = ["--model", "sol", "--", *prompt]
+    rest, extra = launcher["take_settings"](forwarded)
+    assert rest == ["--model", "sol[1m]", "--", *prompt]
+    assert extra == {}

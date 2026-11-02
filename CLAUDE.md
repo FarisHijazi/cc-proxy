@@ -97,12 +97,17 @@ any of the three.
    kept a second "advertised" set on the `Provider` trait for this; the fallback
    made it unnecessary. `registry::tests::everything_listed_can_actually_be_routed`
    pins that every listed id routes.
-10. **The `cursor` backend can borrow `cursor-agent`'s token** from the macOS
+10. **An optional loopback Messages broker owns the Cursor tool protocol when configured.**
+   `CCP_CURSOR_MESSAGES_BASE_URL` makes `src/providers/cursor/messages.rs` relay exact `cursor:<id>` requests
+   through the existing Anthropic opaque relay. It rebuilds minimal headers and never falls back to the legacy
+   provider. It does not install or manage a broker. The research and evaluation are in
+   `docs/research/20261029-cursor-bridge-reuse.md` (plain path). Do not port broker protocol logic here.
+11. **The `cursor` backend can borrow `cursor-agent`'s token** from the macOS
    Keychain (`cursor-access-token`/`cursor-user`) when the proxy has no login of
    its own. Read fresh every time, never written to the proxy's store — copying
    it would go stale the moment the CLI refreshed. Not to be confused with the
    `cursor-cli` backend, which spawns the CLI rather than reusing its token.
-11. **`gemini` overlaps with `claude-code-router`**, which routes to any
+12. **`gemini` overlaps with `claude-code-router`**, which routes to any
    OpenAI-compatible endpoint from config. It is kept to avoid running a second
    gateway alongside the Claude/Codex subscription logic here — see the devlog
    before extending it. `cursor-cli` has no equivalent anywhere.
@@ -135,17 +140,17 @@ ToolSearch and message-thread compatibility fixes, and session-owned launcher mo
 `docs/devlog/claude_20261018-account-endpoint-relay.md` (plain path, read on demand).
 
 The launcher also accepts account aliases and a selectable main login. Main owns
-Remote Control and, by default, the native Chrome UI; separate MCP adapters aggregate browsers
-and read artifacts across accounts. Credential snapshots remain access-only.
+Remote Control and, by default, the native Chrome UI; a separate MCP adapter reads artifacts
+across accounts. Credential snapshots remain access-only.
 Read `docs/devlog/claude_20261018-multi-account-tools.md` for boundaries, upstream
 reuse and live validation (deliberately a plain path, not an include).
 Local shortcuts and saved account maps are runtime configuration outside this
 repository; their setup and smoke checks are recorded in that devlog.
 
-When the aggregate `account-chrome` server is loaded, the launcher passes `--disallowedTools mcp__claude-in-chrome`:
-the built-in tools see only main's browsers and the system prompt steers the model to them. `/chrome` still works.
-`--chrome-account` routes the native Chrome bridge to a selected login independently
-of main, replacing the aggregate Chrome adapter for that session. The protocol
+Browsers use only the built-in `claude-in-chrome` tools; there is no custom Chrome MCP (the `account-chrome`
+adapter was removed on 2026-11-02, see `docs/devlog/claude_20261102-native-chrome-only.md`). For `--via`
+clients the `--serve` proxy's `account_chrome_bridge.py` merges every account's browsers into the native bridge
+(`+chromes`). `--chrome-account` routes the native Chrome bridge to a selected login independently of main. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
@@ -167,10 +172,11 @@ session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages` and
 plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
 still reaches other vendors. The explicit primary-account marker prevents a filtered
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
-Claude model: accounts, then Codex, then Cursor. Codex model: Codex, then Claude
-accounts, then Cursor. Both are defaults: the accounts file's `fallback` section (`chains` per family
-`claude`/`codex`/provider name; `accounts:N` = the next N pool accounts, so another backend can sit between accounts,
-and `accounts` = the rest, `on` = `rate_limit`/`auth`/`server_error`, `threshold` %) overrides them.
+Claude model: accounts, then Codex. Codex model: Codex, then Claude accounts.
+Cursor is never a default target; it requires an explicitly configured chain. The accounts file's
+`fallback` section overrides these defaults (`chains` per family `claude`/`codex`/provider name;
+`accounts:N` = the next N pool accounts, so another backend can sit between accounts;
+`accounts` = the rest; `on` = `rate_limit`/`auth`/`server_error`; `threshold` %).
 `account_inject` attaches it as `x-claude-codex-fallback` beside the pool (stripped the same way) and alone
 applies `threshold`, putting accounts whose last reply reported 5h/7d utilization at or over it last in
 the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`. Never relay the pool header upstream, never retry after
@@ -221,6 +227,15 @@ from the accounts file; profiles are cached a day in `<state>/profiles.json`. Ru
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
 `disabled`, `traffic_days`, `fallback`, `session_models` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
+The dashboard has hash-routed sidebar views and locally vendored Pico conditional CSS (no build step).
+`src/fallback.rs::defaults()` owns the only default chains and equivalence groups, exposed through
+`/v1/models` as `fallback_defaults`. The dashboard forwards that metadata without guessing when unavailable.
+`fallback.tiers` is an ordered full replacement list of `{name, match, models}`; missing or empty uses
+built-ins. Exact matches precede family substring matches. `account_ui.py` remains the only config writer
+and validates bounds, duplicate keys, and full upstream `claude-*` destination IDs. Codex aliases remain
+valid destinations and async fallback dispatch prepares their catalog before routing. Claude Code
+expands native Claude aliases; `[1m]` sets a client budget. Neither is a raw Anthropic destination ID.
+See `docs/devlog/claude_20261029-sidebar-equivalent-models.md` for tests and deployment status (plain path).
 `GET /api/sessions` lists recent inference sessions from the traffic DB, not proof of running processes.
 `session_models` maps session IDs to forced model IDs; dashboard updates patch only named sessions and `null`
 clears one. `account_inject` strips client-supplied `x-claude-codex-session-model` and attaches the configured
@@ -236,16 +251,24 @@ on `account_ui.py`). Remote Control traffic never carries the Claude session id,
 measured wrong live; the exact key is the reply `msg_…` id that a worker event relays and the inference response
 recorded.
 cswap slots may hold `claude setup-token`s (no `expiresAt`, no refresh, inference scope only): `slot_token()` uses them
-as-is; they cannot answer usage/profile, so the dashboard reads their usage from recorded reply headers.
+as-is for both the active login and backup slots; they cannot answer usage/profile, so the dashboard reads their usage
+from recorded reply headers. Active/backup parity and the overnight fallback diagnosis are recorded in
+`docs/devlog/claude_20261029-overnight-fallback-forensics.md` (plain path).
 
 Self-hosted native Remote Control is an optional launcher route to HQ. `--serve` takes
 `--remote-control-backend` too, so every `--via` client's native session reaches the hub; the
 routed-session map persists in the proxy state dir. The launcher sets
-`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `gpt-6.1-sol[1m]`) because a proxied session counts as
+`ANTHROPIC_CUSTOM_MODEL_OPTION` (default `sol[1m]`) because a proxied session counts as
 first-party and Remote Control `set_model` otherwise rejects non-catalog ids. The launcher sets
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` so bare custom model names also use 1M in new processes.
 Codex model bases and derived fast variants come only from
 `src/providers/codex/translate/model_allowlist.rs`; the registry consumes that catalog.
+Its private `model_catalog.rs` discovers visible API family models on demand, cached for 300 seconds, using
+the existing Codex access token without refresh or credential writes. Ownership-compatible legacy CLI cache data and the
+compatibility baseline are fallbacks; opaque identity-bearing caches are skipped. `astra`, `sol`, `luna`, and `terra` select the highest numeric version;
+explicit IDs stay pinned. Native Claude routing is unchanged. Launcher picker rows and explicit launch model
+arguments default to `[1m]`, a client context hint rather than an upstream capacity guarantee. Details and
+verification: `docs/devlog/claude_20261029-model-family-aliases.md` (plain path).
 The new catalog and live context verification are in
 `docs/devlog/claude_20261024-codex-6-models.md` (plain path).
 Folder trust

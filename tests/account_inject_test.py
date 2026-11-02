@@ -469,14 +469,18 @@ def test_spreading_and_prefer_skip_disabled_accounts(monkeypatch):
     assert session_pool(inject, "s4", "c")[0] == "c"
 
 
-def test_setup_tokens_are_used_as_is_and_never_refreshed(monkeypatch):
+@pytest.mark.parametrize("active", [False, True], ids=["inactive", "active"])
+def test_setup_tokens_are_used_as_is_and_never_refreshed(monkeypatch, active):
     import claude_swap.switcher
 
     refreshed = []
 
     class Switcher:
         def current_account_number(self):
-            return "1"
+            return "3" if active else "1"
+
+        def _read_credentials(self):
+            return json.dumps({"claudeAiOauth": {"accessToken": "setup-token", "scopes": ["user:inference"]}})
 
         def _get_sequence_data(self):
             return {"accounts": {"3": {"email": "user@example.com"}}}
@@ -490,6 +494,30 @@ def test_setup_tokens_are_used_as_is_and_never_refreshed(monkeypatch):
     monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", Switcher)
     token, expires = module.slot_token("3")
     assert token == "setup-token" and expires > time.time() * 1000
+    assert expires <= time.time() * 1000 + 61_000, "a replaced setup-token must take effect within a minute"
+    assert refreshed == []
+
+
+def test_expired_active_oauth_never_consumes_a_refresh_grant(monkeypatch):
+    import claude_swap.switcher
+
+    refreshed = []
+
+    class Switcher:
+        def current_account_number(self):
+            return "3"
+
+        def _read_credentials(self):
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": "expired-token", "expiresAt": 1, "refreshToken": "live-grant",
+            }})
+
+        def consume_backup_grant(self, *args):
+            refreshed.append(args)
+
+    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", Switcher)
+    with pytest.raises(ValueError):
+        module.slot_token("3")
     assert refreshed == []
 
 

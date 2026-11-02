@@ -384,36 +384,48 @@ def aggregate_mcp(login, manifest, forwarded):
     manifest = {**manifest, "accounts": accounts}
     manifest_path = login / "accounts.json"
     write_private(manifest_path, json.dumps(manifest))
-    servers = {}
-    for name, script in (
-        ("account-chrome", "account_chrome.py"),
-        ("account-artifacts", "account_artifacts.py"),
-    ):
-        # An explicit native account uses the built-in MCP server end-to-end.
-        # Avoid routing an aggregate child for main into that chosen account.
-        if name == "account-chrome" and manifest.get("chrome_account"):
-            continue
-        servers[name] = {
+    servers = {
+        "account-artifacts": {
             "type": "stdio",
             "command": shutil.which("uv") or "uv",
             "args": [
                 "run",
                 "--script",
-                str(Path(__file__).resolve().with_name(script)),
+                str(Path(__file__).resolve().with_name("account_artifacts.py")),
                 "--manifest",
                 str(manifest_path),
             ],
         }
+    }
     config_path = login / "mcp.json"
     write_private(config_path, json.dumps({"mcpServers": servers}))
-    # Claude reserves claude-in-chrome for its built-in server. Keep that UI
-    # on main; the additional server exposes cross-account browser tools.
+    # Browsers stay on the built-in claude-in-chrome server; the --serve proxy
+    # aggregates its bridge across accounts (account_chrome_bridge.py).
     chrome = [] if {"--chrome", "--no-chrome"}.intersection(forwarded) else ["--chrome"]
-    # The built-in tools see only main's browsers, and the system prompt steers the
-    # model to them, so hide them whenever the aggregate serves every account.
-    if "account-chrome" in servers:
-        chrome += ["--disallowedTools", "mcp__claude-in-chrome"]
     return with_flags(forwarded, *chrome, "--mcp-config", str(config_path))
+
+
+def default_context_hint(model):
+    return model if not model or re.search(r"\[[^\]]+\]$", model) else model + "[1m]"
+
+
+def model_picker(extra):
+    profile = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
+    try:
+        saved = json.loads((profile / "settings.json").read_text()).get("modelPicker", {})
+    except (OSError, ValueError, AttributeError):
+        saved = {}
+    picker = {**saved, **extra.get("modelPicker", {})}
+    options = list(saved.get("options", []))
+    overrides = extra.get("modelPicker", {}).get("options", [])
+    overridden = {row.get("model") for row in overrides}
+    options = [row for row in options if row.get("model") not in overridden] + list(overrides)
+    existing = {row.get("model") for row in options}
+    for family in ("astra", "sol", "luna", "terra", "opus", "sonnet", "haiku", "fable"):
+        model = family + "[1m]"
+        if model not in existing:
+            options.append({"model": model, "label": family.title() + " [1m]"})
+    return {**picker, "options": options}
 
 
 def take_settings(forwarded):
@@ -424,6 +436,18 @@ def take_settings(forwarded):
     rest, extra = [], {}
     args = iter(forwarded)
     for arg in args:
+        if arg == "--":
+            rest.extend([arg, *args])
+            break
+        if arg == "--model":
+            value = next(args, None)
+            rest.append(arg)
+            if value is not None:
+                rest.append(default_context_hint(value))
+            continue
+        if arg.startswith("--model="):
+            rest.append("--model=" + default_context_hint(arg.partition("=")[2]))
+            continue
         if arg == "--settings":
             value = next(args, None)
         elif arg.startswith("--settings="):
@@ -480,7 +504,7 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None, 
     # model. Claude Code owns context budgeting before a request reaches the proxy,
     # so pin custom models to the 1M window even when /model uses a bare name.
     settings_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = (
-        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "gpt-6.1-sol[1m]"
+        os.environ.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "sol[1m]"
     )
     settings_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "1000000"
     # An API credential selects API-key auth even when a subscription is saved.
@@ -526,6 +550,7 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None, 
     settings = dict(extra or {})
     settings["env"] = {**settings.get("env", {}), **settings_env}
     settings["apiKeyHelper"] = ""
+    settings["modelPicker"] = model_picker(settings)
     return env, json.dumps(settings)
 
 
@@ -688,6 +713,7 @@ def reach(candidates, log):
             [
                 candidate.get("wstunnel") or shutil.which("wstunnel") or str(Path.home() / ".local/bin/wstunnel"),
                 "client",
+                "--dns-resolver", "system://0.0.0.0",
                 "--http-headers-file", str(Path(candidate["headers_file"]).expanduser()),
                 "-L", f"tcp://127.0.0.1:{port}:{candidate['target']}",
                 candidate["tunnel"],

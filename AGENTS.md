@@ -31,7 +31,8 @@
   `thread_unsupported_request` envelope so Claude resends full history. Keep
   Anthropic threads and token counting untouched; do not accept contextless deltas.
 - Multi-account tools extend this launcher: main owns Remote Control and, by
-  default, native `/chrome`; `account-chrome` multiplexes persistent native MCP children and
+  default, native `/chrome` (the `--serve` proxy's `account_chrome_bridge.py` merges
+  every account's browsers into that native bridge for `--via` clients; no custom Chrome MCP) and
   `account-artifacts` reuses the published artifact CLI for read-only access.
   Never route a failed account's action to another account. Preserve vendor
   notifications, native permissions, and full platform trust in the session CA
