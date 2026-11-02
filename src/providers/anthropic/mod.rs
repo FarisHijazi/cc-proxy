@@ -223,13 +223,27 @@ impl AnthropicProvider {
 
     /// Select the fixed account origin (also used by integration tests).
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self::build(base_url.into(), false)
+    }
+
+    /// Loopback broker relay: ignores ambient and explicit proxies, bounded timeouts.
+    pub fn with_loopback_base_url(base_url: impl Into<String>) -> Self {
+        Self::build(base_url.into(), true)
+    }
+
+    fn build(base_url: String, direct: bool) -> Self {
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
             .no_brotli()
             .no_deflate()
             .no_zstd();
-        if let Some((proxy, ca)) = crate::config::anthropic_upstream_proxy() {
+        if direct {
+            builder = builder
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .read_timeout(std::time::Duration::from_secs(120));
+        } else if let Some((proxy, ca)) = crate::config::anthropic_upstream_proxy() {
             let pem = std::fs::read(&ca).expect("failed to read CCP_ANTHROPIC_PROXY_CA");
             builder = builder
                 .proxy(reqwest::Proxy::https(&proxy).expect("invalid CCP_ANTHROPIC_PROXY"))
@@ -242,7 +256,7 @@ impl AnthropicProvider {
             .expect("failed to build anthropic passthrough client");
         Self {
             client,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 

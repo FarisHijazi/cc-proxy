@@ -24,6 +24,7 @@ use crate::{
             CodexTranscriptionBackend, MAX_TRANSCRIPTION_REQUEST_BYTES, TranscriptionRequestError,
             prepare_transcription, transcription_error_response,
         },
+        translate::model_allowlist::prepare_model_catalog,
     },
     registry::{Registry, normalize_incoming_model},
     request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
@@ -385,6 +386,7 @@ async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
+    prepare_model_catalog(None).await;
     let registry = state.registry.clone();
     let models = tokio::task::spawn_blocking(move || registry.all_supported_models())
         .await
@@ -410,6 +412,7 @@ async fn handler_models(
         "has_more": has_more,
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
+        "fallback_defaults": crate::fallback::defaults(),
     }))
 }
 
@@ -957,6 +960,10 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
+    state
+        .registry
+        .prepare_model_catalog(&normalized_model)
+        .await;
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
     let affinity = session_state
@@ -1190,6 +1197,10 @@ async fn handler_chat_completions(
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
+    state
+        .registry
+        .prepare_model_catalog(&normalized_model)
+        .await;
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
     let affinity = session_state
@@ -1646,6 +1657,10 @@ async fn dispatch_request(
     };
 
     let mut normalized_model = normalize_incoming_model(model);
+    state
+        .registry
+        .prepare_model_catalog(&normalized_model)
+        .await;
     body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
@@ -1673,6 +1688,10 @@ async fn dispatch_request(
     }
 
     let provider = if auto_review_route.is_some() {
+        state
+            .registry
+            .prepare_model_catalog(&normalized_model)
+            .await;
         state.registry.provider_for_model(&normalized_model, None)
     } else {
         original_provider

@@ -4,8 +4,9 @@
 //! attaches the ordered account pool to inference requests in [`POOL_HEADER`], plus
 //! the accounts file's `fallback` section in [`POLICY_HEADER`]. A request walks one
 //! chain for its model family. Without a configured chain, a Claude model tries each
-//! account in order, then the Codex equivalent, then Cursor, and a Codex model tries
-//! Codex, then the Claude equivalent on each account, then Cursor. A 429 or
+//! account in order, then the Codex equivalent, and a Codex model tries Codex, then
+//! the Claude equivalent on each account. Cursor is never a default step; it runs
+//! only when a configured chain names it. A 429 or
 //! Claude-account 401 moves on before output, as does an account answering 404 for
 //! a model it does not offer (5xx too when enabled). Nothing is
 //! replayed after the client saw a token. Token counts walk only the same model
@@ -18,10 +19,10 @@ use crate::registry::Registry;
 use crate::request_identity::ConversationIdentity;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const POOL_HEADER: &str = "x-claude-codex-account-pool";
@@ -70,6 +71,22 @@ impl Default for Triggers {
 pub struct Policy {
     pub chains: HashMap<String, Vec<String>>,
     pub on: Triggers,
+    /// Replaces every built-in equivalence group when non-empty.
+    #[serde(default, deserialize_with = "deserialize_tiers")]
+    pub tiers: Vec<Tier>,
+}
+
+fn deserialize_tiers<'de, D>(deserializer: D) -> Result<Vec<Tier>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tier| serde_json::from_value(tier.clone()).ok())
+        .collect())
 }
 
 pub struct Pool {
@@ -77,40 +94,100 @@ pub struct Pool {
     pub policy: Policy,
 }
 
-/// Equivalent models per tier. `keys` match both Claude and Codex model names.
-struct Tier {
-    keys: &'static [&'static str],
-    claude: &'static str,
-    codex: &'static str,
-    cursor: &'static str,
+/// One equivalence group: a request whose model matches `match_keys` may run as
+/// the group's model on another provider (`anthropic`, `codex`, `cursor`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tier {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub match_keys: Vec<String>,
+    pub models: HashMap<String, String>,
 }
 
-const TIERS: &[Tier] = &[
+fn builtin(name: &str, keys: &[&str], models: [(&str, &str); 3]) -> Tier {
     Tier {
-        keys: &["opus", "sol"],
-        claude: "claude-opus-5-5",
-        codex: "gpt-6.1-sol",
-        cursor: "cursor:claude-opus-5",
-    },
-    Tier {
-        keys: &["fable", "astra"],
-        claude: "claude-fable-5-1",
-        codex: "gpt-6-astra",
-        cursor: "cursor:claude-fable-5",
-    },
-    Tier {
-        keys: &["sonnet", "haiku", "luna"],
-        claude: "claude-sonnet-5-5",
-        codex: "gpt-6-luna",
-        cursor: "cursor:claude-sonnet-5",
-    },
-];
+        name: name.into(),
+        match_keys: keys.iter().map(|key| key.to_string()).collect(),
+        models: models
+            .into_iter()
+            .map(|(provider, id)| (provider.to_string(), id.to_string()))
+            .collect(),
+    }
+}
 
-fn tier(model: &str) -> Option<&'static Tier> {
+fn default_tiers() -> &'static [Tier] {
+    static TIERS: OnceLock<Vec<Tier>> = OnceLock::new();
+    TIERS.get_or_init(|| {
+        vec![
+            builtin(
+                "opus-sol",
+                &["opus", "sol"],
+                [
+                    ("anthropic", "claude-opus-5-5"),
+                    ("codex", "gpt-6.1-sol"),
+                    ("cursor", "cursor:claude-opus-5"),
+                ],
+            ),
+            builtin(
+                "fable-astra",
+                &["fable", "astra"],
+                [
+                    ("anthropic", "claude-fable-5-1"),
+                    ("codex", "gpt-6-astra"),
+                    ("cursor", "cursor:claude-fable-5"),
+                ],
+            ),
+            builtin(
+                "sonnet-luna",
+                &["sonnet", "haiku", "luna"],
+                [
+                    ("anthropic", "claude-sonnet-5-5"),
+                    ("codex", "gpt-6-luna"),
+                    ("cursor", "cursor:claude-sonnet-5"),
+                ],
+            ),
+        ]
+    })
+}
+
+impl Policy {
+    fn tiers(&self) -> &[Tier] {
+        if self.tiers.is_empty() {
+            default_tiers()
+        } else {
+            &self.tiers
+        }
+    }
+
+    /// The group serving `model`: an exact id or key match anywhere beats a family
+    /// key contained in the name. Exact means a match key equal to the whole model id.
+    fn tier(&self, model: &str) -> Option<&Tier> {
+        let model = normalize(model);
+        let tiers = self.tiers();
+        tiers
+            .iter()
+            .find(|tier| tier.match_keys.iter().any(|key| normalize(key) == model))
+            .or_else(|| {
+                tiers.iter().find(|tier| {
+                    tier.match_keys
+                        .iter()
+                        .any(|key| model.contains(&key.to_ascii_lowercase()))
+                })
+            })
+    }
+}
+
+fn normalize(model: &str) -> String {
     let model = model.to_ascii_lowercase();
-    TIERS
-        .iter()
-        .find(|tier| tier.keys.iter().any(|key| model.contains(key)))
+    model.strip_suffix("[1m]").unwrap_or(&model).to_string()
+}
+
+/// The router's own defaults, for dashboards to show and edit from.
+pub fn defaults() -> Value {
+    json!({
+        "chains": {"claude": DEFAULT_CLAUDE, "codex": DEFAULT_CODEX},
+        "tiers": default_tiers(),
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,8 +200,8 @@ enum Step {
     Substitute(String),
 }
 
-const DEFAULT_CLAUDE: &[&str] = &["accounts", "codex", "cursor"];
-const DEFAULT_CODEX: &[&str] = &["codex", "accounts", "cursor"];
+const DEFAULT_CLAUDE: &[&str] = &["accounts", "codex"];
+const DEFAULT_CODEX: &[&str] = &["codex", "accounts"];
 
 /// The ordered chain for a request first routed to `provider`.
 fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<Step> {
@@ -139,7 +216,7 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
         None if family == "codex" => DEFAULT_CODEX.to_vec(),
         None => Vec::new(),
     };
-    let tier = tier(model);
+    let tier = policy.tier(model);
     let mut steps = Vec::new();
     let mut next_account = 0;
     for target in targets {
@@ -147,7 +224,7 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
             let model = if family == "claude" {
                 Some(model.to_string())
             } else {
-                tier.map(|t| t.claude.to_string())
+                tier.and_then(|t| t.models.get("anthropic").cloned())
             };
             let end = (next_account + count).min(accounts);
             if let Some(model) = model {
@@ -161,8 +238,8 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
                 steps.push(Step::Original);
                 continue;
             }
-            "codex" => tier.map(|t| t.codex.to_string()),
-            "cursor" => tier.map(|t| t.cursor.to_string()),
+            "codex" => tier.and_then(|t| t.models.get("codex").cloned()),
+            "cursor" => tier.and_then(|t| t.models.get("cursor").cloned()),
             id => Some(id.to_string()),
         };
         let Some(substitute) = substitute else {
@@ -302,7 +379,8 @@ pub async fn dispatch(
 ) -> Response {
     let requested = body.model.clone().unwrap_or_default();
     let threaded = is_thread_continue(&body);
-    let anthropic = registry.provider_for_model(TIERS[0].claude, None);
+    let anthropic =
+        registry.provider_for_model(default_tiers()[0].models["anthropic"].as_str(), None);
     let mut rejection: Option<Response> = None;
     let mut skipped_cooling = false;
 
@@ -336,6 +414,7 @@ pub async fn dispatch(
                 )
             }
             Step::Substitute(model) => {
+                registry.prepare_model_catalog(model).await;
                 let Some(target) = registry.provider_for_model(model, None) else {
                     continue;
                 };
@@ -452,14 +531,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_requests_try_accounts_then_codex_then_cursor() {
+    fn claude_requests_try_accounts_then_codex() {
         assert_eq!(
             default_chain("anthropic", "claude-opus-5-5", 2),
             [
                 Step::Account(0, "claude-opus-5-5".into()),
                 Step::Account(1, "claude-opus-5-5".into()),
                 sub("gpt-6.1-sol"),
-                sub("cursor:claude-opus-5"),
             ]
         );
         assert_eq!(
@@ -473,14 +551,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_requests_try_codex_then_claude_accounts_then_cursor() {
+    fn codex_requests_try_codex_then_claude_accounts() {
         assert_eq!(
             default_chain("codex", "gpt-6-astra", 1),
-            [
-                Step::Original,
-                Step::Account(0, "claude-fable-5-1".into()),
-                sub("cursor:claude-fable-5"),
-            ]
+            [Step::Original, Step::Account(0, "claude-fable-5-1".into())]
         );
         assert_eq!(
             default_chain("codex", "gpt-6.1-sol-fast", 1)[1],
@@ -495,6 +569,120 @@ mod tests {
         assert_eq!(
             default_chain("anthropic", "claude-unknown", 1),
             [Step::Account(0, "claude-unknown".into())]
+        );
+    }
+
+    #[test]
+    fn malformed_or_missing_policy_defaults_never_include_cursor() {
+        let malformed: Policy =
+            serde_json::from_value(json!({"chains": "bad"})).unwrap_or_default();
+        let missing: Policy = serde_json::from_value(json!({})).unwrap();
+        for policy in [Policy::default(), malformed, missing] {
+            for (provider, model) in [("anthropic", "claude-opus-5-5"), ("codex", "gpt-6.1-sol")] {
+                assert!(
+                    !chain(provider, model, 2, &policy)
+                        .iter()
+                        .any(|step| matches!(step, Step::Substitute(m) if m.starts_with("cursor"))),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_tiers_preserve_custom_chains_and_triggers() {
+        let parsed = serde_json::from_value::<Policy>(json!({
+            "chains": {"claude": ["accounts"]},
+            "on": {"server_error": true},
+            "tiers": [
+                {"match": ["opus"], "models": {"codex": "sol"}},
+                {"name": "valid", "match": ["sonnet"], "models": {"codex": "luna"}}
+            ]
+        }))
+        .unwrap_or_default();
+        assert_eq!(
+            parsed.chains.get("claude"),
+            Some(&vec!["accounts".to_string()])
+        );
+        assert!(parsed.on.server_error);
+        assert_eq!(parsed.tiers.len(), 1);
+        assert_eq!(parsed.tiers[0].name, "valid");
+    }
+
+    fn policy(value: Value) -> Policy {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn defaults_expose_the_chains_and_tiers_the_router_uses() {
+        let defaults = defaults();
+        assert_eq!(defaults["chains"]["claude"], json!(["accounts", "codex"]));
+        assert_eq!(defaults["chains"]["codex"], json!(["codex", "accounts"]));
+        let tiers = defaults["tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0]["match"], json!(["opus", "sol"]));
+        assert_eq!(tiers[0]["models"]["codex"], "gpt-6.1-sol");
+        let round_trip = policy(json!({"tiers": defaults["tiers"]}));
+        assert_eq!(
+            chain("anthropic", "claude-haiku-5-5", 1, &round_trip),
+            default_chain("anthropic", "claude-haiku-5-5", 1)
+        );
+    }
+
+    #[test]
+    fn configured_tiers_replace_every_builtin_group() {
+        let custom = policy(json!({"tiers": [
+            {"name": "mine", "match": ["opus"], "models": {"anthropic": "claude-opus-5-5", "codex": "gpt-custom"}},
+        ]}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &custom)[1],
+            sub("gpt-custom")
+        );
+        assert_eq!(
+            chain("anthropic", "claude-sonnet-5-5", 1, &custom),
+            [Step::Account(0, "claude-sonnet-5-5".into())]
+        );
+        let empty = policy(json!({"tiers": []}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &empty),
+            default_chain("anthropic", "claude-opus-5-5", 1)
+        );
+    }
+
+    #[test]
+    fn an_exact_match_beats_a_family_key_and_aliases_are_destinations() {
+        let custom = policy(json!({"tiers": [
+            {"name": "family", "match": ["opus"], "models": {"anthropic": "claude-opus-5-5", "codex": "gpt-family"}},
+            {"name": "pin", "match": ["claude-opus-5-5"], "models": {"anthropic": "claude-opus-5-5", "codex": "sol"}},
+        ]}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5[1m]", 1, &custom)[1],
+            sub("sol")
+        );
+        assert_eq!(
+            chain("anthropic", "Claude-Opus-9", 1, &custom)[1],
+            sub("gpt-family")
+        );
+    }
+
+    #[test]
+    fn a_missing_destination_skips_and_cursor_is_never_reenabled() {
+        let custom = policy(json!({"tiers": [
+            {"name": "t", "match": ["opus"], "models": {"anthropic": "claude-opus-5-5"}},
+        ]}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &custom),
+            [Step::Account(0, "claude-opus-5-5".into())]
+        );
+        let with_cursor = policy(json!({"tiers": [
+            {"name": "t", "match": ["opus"], "models": {"anthropic": "claude-opus-5-5", "cursor": "cursor:x"}},
+        ]}));
+        assert!(!chain("anthropic", "claude-opus-5-5", 1, &with_cursor).contains(&sub("cursor:x")));
+        let explicit = policy(
+            json!({"chains": {"claude": ["accounts", "cursor"]}, "tiers": with_cursor.tiers}),
+        );
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &explicit)[1],
+            sub("cursor:x")
         );
     }
 

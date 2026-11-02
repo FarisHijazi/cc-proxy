@@ -32,7 +32,7 @@ async function open(browser, { reachable = true, usage = USAGE, stall = false, q
     accounts: [{ alias: "a@example.com", email: "a@example.com", slot: 1, usage: {} }],
     balance: { strategy: "session" }, strategies: ["session"], traffic_days: null,
     fallback: { chains: { gemini: ["gemini", "codex"] } },
-    default_chains: { claude: ["accounts", "codex", "cursor"], codex: ["codex", "accounts", "cursor"] },
+    fallback_defaults: { chains: { claude: ["accounts", "codex", "cursor"], codex: ["codex", "accounts", "cursor"] }, tiers: [] },
     providers: { reachable, models: reachable ? { anthropic: ["claude-opus-5"], codex: ["gpt-6.1-sol"], gemini: ["gemini-3-pro"],
                                                   cursor: [], "cursor-cli": [], kimi: [], grok: [] } : {} },
     provider_usage: usage, provider_quota: quota, proxy: { address: "x:1", up: true }, db: { path: usage ? "/x" : null, bytes: 0, disk_free: 1 },
@@ -46,7 +46,7 @@ async function open(browser, { reachable = true, usage = USAGE, stall = false, q
     if (url.pathname === "/api/sessions") return json({ days: 7, limit: 50, traffic_db: false, sessions: [] });
     return json({ rows: [] });
   });
-  await page.goto("http://dash.test/");
+  await page.goto("http://dash.test/#accounts");
   return { page, close: () => ctx.close() };
 }
 

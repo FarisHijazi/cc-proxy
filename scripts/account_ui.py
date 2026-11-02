@@ -29,8 +29,9 @@ HERE = Path(__file__).resolve().parent
 STRATEGIES = ["session", "prefer", "round-robin", "least-sessions"]
 WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
 CACHE_S = 60
-# The router's chains when the accounts file has no "fallback.chains" entry (src/fallback.rs).
-DEFAULT_CHAINS = {"claude": ["accounts", "codex", "cursor"], "codex": ["codex", "accounts", "cursor"]}
+# Equivalence groups travel in a request header, so keep them small. Defaults come from the router (src/fallback.rs).
+TIER_PROVIDERS = ["anthropic", "codex", "cursor"]
+MAX_TIERS, MAX_TIER_KEYS, MAX_TIER_BYTES = 24, 8, 8192
 TRIGGERS = ["rate_limit", "auth", "server_error", "model_unavailable"]
 # Same patterns account_inject.py accepts for "session_models" (they become a request header).
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -49,7 +50,40 @@ LINKS_CACHE_S = 60
 QUOTA_CACHE_S = 300
 
 
-def checked_fallback(fallback):
+def checked_tiers(tiers):
+    """Ordered equivalence groups [{name, match: [keys], models: {provider: id}}]; empty means the router defaults."""
+    if not isinstance(tiers, list) or len(tiers) > MAX_TIERS:
+        raise ValueError(f"fallback.tiers is a list of at most {MAX_TIERS} groups")
+    result, names, keys = [], set(), set()
+    for tier in tiers:
+        if not isinstance(tier, dict) or set(tier) != {"name", "match", "models"}:
+            raise ValueError("each tier needs exactly name, match and models")
+        name, match, models = tier["name"], tier["match"], tier["models"]
+        if not isinstance(name, str) or not 0 < len(name.strip()) <= 64:
+            raise ValueError("tier name must be 1 to 64 characters")
+        if not isinstance(match, list) or not 0 < len(match) <= MAX_TIER_KEYS or not all(
+                isinstance(k, str) and 0 < len(k.strip()) <= 64 for k in match):
+            raise ValueError(f"tier {name!r} needs 1 to {MAX_TIER_KEYS} match keys of 1 to 64 characters")
+        if not isinstance(models, dict) or not models or not set(models) <= set(TIER_PROVIDERS) or not all(
+                isinstance(m, str) and MODEL_ID.fullmatch(m.strip()) for m in models.values()):
+            raise ValueError(f"tier {name!r} needs model ids for {', '.join(TIER_PROVIDERS)}")
+        if "anthropic" in models and not re.fullmatch(r"claude-[A-Za-z0-9][A-Za-z0-9._-]*", models["anthropic"].strip()):
+            raise ValueError("Claude equivalents need a full claude-* model id without [1m]; native aliases are expanded by Claude Code")
+        name, match = name.strip(), [k.strip() for k in match]
+        if name.lower() in names:
+            raise ValueError(f"duplicate tier name {name!r}")
+        for key in match:
+            if key.lower() in keys:
+                raise ValueError(f"match key {key!r} appears in two tiers or twice")
+            keys.add(key.lower())
+        names.add(name.lower())
+        result.append({"name": name, "match": match, "models": {p: m.strip() for p, m in models.items()}})
+    if len(json.dumps(result)) > MAX_TIER_BYTES:
+        raise ValueError(f"fallback.tiers is larger than {MAX_TIER_BYTES} bytes")
+    return result
+
+
+def checked_fallback(fallback, current=None):
     """The accounts file's "fallback" section, validated; None removes it (router defaults)."""
     if fallback is None:
         return None
@@ -63,6 +97,9 @@ def checked_fallback(fallback):
                                   or not 0 < threshold <= 100):
         raise ValueError("fallback.threshold must be a percentage from 1 to 100, or empty")
     result = {"chains": {f: [x.strip() for x in t] for f, t in chains.items()}, "on": dict(on)}
+    tiers = checked_tiers(fallback["tiers"]) if "tiers" in fallback else (current or {}).get("tiers")
+    if tiers:
+        result["tiers"] = tiers
     if threshold is not None:
         result["threshold"] = threshold
     return result
@@ -151,15 +188,16 @@ class Dashboard:
             try:
                 # The --serve proxy sends every api.anthropic.com path, this one included, to the router.
                 with self.opener.open("https://api.anthropic.com/v1/models", timeout=10) as response:
-                    listed = [m["display_name"] for m in json.load(response)["data"]]
+                    body = json.load(response)
+                listed = ([m["display_name"] for m in body["data"]], body.get("fallback_defaults"))
             except Exception:  # noqa: BLE001 - shown as "router unreachable"
                 listed = None
             hit = self.cache["models"] = (time.time(), listed)
         models = {name: [] for name in PROVIDERS}
-        for display in hit[1] or []:
+        for display in hit[1][0] if hit[1] else []:
             model, _, provider = display.rpartition(" (")
             models.setdefault(provider.rstrip(")"), []).append(model)
-        return {"reachable": hit[1] is not None, "models": models}
+        return {"reachable": hit[1] is not None, "models": models, "fallback_defaults": hit[1][1] if hit[1] else None}
 
     def last_reply(self, alias, cfg):
         db = self.database(cfg)
@@ -229,6 +267,7 @@ class Dashboard:
 
     def state(self):
         cfg = self.config()
+        providers = self.providers()
         with ThreadPoolExecutor(8) as pool:
             quota = pool.submit(self.provider_quota)
             accounts = list(pool.map(lambda item: self.account(*item, cfg), cfg["accounts"].items()))
@@ -248,8 +287,8 @@ class Dashboard:
             "renamed": cfg.get("renamed", {}),
             "fallback": cfg.get("fallback", {}),
             "session_models": cfg.get("session_models", {}),
-            "default_chains": DEFAULT_CHAINS,
-            "providers": self.providers(),
+            "providers": providers,
+            "fallback_defaults": providers["fallback_defaults"],
             "provider_usage": self.recorded_provider_usage(cfg),
             "provider_quota": quota,
             "proxy": {"address": f"{self.proxy.hostname}:{self.proxy.port}", "up": proxy_up},
@@ -386,7 +425,7 @@ class Dashboard:
             else:
                 cfg.pop("session_models", None)
         if "fallback" in change:
-            fallback = checked_fallback(change["fallback"])
+            fallback = checked_fallback(change["fallback"], cfg.get("fallback"))
             if fallback is None:
                 cfg.pop("fallback", None)
             else:
@@ -416,6 +455,8 @@ def handler(dashboard):
             try:
                 if url.path == "/":
                     return self.reply(200, (HERE / "account_ui.html").read_bytes(), "text/html; charset=utf-8")
+                if url.path == "/pico.css":
+                    return self.reply(200, (HERE / "pico.conditional.min.css").read_bytes(), "text/css; charset=utf-8")
                 if url.path == "/api/state":
                     return self.reply(200, dashboard.state())
                 if url.path == "/api/traffic":

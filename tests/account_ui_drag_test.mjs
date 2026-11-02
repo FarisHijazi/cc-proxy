@@ -27,7 +27,7 @@ async function open(browser, size, { failSave = false } = {}) {
   let accounts = structuredClone(ACCOUNTS), fallback = {};
   const state = () => ({
     accounts, balance: { strategy: "prefer", prefer: "c@example.com" }, strategies: ["session", "prefer"], fallback,
-    default_chains: { claude: ["accounts", "codex", "cursor"] }, providers: { reachable: true, models: { codex: ["gpt-6.1-sol"], cursor: ["cursor-agent"] } },
+    fallback_defaults: { chains: { claude: ["accounts", "codex", "cursor"] }, tiers: [] }, providers: { reachable: true, models: { codex: ["gpt-6.1-sol"], cursor: ["cursor-agent"] } },
     proxy: { address: "x:1", up: true },
     db: { path: null, bytes: 0, disk_free: 1 }, traffic_days: null,
   });
@@ -48,7 +48,7 @@ async function open(browser, size, { failSave = false } = {}) {
     if (url.pathname === "/api/sessions") return json({ days: 7, limit: 50, traffic_db: false, sessions: [] });
     return json({ rows: [] });
   });
-  await page.goto("http://dash.test/");
+  await page.goto("http://dash.test/#accounts");
   await page.locator("#accounts .card").first().waitFor();
   return { page, posts, close: () => ctx.close() };
 }

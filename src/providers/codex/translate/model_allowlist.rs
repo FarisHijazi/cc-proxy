@@ -1,8 +1,9 @@
-use std::collections::HashSet;
-
 use crate::config;
 
+use super::model_catalog::{ModelCatalog, catalog};
 use super::request::ServiceTier;
+
+pub const FAMILY_ALIASES: &[&str] = &["astra", "sol", "luna", "terra"];
 
 pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.2",
@@ -21,13 +22,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
 ];
 
 pub fn selectable_models() -> Vec<String> {
-    let mut models = Vec::with_capacity(ALLOWED_MODELS.len() * 2);
-    for model in ALLOWED_MODELS {
-        models.push((*model).to_string());
-        models.push(format!("{model}-fast"));
-    }
-    models.sort_unstable();
-    models
+    catalog().selectable_models()
 }
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -51,23 +46,30 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+pub async fn prepare_model_catalog(model: Option<&str>) {
+    let needs_discovery = |model: &str| {
+        let normalized = crate::registry::normalize_incoming_model(model);
+        let base = normalized.strip_suffix("-fast").unwrap_or(&normalized);
+        FAMILY_ALIASES.contains(&base)
+            || (base.starts_with("gpt-") && !ALLOWED_MODELS.contains(&base))
+    };
+    if model.is_some_and(|model| !needs_discovery(model))
+        && !config::codex_model()
+            .as_deref()
+            .is_some_and(needs_discovery)
+    {
+        return;
+    }
+    super::model_catalog::prepare_catalog().await;
 }
 
-fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        let base = model.trim_end_matches("-fast");
-        ResolvedModel {
-            model: base.to_string(),
-            service_tier: Some(ServiceTier::Priority),
-        }
+fn resolve_selection(model: &str) -> ResolvedModel {
+    let normalized = crate::registry::normalize_incoming_model(model);
+    let base = normalized.strip_suffix("-fast").unwrap_or(&normalized);
+    if ALLOWED_MODELS.contains(&base) || MODEL_ALIASES.iter().any(|(alias, _)| *alias == base) {
+        ModelCatalog::default().resolve(model)
     } else {
-        ResolvedModel {
-            model: model.to_string(),
-            service_tier: None,
-        }
+        catalog().resolve(model)
     }
 }
 
@@ -79,17 +81,10 @@ pub fn resolve_model_request_with_config_override(
     model: &str,
     apply_config_override: bool,
 ) -> ResolvedModel {
-    let alias = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == model)
-        .map(|(_, target)| *target)
-        .unwrap_or(model);
-
-    let requested = resolve_fast_model_alias(alias);
-
+    let requested = resolve_selection(model);
     let override_model = apply_config_override.then(config::codex_model).flatten();
     let resolved = match override_model {
-        Some(ref val) if !val.is_empty() => resolve_fast_model_alias(val),
+        Some(ref val) if !val.is_empty() => resolve_selection(val),
         _ => requested.clone(),
     };
 
@@ -121,7 +116,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if ALLOWED_MODELS.contains(&model) || catalog().contains(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -147,14 +142,16 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
+    let normalized = crate::registry::normalize_incoming_model(model);
+    let base = normalized.strip_suffix("-fast").unwrap_or(&normalized);
+    if ALLOWED_MODELS.contains(&base) || MODEL_ALIASES.iter().any(|(alias, _)| *alias == base) {
         return true;
     }
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        return true;
+    if !base.starts_with("gpt-") && !FAMILY_ALIASES.contains(&base) {
+        return false;
     }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    let catalog = catalog();
+    catalog.contains(&catalog.resolve(model).model)
 }
 
 #[cfg(test)]

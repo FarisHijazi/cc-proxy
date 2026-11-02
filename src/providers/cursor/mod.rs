@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod connect;
+pub mod messages;
 pub mod model;
 pub mod proto;
 pub mod request;
@@ -42,7 +43,10 @@ use crate::providers::cursor::tool_bridge::{
 // Provider
 // ---------------------------------------------------------------------------
 
-pub struct CursorProvider;
+/// With a configured Messages broker every inference path goes through it.
+pub struct CursorProvider {
+    broker: Option<Result<messages::Broker, String>>,
+}
 
 impl Default for CursorProvider {
     fn default() -> Self {
@@ -52,7 +56,9 @@ impl Default for CursorProvider {
 
 impl CursorProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            broker: messages::from_env(),
+        }
     }
 }
 
@@ -61,6 +67,11 @@ impl Provider for CursorProvider {
     /// Signed in through this proxy, or borrowing the Cursor CLI's session —
     /// either is enough, so a working `cursor-agent login` needs no second login.
     fn availability(&self) -> crate::provider::Availability {
+        match &self.broker {
+            Some(Ok(broker)) => return broker.availability(),
+            Some(Err(error)) => return crate::provider::Availability::unavailable(error.clone()),
+            None => {}
+        }
         match auth::load_cursor_auth() {
             Ok(Some(_)) => crate::provider::Availability::Ready,
             _ => crate::provider::Availability::unavailable(
@@ -81,6 +92,11 @@ impl Provider for CursorProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        match &self.broker {
+            Some(Ok(broker)) => return broker.messages(body, ctx).await,
+            Some(Err(error)) => return messages::config_error(error),
+            None => {}
+        }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("cursor");
@@ -234,6 +250,11 @@ impl Provider for CursorProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        match &self.broker {
+            Some(Ok(broker)) => return broker.count_tokens(body, ctx).await,
+            Some(Err(error)) => return messages::config_error(error),
+            None => {}
+        }
         let prompt = render_cursor_prompt(&body);
         let tokens = (prompt.len() / 4) as u64; // rough estimate
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -253,6 +274,17 @@ impl Provider for CursorProvider {
         mut body: MessagesRequest,
         ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
+        match &self.broker {
+            Some(Ok(broker)) => return broker.generate(body, ctx).await,
+            Some(Err(error)) => {
+                return Err(ProviderError::new(
+                    StatusCode::BAD_REQUEST,
+                    ProviderErrorKind::InvalidRequest,
+                    format!("Cursor Messages broker: {error}"),
+                ));
+            }
+            None => {}
+        }
         body.stream = true;
         let requested = body.model.clone().unwrap_or_else(|| "cursor".to_string());
         let resolved = resolve_cursor_model(&requested).map_err(|error| {

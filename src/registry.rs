@@ -2,7 +2,7 @@ use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
     provider::{Availability, CliHandlers, Provider, RequestContext},
-    providers::codex::translate::model_allowlist::selectable_models,
+    providers::codex::translate::model_allowlist::{is_valid_model_for_codex, selectable_models},
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -59,7 +59,7 @@ impl Registry {
                 .map(|alias| (*alias).to_string())
                 .collect(),
         );
-        models.insert("codex".into(), selectable_models());
+        models.insert("codex".into(), Vec::new());
         models.insert(
             "kimi".into(),
             KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
@@ -139,7 +139,11 @@ impl Registry {
     }
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
-        let mut models = self.models.get(provider).cloned().unwrap_or_default();
+        let mut models = if provider == "codex" {
+            selectable_models()
+        } else {
+            self.models.get(provider).cloned().unwrap_or_default()
+        };
         if provider == self.alias_provider.as_str() {
             for alias in ANTHROPIC_STYLE_ALIASES {
                 if !models.iter().any(|value| value == alias) {
@@ -209,6 +213,21 @@ impl Registry {
             .collect()
     }
 
+    pub async fn prepare_model_catalog(&self, raw_model: &str) {
+        let normalized = normalize_incoming_model(raw_model);
+        let provider = self.provider_for_model(&normalized, None);
+        if provider
+            .as_ref()
+            .is_some_and(|provider| provider.name() == "codex")
+            || (provider.is_none() && normalized.starts_with("gpt-"))
+        {
+            crate::providers::codex::translate::model_allowlist::prepare_model_catalog(Some(
+                &normalized,
+            ))
+            .await;
+        }
+    }
+
     pub fn provider_for_model(
         &self,
         raw_model: &str,
@@ -231,6 +250,10 @@ impl Registry {
         }
         if is_cursor_model(&normalized) {
             return self.handlers.get("cursor").cloned();
+        }
+
+        if is_valid_model_for_codex(&normalized) {
+            return self.handlers.get("codex").cloned();
         }
 
         // Exact model-name match reaches a specific backend regardless of the alias

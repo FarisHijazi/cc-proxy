@@ -1435,6 +1435,11 @@ async fn models_endpoint_lists_supported_models() {
     unsafe { std::env::remove_var("CCP_CODEX_AUTH_FILE") };
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        value["fallback_defaults"]["chains"]["claude"],
+        json!(["accounts", "codex"])
+    );
+    assert_eq!(value["fallback_defaults"]["tiers"][0]["match"][0], "opus");
     let data = value["data"].as_array().unwrap();
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cc-proxy</title>
+<link rel="stylesheet" href="/pico.css">
 <style>
   :root {
     --bg: #f6f6f4; --panel: #ffffff; --text: #18181b; --muted: #71717a; --line: #e4e4e7;
@@ -17,7 +18,30 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .shell { display: grid; grid-template-columns: 200px minmax(0, 1fr); max-width: 1320px; margin: 0 auto; }
+  .side { position: sticky; top: 0; align-self: start; height: 100vh; padding: 20px 12px; border-right: 1px solid var(--line); }
+  .side ul { padding: 0; margin: 12px 0 0; } .side li { list-style: none; padding: 0; }
+  .side a { display: block; padding: 8px 12px; border-radius: 8px; text-decoration: none; color: var(--text); }
+  .side a[aria-current=page] { background: var(--accent); color: #fff; }
+  .side a:hover:not([aria-current=page]) { background: var(--track); }
+  .side #menu-toggle { display: none; width: 100%; margin: 0; }
+  [data-view][hidden] { display: none; }
+  @media (max-width: 820px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 10px 16px; }
+    .side #menu-toggle { display: block; }
+    .side ul { display: none; } .side ul.open { display: block; }
+  }
   main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 64px; }
+  .models-view { --pico-spacing: .6rem; --pico-form-element-spacing-vertical: .4rem; }
+  .models-view h2 { font-size: 14px; }
+  .models-view :is(input, button) { font-size: 16px; min-height: 44px; }
+  .models-view article { margin: 0 0 12px; padding: 14px 16px; }
+  .models-view label { font-size: 12px; color: var(--muted); margin: 0; }
+  .models-view input { margin: 2px 0 8px; }
+  .tier-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0 12px; }
+  .models-view .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .models-view .actions button { width: auto; margin: 0; }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
   h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
@@ -135,9 +159,22 @@
 </style>
 </head>
 <body>
+<div class="shell">
+<nav class="pico side" aria-label="Sections">
+  <strong>cc-proxy</strong>
+  <button id="menu-toggle" class="secondary" aria-expanded="false" aria-controls="nav-list">Menu</button>
+  <ul id="nav-list">
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#accounts">Accounts</a></li>
+    <li><a href="#routing">Routing</a></li>
+    <li><a href="#models">Models</a></li>
+    <li><a href="#sessions">Sessions</a></li>
+    <li><a href="#requests">Requests</a></li>
+  </ul>
+</nav>
 <main>
   <header>
-    <h1>cc-proxy</h1>
+    <h1 id="view-title">Overview</h1>
     <span class="pill" id="proxy"><span class="dot"></span>checking proxy…</span>
     <span class="pill" id="db">database…</span>
     <span class="spacer"></span>
@@ -146,40 +183,56 @@
   </header>
   <div id="error"></div>
 
-  <h2>Routing</h2>
-  <div class="panel" id="routing"><div class="skeleton">Loading settings…</div></div>
-
+  <section data-view="overview">
   <h2>Providers</h2>
   <div class="providers" id="providers"><div class="skeleton">Asking the router which backends are signed in…</div></div>
-
-  <h2>Failover <span class="muted" style="text-transform:none;letter-spacing:0">what each model family tries, in order, before giving up</span></h2>
-  <div class="failover">
-    <div class="panel" id="chains"><div class="skeleton">Loading failover chains…</div></div>
-    <div class="panel" id="triggers"><div class="skeleton">Loading triggers…</div></div>
-  </div>
-
-  <h2>Accounts &amp; providers</h2>
-  <div class="subhead">Fallback order for Claude models: a session starts on its own account (or the preferred one), then walks this list. Drag a card or use the arrows.</div>
-  <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
-  <div class="subhead">Other backends: used when one of their models is requested, or from a Failover chain above</div>
-  <div class="grid" id="provider-cards"><div class="skeleton">Loading providers…</div></div>
 
   <h2>Activity</h2>
   <div class="row" style="margin-bottom:10px">
     <div class="seg" id="range"><button data-h="1">1h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button></div>
   </div>
   <div class="stats" id="stats"><div class="panel skeleton">Loading activity…</div></div>
+  </section>
 
+  <section data-view="accounts" hidden>
+  <h2>Accounts &amp; providers</h2>
+  <div class="subhead">Fallback order for Claude models: a session starts on its own account (or the preferred one), then walks this list. Drag a card or use the arrows.</div>
+  <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
+  <div class="subhead">Other backends: used when one of their models is requested, or from a Failover chain in Routing</div>
+  <div class="grid" id="provider-cards"><div class="skeleton">Loading providers…</div></div>
+  </section>
+
+  <section data-view="routing" hidden>
+  <h2>Routing</h2>
+  <div class="panel" id="routing"><div class="skeleton">Loading settings…</div></div>
+
+  <h2>Failover <span class="muted" style="text-transform:none;letter-spacing:0">what each model family tries, in order, before giving up</span></h2>
+  <div class="failover">
+    <div class="panel" id="chains"><div class="skeleton">Loading failover chains…</div></div>
+    <div class="panel" id="triggers"><div class="skeleton">Loading triggers…</div></div>
+  </div>
+  </section>
+
+  <section data-view="models" class="pico models-view" hidden>
+  <h2>Equivalent models</h2>
+  <div id="models"><div class="skeleton">Loading equivalence groups…</div></div>
+  </section>
+
+  <section data-view="sessions" hidden>
   <h2>Sessions <span class="muted" style="text-transform:none;letter-spacing:0" id="sessions-note">Claude Code sessions seen in recent traffic</span></h2>
   <div class="panel scroll" style="padding:0" id="sessions"><div class="skeleton">Loading sessions…</div></div>
+  </section>
 
+  <section data-view="requests" hidden>
   <h2>Requests</h2>
   <div class="row" style="margin-bottom:10px">
     <input type="search" id="q" placeholder="Filter: machine, user, folder, account, model, URL…" style="flex:1;min-width:220px">
     <label class="small muted"><input type="checkbox" id="inference" checked> model calls only</label>
   </div>
   <div class="panel scroll" style="padding:0" id="traffic"><div class="skeleton">Loading requests…</div></div>
+  </section>
 </main>
+</div>
 
 <dialog id="flow"><header class="row"><strong>Request</strong><span class="spacer"></span><button onclick="flow.close()">Close</button></header><div class="body" id="flow-body"></div></dialog>
 
@@ -187,7 +240,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const WINDOW = {five_hour: "5 hours", seven_day: "7 days", seven_day_opus: "7d Opus", seven_day_sonnet: "7d Sonnet"};
-let state = null, hours = 24, saving = false, sessions = null;
+let state = null, hours = 24, saving = false, sessions = null, hasLoaded = false, draft = null, dirty = false;
 
 async function api(path, body) {
   const res = await fetch(path, body ? {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)} : {});
@@ -207,10 +260,10 @@ function until(iso) {
 function ago(t) { const s = Date.now() / 1000 - t; return s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; }
 
 async function save(change) {
-  if (saving) return;
+  if (saving) return false;
   saving = true;
-  try { state = await api("/api/config", change); render(); showError(null); }
-  catch (e) { showError(e); }
+  try { state = await api("/api/config", change); render(); showError(null); return true; }
+  catch (e) { showError(e); return false; }
   finally { saving = false; }
 }
 
@@ -287,7 +340,7 @@ function saveItems(items) {
   const chain = runs.flatMap((r, i) => typeof r !== "number" ? [r] : i === lastRun ? ["accounts"] : r ? [`accounts:${r}`] : []);
   if (lastRun < 0) chain.unshift("accounts");
   const f = failover();
-  if (JSON.stringify(chain) === JSON.stringify(state.default_chains.claude)) delete f.chains.claude;
+  if (JSON.stringify(chain) === JSON.stringify(defaultChains().claude)) delete f.chains.claude;
   else f.chains.claude = chain;
   save({order: items.filter((x) => x.a).map((x) => x.a.alias), fallback: f});
 }
@@ -458,10 +511,11 @@ const own = (family) => family === "claude" ? "accounts" : family;
 function failover() {
   const f = state.fallback || {};
   return {chains: {...(f.chains || {})}, on: {rate_limit: true, auth: true, server_error: false, model_unavailable: true, ...(f.on || {})},
-          threshold: f.threshold ?? null};
+          threshold: f.threshold ?? null, ...(f.tiers?.length ? {tiers: f.tiers} : {})};
 }
+const defaultChains = () => state.fallback_defaults?.chains ?? {};
 function chainOf(family) {
-  return (state.fallback.chains || {})[family] ?? state.default_chains[family] ?? [own(family)];
+  return (state.fallback.chains || {})[family] ?? defaultChains()[family] ?? [own(family)];
 }
 function providerOf(target, family) {
   if (target === "accounts" || /^accounts:\d+$/.test(target)) return "anthropic";
@@ -562,7 +616,7 @@ function renderChains() {
     const chain = chainOf(family);
     return `<div class="chain" data-family="${family}">
       <div><div style="font-weight:600">${esc(title)}</div>
-        <div class="small muted">${custom[family] ? `custom · <a href="#" data-reset>reset</a>` : state.default_chains[family] ? "default" : "no failover"}</div></div>
+        <div class="small muted">${custom[family] ? `custom · <a href="#" data-reset>reset</a>` : defaultChains()[family] ? "default" : state.fallback_defaults ? "no failover" : "router defaults unknown"}</div></div>
       <div class="chips">${chain.map((t, i) => {
         const provider = providerOf(t, family);
         const up = !state.providers.reachable || (provider && (state.providers.models[provider] || []).length);
@@ -610,8 +664,8 @@ function renderTriggers() {
 }
 
 const home = (path) => (path || "-").replace(/^\/(home|Users)\/[^/]+/, "~");
-// Equivalent tiers across vendors, so switching a session's provider keeps its weight class.
-const TIER_KEYS = [["opus", "sol"], ["fable", "astra"], ["sonnet", "haiku", "luna"]];
+const effectiveTiers = () => state.fallback?.tiers?.length ? state.fallback.tiers : state.fallback_defaults?.tiers ?? [];
+const PROVIDER_KEY = {anthropic: "anthropic", codex: "codex", cursor: "cursor"};
 function providerOfModel(model) {
   if (!model) return "";
   const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(model));
@@ -619,11 +673,15 @@ function providerOfModel(model) {
 }
 function sameTier(provider, model) {
   if (model && providerOfModel(model) === provider) return model;
+  const m0 = (model || "").toLowerCase(), group = effectiveTiers().find((t) => t.match.some((k) => k.toLowerCase() === m0.replace(/\[1m\]$/, "")))
+    || effectiveTiers().find((t) => t.match.some((k) => m0.includes(k.toLowerCase())));
+  // A configured destination is honoured even when the router does not list it (it shows as an exact id).
+  if (group?.models[PROVIDER_KEY[provider]]) return group.models[PROVIDER_KEY[provider]];
   const newest = (a, b) => b.localeCompare(a, undefined, {numeric: true});
   const ids = [...(state.providers.models[provider] || [])].sort(newest), m = (model || "").toLowerCase();
-  const keys = TIER_KEYS.find((k) => k.some((key) => m.includes(key)));
+  const keys = group?.match.map((k) => k.toLowerCase());
   const plain = (id) => !/fast|low|spark|-mini/.test(id);
-  return (keys && (ids.find((id) => plain(id) && keys.some((k) => id.includes(k))) || ids.find((id) => keys.some((k) => id.includes(k)))))
+  return (keys?.length && (ids.find((id) => plain(id) && keys.some((k) => id.includes(k))) || ids.find((id) => keys.some((k) => id.includes(k)))))
     || ids.find(plain) || ids[0] || "";
 }
 function providerOptions(current) {
@@ -678,7 +736,9 @@ function renderSessions() {
     showExact();
     pick.onchange = showExact;
     tr.querySelector("[data-provider]").onchange = (e) => {
-      pick.innerHTML = modelOptions(e.target.value, sameTier(e.target.value, tr.dataset.asked));
+      const selected = sameTier(e.target.value, tr.dataset.asked);
+      pick.innerHTML = modelOptions(e.target.value, selected);
+      exact.value = selected;
       showExact();
     };
     tr.querySelector("[data-force]").onclick = () => {
@@ -694,11 +754,74 @@ async function loadSessions() {
   catch (e) { showError(e); }
 }
 
-function render() { renderHeader(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
+const TIER_PROVIDER_LABEL = [["anthropic", "Claude"], ["codex", "Codex"], ["cursor", "Cursor API"]];
+const tierRow = (t) => ({name: t.name, match: t.match.join(", "), models: {...t.models}});
+const tierSignature = (tiers) => JSON.stringify(tiers.map(({name, match, models}) => [name, match, Object.entries(models).sort(([a], [b]) => a.localeCompare(b))]));
+function draftTiers() {
+  return draft.map((r) => ({name: r.name.trim(), match: r.match.split(",").map((k) => k.trim()).filter(Boolean),
+    models: Object.fromEntries(Object.entries(r.models).map(([p, m]) => [p, m.trim()]).filter(([, m]) => m))}));
+}
+function modelsFailed(e) {
+  $("models").innerHTML = `<div class="error">Could not load settings: ${esc(e.message || e)} <button data-retry>Retry</button></div>`;
+  $("models").querySelector("[data-retry]").onclick = () => { $("models").innerHTML = `<div class="skeleton">Loading equivalence groups…</div>`; loadState(); };
+}
+function renderModels(force = false) {
+  const box = $("models");
+  if (!hasLoaded || (!force && box.contains(document.activeElement))) return;
+  const configured = state.fallback.tiers?.length ? state.fallback.tiers : null;
+  const base = configured ?? state.fallback_defaults?.tiers ?? null;
+  if (!base && !dirty) {
+    box.innerHTML = `<div class="error">Router unreachable: its default equivalence groups are unknown, so nothing is shown to edit.</div>`;
+    return;
+  }
+  if (!dirty) draft = base.map(tierRow);
+  const ids = (p) => (state.providers.models[p] || []).filter((m) => p !== "anthropic" || /^claude-[A-Za-z0-9][A-Za-z0-9._-]*$/.test(m));
+  box.innerHTML = `<p class="small muted">A request is served by another provider's model in the same group. A match key equal to the whole model id wins over a key contained in the name.
+      Saving replaces every group, including the defaults. ${configured ? "Custom groups are in use." : "These are the router defaults."}
+      ${state.fallback_defaults ? "" : "Router defaults unavailable."} Claude destinations use full claude-* IDs; Codex also accepts aliases such as sol.</p>` +
+    draft.map((r, i) => `<article data-tier="${i}">
+      <label>Name<input data-f="name" value="${esc(r.name)}" maxlength="64"></label>
+      <label>Match keys, comma separated<input data-f="match" value="${esc(r.match)}" placeholder="opus, sol"></label>
+      <div class="tier-grid">${TIER_PROVIDER_LABEL.map(([p, label]) => `<label>${label} model<input data-m="${p}" list="ids-${p}" value="${esc(r.models[p] || "")}" placeholder="none: skipped"></label>`).join("")}</div>
+      <button class="secondary outline" data-rm="${i}">Remove group</button></article>`).join("") +
+    TIER_PROVIDER_LABEL.map(([p]) => `<datalist id="ids-${p}">${ids(p).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>`).join("") +
+    `<div class="actions"><button data-add class="secondary">Add group</button><button data-save ${dirty ? "" : "disabled"}>Save</button>
+      <button data-reset class="secondary" ${configured || dirty ? "" : "disabled"}>Reset to defaults</button></div>`;
+  box.querySelectorAll("article").forEach((a) => {
+    const row = draft[+a.dataset.tier];
+    a.querySelectorAll("input").forEach((input) => input.oninput = () => {
+      if (input.dataset.f) row[input.dataset.f] = input.value; else row.models[input.dataset.m] = input.value;
+      dirty = true; box.querySelector("[data-save]").disabled = false; box.querySelector("[data-reset]").disabled = false;
+    });
+  });
+  box.querySelectorAll("[data-rm]").forEach((b) => b.onclick = () => { draft.splice(+b.dataset.rm, 1); dirty = true; renderModels(true); });
+  box.querySelector("[data-add]").onclick = () => { draft.push({name: "", match: "", models: {}}); dirty = true; renderModels(true); };
+  box.querySelector("[data-save]").onclick = async () => {
+    const tiers = draftTiers(), same = state.fallback_defaults && tierSignature(tiers) === tierSignature(state.fallback_defaults.tiers);
+    if (await save({fallback: {...failover(), tiers: same ? [] : tiers}})) { dirty = false; renderModels(true); }
+  };
+  box.querySelector("[data-reset]").onclick = async () => {
+    if (await save({fallback: {...failover(), tiers: []}})) { dirty = false; renderModels(true); }
+  };
+}
+
+const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", sessions: "Sessions", requests: "Requests"};
+function showView() {
+  const view = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : "overview";
+  document.querySelectorAll("[data-view]").forEach((x) => { x.hidden = x.dataset.view !== view; });
+  document.querySelectorAll(".side a").forEach((a) => a.hash === "#" + view ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
+  $("view-title").textContent = VIEWS[view];
+  $("nav-list").classList.remove("open"); $("menu-toggle").setAttribute("aria-expanded", "false");
+}
+$("menu-toggle").onclick = () => $("menu-toggle").setAttribute("aria-expanded", $("nav-list").classList.toggle("open"));
+addEventListener("hashchange", showView);
+showView();
+
+function render() { renderHeader(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
 
 async function loadState() {
-  try { state = await api("/api/state"); render(); showError(null); }
-  catch (e) { showError(e); }
+  try { state = await api("/api/state"); hasLoaded = true; render(); showError(null); }
+  catch (e) { showError(e); if (!hasLoaded) modelsFailed(e); }
 }
 
 $("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); loadSessions(); };

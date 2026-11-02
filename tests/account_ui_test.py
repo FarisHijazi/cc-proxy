@@ -97,3 +97,79 @@ def test_setup_tokens_are_recognised_and_read_usage_from_reply_headers():
     assert windows["five_hour"]["utilization"] == 25.0
     assert windows["five_hour"]["resets_at"].startswith("2026-")
     assert windows["seven_day"] == {"utilization": 85.0, "resets_at": None}
+
+
+TIERS = [{"name": "heavy", "match": ["opus", " sol "], "models": {"anthropic": "claude-opus-5-5", "codex": "sol[1m]", "cursor": "cursor:claude-opus-5"}}]
+
+
+def test_tiers_are_validated_saved_and_kept_across_other_failover_edits(tmp_path):
+    board, accounts = dashboard(tmp_path)
+    saved = board.update({"fallback": {"tiers": TIERS}})["fallback"]
+    assert saved["tiers"][0]["match"] == ["opus", "sol"], "keys are stripped"
+    assert saved["tiers"][0]["models"]["codex"] == "sol[1m]", "aliases are accepted as destinations"
+    edited = board.update({"fallback": {"on": {"auth": False}, "chains": {"claude": ["accounts"]}}})["fallback"]
+    assert edited["tiers"] == saved["tiers"], "a failover edit without tiers keeps them"
+    assert "tiers" not in board.update({"fallback": {"tiers": []}})["fallback"], "an empty list means router defaults"
+    board.update({"fallback": {"tiers": TIERS}})
+    assert "tiers" not in board.update({"fallback": None}).get("fallback", {})
+    assert json.loads(accounts.read_text())["renamed"] == {"old": "a"}
+
+
+def tier(**kw):
+    return {"name": "t", "match": ["k"], "models": {"codex": "gpt-x"}, **kw}
+
+
+@pytest.mark.parametrize("tiers", [
+    "opus",
+    [tier(), tier(name="T", match=["other"])],
+    [tier(), tier(name="u")],
+    [tier(match=["a", "A"])],
+    [tier(match=[])],
+    [tier(match=[" "])],
+    [tier(match=["x" * 65])],
+    [tier(match=[str(i) for i in range(9)])],
+    [tier(models={})],
+    [tier(models={"gemini": "gemini-3-pro"})],
+    [tier(models={"codex": "bad id"})],
+    [tier(models={"codex": "x" * 129})],
+    [tier(name="")],
+    [{"name": "t", "match": ["k"]}],
+    [{**tier(), "extra": 1}],
+    [tier(name=f"n{i}", match=[f"k{i}"]) for i in range(25)],
+    [tier(name=f"n{i}", match=[f"k{i}" + "x" * 50 for _ in range(1)], models={"anthropic": "a" * 128, "codex": "b" * 128, "cursor": "c" * 128})
+     for i in range(24)],
+])
+def test_invalid_tiers_are_refused_and_nothing_is_written(tmp_path, tiers):
+    board, accounts = dashboard(tmp_path)
+    before = accounts.read_text()
+    with pytest.raises(ValueError):
+        board.update({"fallback": {"tiers": tiers}})
+    assert accounts.read_text() == before
+
+
+def test_router_defaults_travel_through_the_provider_read():
+    defaults = {"chains": {"claude": ["accounts", "codex"]}, "tiers": TIERS}
+
+    class Opener:
+        def open(self, url, timeout):
+            return io.BytesIO(json.dumps({"data": [{"display_name": "gpt-6.1-sol (codex)"}], "fallback_defaults": defaults}).encode())
+
+    board = ui["Dashboard"].__new__(ui["Dashboard"])
+    board.opener, board.cache = Opener(), {}
+    assert board.providers()["fallback_defaults"] == defaults
+
+    class Down:
+        def open(self, url, timeout):
+            raise OSError("down")
+
+    board.opener, board.cache = Down(), {}
+    assert board.providers() == {"reachable": False, "models": {n: [] for n in ui["PROVIDERS"]}, "fallback_defaults": None}
+
+
+@pytest.mark.parametrize("model", ["opus", "opus[1m]", "sonnet", "claude-opus-5-5[1m]"])
+def test_anthropic_equivalence_requires_a_full_upstream_model_id(tmp_path, model):
+    board, accounts = dashboard(tmp_path)
+    before = accounts.read_text()
+    with pytest.raises(ValueError, match="full claude-.*model id"):
+        board.update({"fallback": {"tiers": [tier(models={"anthropic": model})]}})
+    assert accounts.read_text() == before

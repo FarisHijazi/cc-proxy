@@ -1,4 +1,4 @@
-//! Quota failover: Claude accounts in order, then the Codex tier, then Cursor.
+//! Quota failover: Claude accounts in order, then the Codex tier; Cursor only when configured.
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -237,16 +237,18 @@ async fn cooldown_is_per_model() {
 }
 
 #[tokio::test]
-async fn all_accounts_exhausted_uses_codex_tier_then_cursor() {
+async fn all_accounts_exhausted_uses_codex_tier_then_a_configured_cursor() {
     let upstream = anthropic_upstream().await;
     let codex = stub("codex", "gpt-6.1-sol", StatusCode::TOO_MANY_REQUESTS);
     let cursor = stub("cursor", "cursor:claude-opus-5", StatusCode::OK);
     let router = gateway(&upstream.base, vec![codex.clone(), cursor.clone()]);
-    let (status, body) = send(
+    let policy = json!({"chains": {"claude": ["accounts", "codex", "cursor"]}});
+    let (status, body) = send_with(
         router,
         "claude-opus-5-5[1m]",
         Some(pool(&[("c1", "dead-c1"), ("c2", "dead-c2")])),
         false,
+        Some(policy),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -277,6 +279,28 @@ async fn a_configured_chain_replaces_the_default_order() {
         upstream.seen.lock().unwrap().iter().all(|(_, pool)| !pool),
         "neither the pool nor the policy reaches the upstream"
     );
+}
+
+/// The shape the dashboard saves under `fallback.tiers` (tests/account_ui_http_test.py writes the same).
+#[tokio::test]
+async fn configured_tiers_choose_the_destination_model() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-custom", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let policy = json!({"tiers": [
+        {"name": "mine", "match": ["opus"], "models": {"anthropic": "claude-opus-5-5", "codex": "gpt-custom"}},
+    ]});
+    let (status, body) = send_with(
+        router,
+        "claude-opus-5-5",
+        Some(pool(&[("h1", "dead-h1")])),
+        false,
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "codex");
+    assert_eq!(*codex.seen.lock().unwrap(), ["gpt-custom"]);
 }
 
 #[tokio::test]
@@ -781,4 +805,63 @@ async fn counts_neither_cool_down_messages_nor_move_thread_deltas() {
         "a contextless delta stays on its own account"
     );
     assert_eq!(seen_auths(&upstream).len(), 5);
+}
+
+#[tokio::test]
+async fn custom_tier_discovers_a_cold_codex_destination_before_routing() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("auth.json"),
+        json!({"tokens":{"access_token":"toy-token","account_id":"toy-account"}}).to_string(),
+    )
+    .unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let catalog = Router::new().route("/models", axum::routing::get(move || {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            axum::Json(json!({"models":[{"slug":"gpt-6.10-sol","visibility":"list","supported_in_api":true}]}))
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/responses", listener.local_addr().unwrap());
+    let catalog_task = tokio::spawn(async move { axum::serve(listener, catalog).await.unwrap() });
+    let previous: Vec<_> = ["CODEX_HOME", "CCP_CODEX_BASE_URL", "NO_PROXY"]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+    unsafe {
+        std::env::set_var("CODEX_HOME", home.path());
+        std::env::set_var("CCP_CODEX_BASE_URL", base);
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+    }
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let (status, body) = send_with(
+        gateway(&upstream.base, vec![codex]),
+        "claude-opus-5-5",
+        Some(pool(&[("a", "dead-a")])),
+        false,
+        Some(
+            json!({"tiers":[{"name":"custom","match":["opus"],"models":{"codex":"gpt-6.10-sol"}}]}),
+        ),
+    )
+    .await;
+    for (key, value) in previous {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+    catalog_task.abort();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a discovered custom destination must not be silently skipped"
+    );
+    assert_eq!(body["model"], "gpt-6.10-sol");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

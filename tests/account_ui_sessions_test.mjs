@@ -32,10 +32,11 @@ try {
   const page = await (await browser.newContext({ viewport: { width: 1280, height: 2400 } })).newPage();
   const posts = [];
   let forced = { [TWO]: "claude-mythos-1" };
+  let tiers = [];
   let releaseSessions;
   const sessionsGate = new Promise((resolve) => { releaseSessions = resolve; });
   const state = () => ({
-    accounts: [], balance: { strategy: "session" }, strategies: ["session"], fallback: {}, default_chains: {},
+    accounts: [], balance: { strategy: "session" }, strategies: ["session"], fallback: {tiers}, fallback_defaults: null,
     providers: { reachable: true, models: { anthropic: ["claude-opus-4-7"], codex: ["gpt-6.1-sol-fast", "gpt-6.1-sol", "gpt-6-luna"], "cursor-cli": ["cursor-cli:auto"] } },
     proxy: { address: "x:1", up: true }, db: { path: "/t.db", bytes: 0, disk_free: 1 }, traffic_days: null, session_models: forced,
   });
@@ -58,8 +59,8 @@ try {
     if (url.pathname === "/api/stats") return json({ total: 0, errors: 0, series: {}, by_account: {}, by_host: {}, by_model: {} });
     return json({ rows: [] });
   });
-  await page.goto("http://dash.test/");
-  await page.locator("#providers .provider").first().waitFor();
+  await page.goto("http://dash.test/#sessions");
+  await page.waitForFunction(() => document.querySelector("#updated").textContent);
   assert.equal(await page.locator("#sessions").innerText(), "Loading sessions…", "nothing but the loading line before sessions arrive");
 
   releaseSessions();
@@ -106,6 +107,15 @@ try {
   assert.deepEqual(posts.at(-1), { session_models: { [TWO]: null } });
   assert.equal(await row(TWO).locator("[data-clear]").isDisabled(), true);
   assert.equal(await row(ONE).locator(".forced").innerText(), "claude-mythos-2[1m]", "clearing one session leaves the other");
+  tiers = [{name: "custom", match: ["opus"], models: {anthropic: "claude-opus-5-5", codex: "sol[1m]"}}];
+  await page.locator("#refresh").click();
+  await page.waitForFunction(() => state.fallback.tiers?.length === 1);
+  await row(THREE).locator("[data-provider]").selectOption("codex");
+  assert.equal(await row(THREE).locator("[data-pick]").inputValue(), "exact");
+  assert.equal(await row(THREE).locator("[data-exact]").inputValue(), "sol[1m]", "switching provider populates the configured exact destination");
+  await row(THREE).locator("[data-force]").click();
+  await page.waitForFunction((sid) => document.querySelector(`#sessions tr[data-sid="${sid}"] .forced`)?.textContent === "sol[1m]", THREE);
+  assert.deepEqual(posts.at(-1), {session_models: {[THREE]: "sol[1m]"}});
   const fits = () => page.locator("#sessions").evaluate((el) => el.scrollWidth <= el.clientWidth + 1);
   assert.equal(await fits(), true, "Force and Clear fit at desktop width without sideways scrolling");
   await page.setViewportSize({ width: 1024, height: 2400 });
