@@ -173,3 +173,56 @@ def test_anthropic_equivalence_requires_a_full_upstream_model_id(tmp_path, model
     with pytest.raises(ValueError, match="full claude-.*model id"):
         board.update({"fallback": {"tiers": [tier(models={"anthropic": model})]}})
     assert accounts.read_text() == before
+
+
+def usage_board(tmp_path, columns=True):
+    import sqlite3
+    import time as clock
+    board, accounts = dashboard(tmp_path)
+    db_path = tmp_path / "traffic.sqlite3"
+    cfg = json.loads(accounts.read_text())
+    accounts.write_text(json.dumps({**cfg, "traffic_db": str(db_path)}))
+    db = sqlite3.connect(db_path)
+    tokens = ", input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER" if columns else ""
+    db.execute("CREATE TABLE flows (id TEXT, started REAL, client_ip TEXT, client_host TEXT, client_user TEXT, "
+               f"launch_cwd TEXT, cwd TEXT, session_id TEXT, account TEXT, served_by TEXT, model TEXT, url TEXT, status INTEGER{tokens})")
+    now = clock.time()
+    rows = [
+        # id, age, host, session, served_by, url, tokens
+        ("1", 60, "vm-a", "s1", "a/claude-opus-5-5", "/v1/messages", (100, 1000, 10)),
+        ("2", 50, "vm-a", "s1", "b/claude-opus-5-5", "/v1/messages", (50, 500, 5)),
+        ("3", 40, "vm-a", "s2", "a/claude-opus-5-5", "/v1/messages", None),
+        ("4", 30, "vm-b", "s3", "codex/gpt-5.6", "/v1/messages", (7, 0, 3)),
+        ("5", 20, "vm-b", "s3", None, "/v1/messages/count_tokens", (999, 0, 0)),
+        ("6", 10 * 86400, "vm-b", "old", "a/claude-opus-5-5", "/v1/messages", (5, 5, 5)),
+    ]
+    for flow_id, age, host, session, served, url, counts in rows:
+        values = [flow_id, now - age, None, host, "dev", None, "/work", session, None, served, "claude-opus-5-5", url, 200]
+        if columns:
+            values += list(counts or (None, None, None))
+        db.execute(f"INSERT INTO flows VALUES ({','.join('?' * len(values))})", values)
+    db.commit()
+    return board
+
+
+def test_usage_totals_per_machine_session_and_account(tmp_path):
+    usage = usage_board(tmp_path).usage(24)
+    assert usage["total"]["requests"] == 4 and usage["total"]["sessions"] == 3
+    assert usage["total"]["tokens"] == {"input": 157, "cache_read": 1500, "output": 18}
+    assert usage["total"]["tokens_reported"] == 3
+    hosts = {h["host"]: h for h in usage["by_host"]}
+    assert [h["host"] for h in usage["by_host"]] == ["vm-a", "vm-b"]  # most tokens first
+    assert hosts["vm-a"]["sessions"] == 2 and hosts["vm-a"]["requests"] == 3
+    assert hosts["vm-a"]["tokens"] == {"input": 150, "cache_read": 1500, "output": 15}
+    first = usage["by_session"][0]
+    assert first["session_id"] == "s1" and first["host"] == "vm-a" and first["accounts"] == {"a": 1, "b": 1}
+    unreported = next(s for s in usage["by_session"] if s["session_id"] == "s2")
+    assert unreported["tokens_reported"] == 0 and unreported["tokens"] == {"input": 0, "cache_read": 0, "output": 0}
+    accounts = {a["account"]: a for a in usage["by_account"]}
+    assert accounts["a"]["requests"] == 2 and accounts["codex"]["tokens"]["output"] == 3
+
+
+def test_usage_on_a_database_without_token_columns_reports_tokens_unknown(tmp_path):
+    usage = usage_board(tmp_path, columns=False).usage(24)
+    assert usage["total"]["requests"] == 4 and usage["tokens_recorded"] is False
+    assert usage["total"]["tokens_reported"] == 0

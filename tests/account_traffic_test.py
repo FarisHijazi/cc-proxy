@@ -156,3 +156,53 @@ def test_rows_and_unused_blobs_older_than_traffic_days_are_dropped(tmp_path, mon
     db = sqlite3.connect(tmp_path / "traffic.sqlite3")
     assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 1
     assert db.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1  # only the new message
+
+
+def test_reply_token_counts_are_stored_on_the_row(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    stream = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":40,"output_tokens":1}}}\n\n'
+        b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
+    )
+    flow.response = http.Response.make(200, stream, {"content-type": "text/event-stream"})
+    traffic.response(flow)
+    [row] = rows(tmp_path)
+    assert (row["input_tokens"], row["cache_read_tokens"], row["output_tokens"]) == (8, 40, 9)
+
+
+def test_a_reply_without_usage_has_unknown_not_zero_tokens(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(529, b'{"error": "overloaded"}')
+    traffic.response(flow)
+    [row] = rows(tmp_path)
+    assert (row["input_tokens"], row["cache_read_tokens"], row["output_tokens"]) == (None, None, None)
+
+
+def test_older_databases_gain_the_token_columns(tmp_path):
+    path = tmp_path / "traffic.sqlite3"
+    old = sqlite3.connect(path)
+    old.executescript(module.SCHEMA.replace(
+        ",\n    input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER", ""))
+    old.close()
+    recorder(tmp_path).connection()
+    columns = {row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(flows)")}
+    assert {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns
+
+
+def test_backfill_fills_old_rows_and_leaves_unreported_ones_unknown(tmp_path):
+    cli = __import__("runpy").run_path(str(Path(__file__).parents[1] / "scripts/claude-traffic"))
+    recorder(tmp_path).connection()
+    db = sqlite3.connect(tmp_path / "traffic.sqlite3")
+    reply = zlib.compress(b'{"usage": {"input_tokens": 2, "cache_read_input_tokens": 7, "output_tokens": 4}}')
+    db.executemany("INSERT INTO flows (id, model, response_body) VALUES (?, ?, ?)", [
+        ("a", "claude-opus-5-5", reply), ("b", "claude-opus-5-5", zlib.compress(b"overloaded")), ("c", None, reply)])
+    db.commit()
+    assert cli["backfill_tokens"](db, batch=1) == 1
+    got = dict(db.execute("SELECT id, input_tokens FROM flows").fetchall())
+    assert got == {"a": 2, "b": None, "c": None}
+    assert db.execute("SELECT cache_read_tokens, output_tokens FROM flows WHERE id = 'a'").fetchone() == (7, 4)

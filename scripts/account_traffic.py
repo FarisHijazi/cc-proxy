@@ -12,6 +12,7 @@ the request body keeps `{"$blob": hash}` in their place. Read them with
 import hashlib
 import json
 import re
+import runpy
 import sqlite3
 import subprocess
 import time
@@ -20,6 +21,14 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from mitmproxy.net import encoding
+
+reply_tokens = runpy.run_path(str(Path(__file__).with_name("account_providers.py")))["reply_tokens"]
+TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "output_tokens")
+FLOW_COLUMNS = (
+    "id, started, finished, client_ip, client_host, client_user, launch_cwd, cwd, session_id, account, "
+    "served_by, model, method, url, status, error, request_headers, request_body, response_headers, "
+    "response_body, " + ", ".join(TOKEN_COLUMNS)
+)
 
 # Set by `claude-account-router --via` clients; stripped here so they go no further.
 CLIENT_HEADERS = {
@@ -40,7 +49,8 @@ CREATE TABLE IF NOT EXISTS flows (
     client_ip TEXT, client_host TEXT, client_user TEXT, launch_cwd TEXT, cwd TEXT,
     session_id TEXT, account TEXT, served_by TEXT, model TEXT,
     method TEXT, url TEXT, status INTEGER, error TEXT,
-    request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB
+    request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB,
+    input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS flows_started ON flows(started);
 CREATE INDEX IF NOT EXISTS flows_session ON flows(session_id);
@@ -153,6 +163,10 @@ class TrafficDB:
                     self.db.execute("UPDATE blobs SET last_seen = ?", (time.time(),))
                 except sqlite3.OperationalError:
                     pass
+                present = {row[1] for row in self.db.execute("PRAGMA table_info(flows)")}
+                for column in TOKEN_COLUMNS:  # databases written before token counts were kept
+                    if column not in present:
+                        self.db.execute(f"ALTER TABLE flows ADD COLUMN {column} INTEGER")
         return self.db
 
     def prune(self):
@@ -239,11 +253,13 @@ class TrafficDB:
                 request_body = self.deduplicated(parsed)
         except (ValueError, AttributeError):
             pass
+        tokens = None
         if response is not None:
             raw = b"".join(meta["chunks"]) if "chunks" in meta else response.raw_content
             response_body = clean_body(raw, response.headers.get("content-encoding", ""))
+            tokens = reply_tokens(response_body) if model else None
         db.execute(
-            "INSERT OR REPLACE INTO flows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 23)})",
             (
                 flow.id, meta["started"], time.time(),
                 meta["client_ip"], meta.get("client_host"), meta.get("client_user"), meta.get("launch_cwd"), cwd,
@@ -254,6 +270,7 @@ class TrafficDB:
                 meta["request_headers"], request_body,
                 clean_headers(response.headers) if response is not None else None,
                 response_body if response is not None else None,
+                *((tokens["input"], tokens["cache_read"], tokens["output"]) if tokens else (None, None, None)),
             ),
         )
 

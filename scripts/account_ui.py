@@ -39,6 +39,9 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # The Sessions panel: sessions with inference traffic in this window, newest first, at most this many.
 RECENT_SESSION_DAYS = 7
 RECENT_SESSION_LIMIT = 50
+# The usage view lists at most this many sessions, largest first, over at most 90 days.
+USAGE_SESSION_LIMIT = 300
+USAGE_MAX_HOURS = 90 * 24
 PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "grok"]
 _providers = runpy.run_path(str(HERE / "account_providers.py"), run_name="account_providers")
 provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cursor_card_quota"]
@@ -147,6 +150,10 @@ def reply_usage(headers):
 
 def alias_of(placeholder):
     return (placeholder or "").removeprefix("proxy-account-").split("+")[0] or None
+
+
+def usage_size(entry):
+    return sum(entry["tokens"].values()), entry["requests"]
 
 
 class Dashboard:
@@ -376,6 +383,56 @@ class Dashboard:
             series[min(int((started - since) // bucket), 23)] += 1
         return result
 
+    def usage(self, hours):
+        """Model calls and reported tokens over `hours`, in total and per machine, session and
+        answering account. Tokens are only what replies reported; `tokens_reported` says how many did."""
+        db = self.database(self.config())
+        result = {"hours": hours, "traffic_db": db is not None, "tokens_recorded": False,
+                  "total": None, "by_host": [], "by_session": [], "by_account": []}
+        if db is None:
+            return result
+        columns = {row[1] for row in db.execute("PRAGMA table_info(flows)")}
+        recorded = {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns
+        result["tokens_recorded"] = recorded
+        counts = ("input_tokens, cache_read_tokens, output_tokens" if recorded else "NULL, NULL, NULL")
+        rows = db.execute(
+            f"SELECT coalesce(client_host, client_ip, 'unknown'), session_id, client_user, coalesce(cwd, launch_cwd), "
+            f"served_by, account, started, {counts} FROM flows WHERE started > ? AND model IS NOT NULL "
+            "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'",
+            (time.time() - hours * 3600,)).fetchall()
+
+        def bucket(**fields):
+            return {**fields, "requests": 0, "tokens": {"input": 0, "cache_read": 0, "output": 0},
+                    "tokens_reported": 0, "first_at": None, "last_at": None}
+
+        def add(entry, started, tokens):
+            entry["requests"] += 1
+            entry["first_at"] = min(entry["first_at"] or started, started)
+            entry["last_at"] = max(entry["last_at"] or started, started)
+            if tokens[0] is not None:
+                entry["tokens_reported"] += 1
+                for key, value in zip(("input", "cache_read", "output"), tokens):
+                    entry["tokens"][key] += value or 0
+
+        total, hosts, sessions, accounts = bucket(), {}, {}, {}
+        for host, session, user, cwd, served_by, account, started, *tokens in rows:
+            who = (served_by or "").split("/")[0] or alias_of(account) or "unknown"
+            add(total, started, tokens)
+            add(hosts.setdefault(host, bucket(host=host, session_ids=set())), started, tokens)
+            hosts[host]["session_ids"].add(session)
+            entry = sessions.setdefault((host, session), bucket(session_id=session, host=host, user=user, cwd=cwd, accounts={}))
+            add(entry, started, tokens)
+            entry["accounts"][who] = entry["accounts"].get(who, 0) + 1
+            add(accounts.setdefault(who, bucket(account=who)), started, tokens)
+        for entry in hosts.values():
+            entry["sessions"] = len(entry.pop("session_ids"))
+        total["sessions"] = len({key for key in sessions if key[1] is not None})
+        total["hosts"] = len(hosts)
+        result.update(total=total, by_host=sorted(hosts.values(), key=usage_size, reverse=True),
+                      by_session=sorted(sessions.values(), key=usage_size, reverse=True)[:USAGE_SESSION_LIMIT],
+                      by_account=sorted(accounts.values(), key=usage_size, reverse=True))
+        return result
+
     def flow(self, flow_id):
         db = self.database(self.config())
         if db is None:
@@ -463,6 +520,8 @@ def handler(dashboard):
                     return self.reply(200, dashboard.traffic(query))
                 if url.path == "/api/sessions":
                     return self.reply(200, dashboard.sessions())
+                if url.path == "/api/usage":
+                    return self.reply(200, dashboard.usage(min(max(int(query.get("hours", 24)), 1), USAGE_MAX_HOURS)))
                 if url.path == "/api/stats":
                     return self.reply(200, dashboard.stats(int(query.get("hours", 24))))
                 if url.path.startswith("/api/flow/"):

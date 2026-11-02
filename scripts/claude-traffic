@@ -3,11 +3,13 @@
 
   claude-traffic [-n 20]       newest flows: when, machine, user, folder, account, model
   claude-traffic show FLOW_ID  one flow with its decompressed request and response
+  claude-traffic backfill-tokens  fill token counts on rows recorded before they were stored
 Metadata columns are plain SQL, so `sqlite3 DB` works for anything else.
 """
 
 import argparse
 import json
+import runpy
 import sqlite3
 import time
 import zlib
@@ -26,6 +28,25 @@ def restored(db, value):
     return value
 
 
+def backfill_tokens(db, batch=2000):
+    """Token counts for model calls recorded before account_traffic.py stored them. A reply that
+    reported none stays NULL (unknown), so a rerun reads it again. Returns rows filled."""
+    reply_tokens = runpy.run_path(str(Path(__file__).with_name("account_providers.py")))["reply_tokens"]
+    filled, after = 0, ""
+    while True:
+        rows = db.execute(
+            "SELECT id, response_body FROM flows WHERE id > ? AND model IS NOT NULL AND input_tokens IS NULL "
+            "AND response_body IS NOT NULL ORDER BY id LIMIT ?", (after, batch)).fetchall()
+        if not rows:
+            return filled
+        updates = [(t["input"], t["cache_read"], t["output"], flow_id)
+                   for flow_id, body in rows if (t := reply_tokens(body))]
+        db.executemany("UPDATE flows SET input_tokens = ?, cache_read_tokens = ?, output_tokens = ? WHERE id = ?", updates)
+        db.commit()
+        filled += len(updates)
+        after = rows[-1][0]
+
+
 def default_db():
     accounts = Path.home() / ".config/claude-codex/accounts.json"
     return json.loads(accounts.read_text()).get("traffic_db")
@@ -40,6 +61,9 @@ def main():
     path = args.db or default_db()
     if not path:
         parser.error("no --db and no traffic_db in ~/.config/claude-codex/accounts.json")
+    if args.command == ["backfill-tokens"]:
+        print(f"filled {backfill_tokens(sqlite3.connect(Path(path).expanduser()))} rows")
+        return
     db = sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     if args.command[:1] == ["show"] and len(args.command) == 2:

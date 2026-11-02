@@ -32,7 +32,7 @@
     .side #menu-toggle { display: block; }
     .side ul { display: none; } .side ul.open { display: block; }
   }
-  main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 64px; }
+  main { width: 100%; min-width: 0; max-width: 1120px; margin: 0 auto; padding: 24px 16px 64px; }
   .models-view { --pico-spacing: .6rem; --pico-form-element-spacing-vertical: .4rem; }
   .models-view h2 { font-size: 14px; }
   .models-view :is(input, button) { font-size: 16px; min-height: 44px; }
@@ -168,6 +168,7 @@
     <li><a href="#accounts">Accounts</a></li>
     <li><a href="#routing">Routing</a></li>
     <li><a href="#models">Models</a></li>
+    <li><a href="#usage">Usage</a></li>
     <li><a href="#sessions">Sessions</a></li>
     <li><a href="#requests">Requests</a></li>
   </ul>
@@ -216,6 +217,20 @@
   <section data-view="models" class="pico models-view" hidden>
   <h2>Equivalent models</h2>
   <div id="models"><div class="skeleton">Loading equivalence groups…</div></div>
+  </section>
+
+  <section data-view="usage" hidden>
+  <div class="row" style="margin-bottom:10px">
+    <div class="seg" id="usage-range"><button data-h="24" class="on">24h</button><button data-h="168">7d</button><button data-h="720">30d</button><button data-h="2160">90d</button></div>
+    <span class="small muted" id="usage-note"></span>
+  </div>
+  <div class="stats" id="usage-total"><div class="panel skeleton">Loading usage…</div></div>
+  <h2>By machine <span class="muted" style="text-transform:none;letter-spacing:0">click a machine to list only its sessions</span></h2>
+  <div class="panel scroll" style="padding:0" id="usage-hosts"><div class="skeleton">Loading machines…</div></div>
+  <h2>By account</h2>
+  <div class="panel scroll" style="padding:0" id="usage-accounts"><div class="skeleton">Loading accounts…</div></div>
+  <h2>By session <span class="muted" style="text-transform:none;letter-spacing:0" id="usage-filter"></span></h2>
+  <div class="panel scroll" style="padding:0" id="usage-sessions"><div class="skeleton">Loading sessions…</div></div>
   </section>
 
   <section data-view="sessions" hidden>
@@ -805,7 +820,54 @@ function renderModels(force = false) {
   };
 }
 
-const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", sessions: "Sessions", requests: "Requests"};
+let usage = null, usageHours = 24, usageHost = null;
+const big = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+const tokenSum = (e) => e.tokens.input + e.tokens.cache_read + e.tokens.output;
+function tokenCells(e, max) {
+  if (!usage.tokens_recorded || !e.tokens_reported) return `<td colspan="4" class="muted">tokens unknown</td>`;
+  const part = e.tokens_reported < e.requests ? ` title="${e.tokens_reported} of ${e.requests} replies reported tokens"` : "";
+  return `<td${part}><strong>${big(tokenSum(e))}</strong>${part ? " *" : ""}<div class="track"><div class="fill" style="width:${tokenSum(e) / max * 100}%"></div></div></td>
+    <td>${big(e.tokens.input)}</td><td>${big(e.tokens.cache_read)}</td><td>${big(e.tokens.output)}</td>`;
+}
+const TOKEN_HEAD = `<th>Tokens</th><th>Input</th><th>Cache read</th><th>Output</th>`;
+function renderUsage() {
+  if (!usage) return;
+  if (!usage.traffic_db) {
+    for (const id of ["usage-total", "usage-hosts", "usage-accounts", "usage-sessions"]) $(id).innerHTML = `<div class="skeleton">Traffic recording is off, so no usage is known.</div>`;
+    return;
+  }
+  const t = usage.total;
+  $("usage-note").textContent = usage.tokens_recorded ? "Tokens are what replies reported; * marks rows where some replies reported none." : "This database has no token counts yet: run claude-traffic backfill-tokens.";
+  $("usage-total").innerHTML = `
+    <div class="panel"><div class="small muted">Model calls</div><div class="big">${t.requests.toLocaleString()}</div><div class="small muted">${t.sessions} sessions on ${t.hosts} machines</div></div>
+    <div class="panel"><div class="small muted">Tokens</div><div class="big">${usage.tokens_recorded && t.tokens_reported ? big(tokenSum(t)) : "unknown"}</div>
+      <div class="small muted">${usage.tokens_recorded && t.tokens_reported ? `${big(t.tokens.input)} in · ${big(t.tokens.cache_read)} cache read · ${big(t.tokens.output)} out` : ""}</div></div>`;
+  const maxOf = (rows) => Math.max(1, ...rows.map(tokenSum));
+  const hostMax = maxOf(usage.by_host);
+  $("usage-hosts").innerHTML = usage.by_host.length ? `<table><thead><tr><th>Machine</th><th>Sessions</th><th>Calls</th>${TOKEN_HEAD}<th>Last call</th></tr></thead><tbody>
+    ${usage.by_host.map((h) => `<tr data-host="${esc(h.host)}" style="cursor:pointer${h.host === usageHost ? ";background:var(--line)" : ""}"><td><strong>${esc(h.host)}</strong></td><td>${h.sessions}</td><td>${h.requests.toLocaleString()}</td>
+      ${tokenCells(h, hostMax)}<td>${ago(h.last_at)} ago</td></tr>`).join("")}</tbody></table>` : `<div class="skeleton">No model calls in this window.</div>`;
+  $("usage-hosts").querySelectorAll("tr[data-host]").forEach((tr) => tr.onclick = () => { usageHost = usageHost === tr.dataset.host ? null : tr.dataset.host; renderUsage(); });
+  const accountMax = maxOf(usage.by_account);
+  $("usage-accounts").innerHTML = usage.by_account.length ? `<table><thead><tr><th>Answered by</th><th>Calls</th>${TOKEN_HEAD}</tr></thead><tbody>
+    ${usage.by_account.map((a) => `<tr><td>${esc(a.account)}</td><td>${a.requests.toLocaleString()}</td>${tokenCells(a, accountMax)}</tr>`).join("")}</tbody></table>` : `<div class="skeleton">No model calls in this window.</div>`;
+  const rows = usage.by_session.filter((s) => !usageHost || s.host === usageHost);
+  $("usage-filter").textContent = usageHost ? `on ${usageHost} (click it again for every machine)` : `largest first, top ${rows.length}`;
+  const sessionMax = maxOf(rows);
+  $("usage-sessions").innerHTML = rows.length ? `<table><thead><tr><th>Session</th><th>Where</th><th>Calls</th>${TOKEN_HEAD}<th>Answered by</th><th>Active</th></tr></thead><tbody>
+    ${rows.map((s) => `<tr><td title="${esc(s.session_id || "")}"><span class="mono">${esc(s.session_id ? s.session_id.slice(0, 8) : "no session id")}</span></td>
+      <td title="${esc(s.cwd || "")}">${esc([s.user, s.host].filter(Boolean).join("@"))}<br><span class="small muted">${esc(home(s.cwd || ""))}</span></td>
+      <td>${s.requests.toLocaleString()}</td>${tokenCells(s, sessionMax)}
+      <td class="small">${Object.entries(s.accounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${esc(k)} <span class="muted">${v}</span>`).join("<br>")}</td>
+      <td class="small">${ago(s.last_at)} ago<br><span class="muted">over ${ago(Date.now() / 1000 - (s.last_at - s.first_at))}</span></td></tr>`).join("")}</tbody></table>`
+    : `<div class="skeleton">No sessions in this window.</div>`;
+}
+async function loadUsage() {
+  try { usage = await api(`/api/usage?hours=${usageHours}`); renderUsage(); }
+  catch (e) { showError(e); }
+}
+
+const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", sessions: "Sessions", requests: "Requests"};
 function showView() {
   const view = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : "overview";
   document.querySelectorAll("[data-view]").forEach((x) => { x.hidden = x.dataset.view !== view; });
@@ -824,7 +886,11 @@ async function loadState() {
   catch (e) { showError(e); if (!hasLoaded) modelsFailed(e); }
 }
 
-$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); loadSessions(); };
+$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); loadSessions(); loadUsage(); };
+$("usage-range").querySelectorAll("button").forEach((b) => b.onclick = () => {
+  $("usage-range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+  usageHours = +b.dataset.h; loadUsage();
+});
 $("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
   $("range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
   hours = +b.dataset.h; loadStats();
@@ -832,8 +898,9 @@ $("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
 let typing;
 $("q").oninput = () => { clearTimeout(typing); typing = setTimeout(loadTraffic, 250); };
 $("inference").onchange = loadTraffic;
-loadState(); loadStats(); loadTraffic(); loadSessions();
+loadState(); loadStats(); loadTraffic(); loadSessions(); loadUsage();
 setInterval(loadState, 60000);
+setInterval(loadUsage, 60000);
 setInterval(() => { loadStats(); loadTraffic(); loadSessions(); }, 15000);
 </script>
 </body>

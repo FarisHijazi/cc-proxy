@@ -217,6 +217,10 @@ A client's `"pin_main": true` adds `+pin`, so its sessions start on their own al
 `"traffic_db"` in the `--serve` accounts file turns on `scripts/account_traffic.py` (every flow, sender
 metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` prunes). See
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
+Each model-call row also stores `input_tokens`/`cache_read_tokens`/`output_tokens` from the reply (parser:
+`account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
+fills older rows. The dashboard's Usage view (`/api/usage?hours=`) totals calls and tokens per machine, session and
+answering account. See `docs/devlog/claude_20261102-usage-by-machine-and-session.md` (plain path).
 `serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
 Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the
 router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
