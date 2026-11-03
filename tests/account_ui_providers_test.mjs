@@ -25,7 +25,7 @@ const USAGE = {
   },
 };
 
-async function open(browser, { reachable = true, usage = USAGE, stall = false, quota } = {}) {
+async function open(browser, { reachable = true, usage = USAGE, stall = false, quota, hash = "accounts" } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   const page = await ctx.newPage();
   const state = {
@@ -46,7 +46,7 @@ async function open(browser, { reachable = true, usage = USAGE, stall = false, q
     if (url.pathname === "/api/sessions") return json({ days: 7, limit: 50, traffic_db: false, sessions: [] });
     return json({ rows: [] });
   });
-  await page.goto("http://dash.test/#accounts");
+  await page.goto(`http://dash.test/#${hash}`);
   return { page, close: () => ctx.close() };
 }
 
@@ -127,6 +127,27 @@ try {
     assert.match(await page.locator("#provider-cards").innerText(), /Loading/);
     await close();
     console.log("ok loading");
+  }
+  {
+    const { page, close } = await open(browser, { hash: "models" });
+    const catalog = page.locator("#catalog");
+    await catalog.locator("[data-model]").first().waitFor();
+    const all = await catalog.locator("[data-model]").evaluateAll((els) => els.map((e) => e.dataset.model));
+    assert.deepEqual(all.sort(), ["claude-opus-5", "gemini-3-pro", "gpt-6.1-sol"], "every model of every signed-in backend is listed");
+    assert.match(await catalog.innerText(), /Kimi[\s\S]*not signed in/i, "a backend with no models says why");
+    assert.match(await page.locator("#catalog-count").innerText(), /3 models/);
+    await page.fill("#catalog-filter", "sol");
+    assert.deepEqual(await catalog.locator("[data-model]:visible").evaluateAll((els) => els.map((e) => e.dataset.model)), ["gpt-6.1-sol"]);
+    await close();
+    console.log("ok model catalog");
+  }
+  {
+    const { page, close } = await open(browser, { stall: true, hash: "models" });
+    await page.waitForTimeout(300);
+    assert.equal(await page.locator("#catalog [data-model]").count(), 0, "no catalog while state is in flight");
+    assert.match(await page.locator("#catalog").innerText(), /Loading/);
+    await close();
+    console.log("ok catalog loading");
   }
 } finally {
   await browser.close();

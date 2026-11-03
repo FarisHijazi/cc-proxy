@@ -961,7 +961,7 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
     assert launcher["main"]() == 0
     suffix = "+private" if private else ""
     assert launched == [f"proxy-account-work+rc=personal{suffix}+chromes"]
-    assert sorted(seen) == ["Bearer proxy-account-personal", "Bearer proxy-account-work"]
+    assert sorted(filter(None, seen)) == ["Bearer proxy-account-personal", "Bearer proxy-account-work"]
 
 
 @pytest.mark.parametrize("selected", [None, "personal", "work"])
@@ -1117,3 +1117,24 @@ def test_settings_and_model_parsing_stops_at_prompt_separator(prompt):
     rest, extra = launcher["take_settings"](forwarded)
     assert rest == ["--model", "sol[1m]", "--", *prompt]
     assert extra == {}
+
+
+def test_picker_lists_every_router_model_after_saved_rows(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "settings.json").write_text(json.dumps({"modelPicker": {"options": [{"model": "gemini-3-pro", "label": "Saved"}]}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    served = ["claude-opus-5 (anthropic)", "gemini-3-pro (gemini)", "qwen-local (local)",
+              "cursor-cli-plan (cursor-cli)", "cursor-cli:grok-high (cursor-cli)", "gpt-6.1-sol (codex)"]
+    monkeypatch.setitem(launcher["client_environment"].__globals__, "served_models", lambda proxy_url, ca: served)
+    _, serialized = launcher["client_environment"](tmp_path, 19999, tmp_path / "secure")
+    rows = json.loads(serialized)["modelPicker"]["options"]
+    assert rows[0] == {"model": "gemini-3-pro", "label": "Saved"}
+    added = [row for row in rows if not row["model"].endswith("[1m]")][1:]
+    assert added == [{"model": "qwen-local", "label": "qwen-local (local)"},
+                     {"model": "cursor-cli-plan", "label": "cursor-cli-plan (cursor-cli)"},
+                     {"model": "gpt-6.1-sol", "label": "gpt-6.1-sol (codex)"}]
+
+
+def test_served_models_is_empty_when_the_router_cannot_be_asked(tmp_path):
+    assert launcher["served_models"]("http://127.0.0.1:9", tmp_path / "missing.pem") == []

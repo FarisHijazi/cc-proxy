@@ -307,6 +307,10 @@ This is a client setting, not a separate upstream model. Existing sessions keep
 their launch environment; use `[1m]` there or start a new launcher process.
 The launcher adds `astra[1m]`, `sol[1m]`, `luna[1m]`, `terra[1m]`, and native
 Claude family rows to `modelPicker`, preserving your existing rows and settings.
+At launch it also asks the router for `/v1/models` and adds every non-Claude id,
+so a new backend model appears in `/model` at the next launch. cursor-agent's
+per-effort `cursor-cli:*` variants are left out; the dashboard's Models page lists
+every id, those included.
 Its default custom option is `sol[1m]`. An explicit `--model` gets `[1m]` unless
 it already has a context suffix. This is client budgeting only. It does not
 increase or guarantee the upstream model's context window.

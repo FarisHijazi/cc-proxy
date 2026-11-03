@@ -409,7 +409,21 @@ def default_context_hint(model):
     return model if not model or re.search(r"\[[^\]]+\]$", model) else model + "[1m]"
 
 
-def model_picker(extra):
+def served_models(proxy_url, ca):
+    """The router's model ids, each as "id (backend)"; empty when the router cannot be asked."""
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"https": proxy_url}),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca)),
+        )
+        with opener.open(urllib.request.Request("https://api.anthropic.com/v1/models"), timeout=15) as response:
+            return [m["display_name"] for m in json.load(response)["data"]]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Model picker: router models unavailable ({error}); /model shows the defaults only", file=sys.stderr)
+        return []
+
+
+def model_picker(extra, served=()):
     profile = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
     try:
         saved = json.loads((profile / "settings.json").read_text()).get("modelPicker", {})
@@ -425,6 +439,12 @@ def model_picker(extra):
         model = family + "[1m]"
         if model not in existing:
             options.append({"model": model, "label": family.title() + " [1m]"})
+    # Claude Code lists Claude models itself; cursor-agent's per-effort variants would add hundreds of rows.
+    for name in served:
+        model, _, backend = name.rpartition(" (")
+        if model and backend != "anthropic)" and ":" not in model and model not in existing:
+            options.append({"model": model, "label": name})
+            existing.add(model)
     return {**picker, "options": options}
 
 
@@ -550,7 +570,7 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None, 
     settings = dict(extra or {})
     settings["env"] = {**settings.get("env", {}), **settings_env}
     settings["apiKeyHelper"] = ""
-    settings["modelPicker"] = model_picker(settings)
+    settings["modelPicker"] = model_picker(settings, served_models(proxy_url, state / "client-ca.pem"))
     return env, json.dumps(settings)
 
 

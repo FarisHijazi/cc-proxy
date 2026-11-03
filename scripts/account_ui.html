@@ -42,6 +42,9 @@
   .tier-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0 12px; }
   .models-view .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .models-view .actions button { width: auto; margin: 0; }
+  .catalog summary { font-weight: 600; }
+  .catalog .ids { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .catalog code { cursor: copy; font-size: 12px; padding: 2px 8px; border-radius: 6px; overflow-wrap: anywhere; }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
   h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
@@ -215,6 +218,9 @@
   </section>
 
   <section data-view="models" class="pico models-view" hidden>
+  <h2>Available models <span id="catalog-count" style="text-transform:none;letter-spacing:0"></span></h2>
+  <input id="catalog-filter" type="search" placeholder="Filter, e.g. opus, sol, grok" autocomplete="off">
+  <div id="catalog"><div class="skeleton">Loading models…</div></div>
   <h2>Equivalent models</h2>
   <div id="models"><div class="skeleton">Loading equivalence groups…</div></div>
   </section>
@@ -780,6 +786,29 @@ function modelsFailed(e) {
   $("models").innerHTML = `<div class="error">Could not load settings: ${esc(e.message || e)} <button data-retry>Retry</button></div>`;
   $("models").querySelector("[data-retry]").onclick = () => { $("models").innerHTML = `<div class="skeleton">Loading equivalence groups…</div>`; loadState(); };
 }
+function renderCatalog() {
+  const box = $("catalog");
+  if (!hasLoaded) return;
+  if (!state.providers.reachable) {
+    box.innerHTML = `<div class="error">Router unreachable: its model list is unknown.</div>`;
+    $("catalog-count").textContent = "";
+    return;
+  }
+  const entries = Object.entries(state.providers.models), q = $("catalog-filter").value.trim().toLowerCase();
+  const total = entries.reduce((n, [, ids]) => n + ids.length, 0);
+  $("catalog-count").textContent = `· ${total} models on ${entries.filter(([, ids]) => ids.length).length} backends`;
+  box.innerHTML = `<p class="small muted">Every model id the router accepts right now. Click an id to copy it, then use it with /model or in a session's model picker.</p>` +
+    entries.map(([name, ids]) => {
+      const shown = ids.filter((id) => id.toLowerCase().includes(q));
+      if (q && !shown.length) return "";
+      return `<article class="catalog"><details ${q || ids.length <= 40 ? "open" : ""}>
+        <summary>${esc(PROVIDER[name] || name)} <span class="small muted">${ids.length ? `${q ? `${shown.length} of ` : ""}${ids.length} models` : "not signed in on the proxy host"}</span></summary>
+        <div class="ids">${shown.map((id) => `<code data-model="${esc(id)}" title="Copy">${esc(id)}</code>`).join("")}</div></details></article>`;
+    }).join("") || `<p class="muted">No model id contains "${esc(q)}".</p>`;
+  box.querySelectorAll("[data-model]").forEach((c) => c.onclick = () => navigator.clipboard?.writeText(c.dataset.model).then(() => {
+    c.textContent = "copied"; setTimeout(() => { c.textContent = c.dataset.model; }, 900);
+  }));
+}
 function renderModels(force = false) {
   const box = $("models");
   if (!hasLoaded || (!force && box.contains(document.activeElement))) return;
@@ -877,9 +906,10 @@ function showView() {
 }
 $("menu-toggle").onclick = () => $("menu-toggle").setAttribute("aria-expanded", $("nav-list").classList.toggle("open"));
 addEventListener("hashchange", showView);
+$("catalog-filter").oninput = renderCatalog;
 showView();
 
-function render() { renderHeader(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
+function render() { renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
 
 async function loadState() {
   try { state = await api("/api/state"); hasLoaded = true; render(); showError(null); }
