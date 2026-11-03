@@ -21,6 +21,44 @@ use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
 
+/// How long a model list Anthropic gave a signed-in caller stays fresh.
+pub const LIVE_MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+static LIVE_MODELS: std::sync::RwLock<Option<(std::time::Instant, Vec<String>)>> =
+    std::sync::RwLock::new(None);
+
+/// The Claude model ids Anthropic last listed; `None` until a signed-in caller asked.
+pub fn live_models() -> Option<Vec<String>> {
+    LIVE_MODELS.read().ok()?.as_ref().map(|(_, ids)| ids.clone())
+}
+
+pub fn live_models_stale() -> bool {
+    LIVE_MODELS
+        .read()
+        .map(|live| live.as_ref().is_none_or(|(at, _)| at.elapsed() >= LIVE_MODELS_TTL))
+        .unwrap_or(true)
+}
+
+/// Keep the ids of an Anthropic `/v1/models` reply. A reply without any keeps the previous list.
+pub fn record_live_models(body: &[u8]) -> bool {
+    let ids: Vec<String> = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|reply| reply.get("data")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|model| model.get("id")?.as_str())
+        .filter(|id| id.starts_with("claude-"))
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return false;
+    }
+    if let Ok(mut live) = LIVE_MODELS.write() {
+        *live = Some((std::time::Instant::now(), ids));
+    }
+    true
+}
+
 /// Rewrite an outgoing Anthropic request body so it survives a mid-conversation switch
 /// away from the codex backend.
 ///

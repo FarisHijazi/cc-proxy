@@ -382,10 +382,51 @@ struct ModelsQuery {
 /// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
 /// so the Anthropic-style aliases are what surface in its `/model` picker;
 /// raw provider ids are still listed for other Anthropic-compatible clients.
+/// Ask Anthropic which Claude models the caller's login offers, at most once per
+/// [`LIVE_MODELS_TTL`](crate::providers::anthropic::LIVE_MODELS_TTL). The router holds no
+/// Anthropic login, so a caller without one keeps the last list (or the built-in one).
+async fn refresh_live_claude_models(registry: &Registry, headers: &axum::http::HeaderMap) {
+    if !headers.contains_key(axum::http::header::AUTHORIZATION)
+        || !crate::providers::anthropic::live_models_stale()
+    {
+        return;
+    }
+    let Some(anthropic) = registry.provider("anthropic") else {
+        return;
+    };
+    let mut request = axum::http::Request::new(Body::empty());
+    *request.uri_mut() = axum::http::Uri::from_static("/v1/models?limit=1000");
+    let outgoing = request.headers_mut();
+    for name in ["authorization", "anthropic-version", "anthropic-beta", "user-agent"] {
+        if let Some(value) = headers.get(name) {
+            outgoing.insert(name, value.clone());
+        }
+    }
+    outgoing
+        .entry("anthropic-version")
+        .or_insert(axum::http::HeaderValue::from_static("2023-06-01"));
+    outgoing
+        .entry("anthropic-beta")
+        .or_insert(axum::http::HeaderValue::from_static("oauth-2025-04-20"));
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        anthropic.handle_account_request(request),
+    )
+    .await;
+    let Ok(reply) = reply else { return };
+    if reply.status().is_success()
+        && let Ok(body) = axum::body::to_bytes(reply.into_body(), 1 << 20).await
+    {
+        crate::providers::anthropic::record_live_models(&body);
+    }
+}
+
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Json<serde_json::Value> {
+    refresh_live_claude_models(&state.registry, &headers).await;
     prepare_model_catalog(None).await;
     let registry = state.registry.clone();
     let models = tokio::task::spawn_blocking(move || registry.all_supported_models())

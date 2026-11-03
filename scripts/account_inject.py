@@ -376,6 +376,17 @@ class AccountInject:
             # The router reaches Anthropic through the next proxy; the Chrome bridge must too.
             flow.server_conn.via = self.upstream
         supplied = flow.request.headers.get("authorization", "")
+        if not supplied and not self.upstream and flow.request.method == "GET" and (
+                flow.request.host == "api.anthropic.com" and flow.request.path.split("?")[0] == "/v1/models"):
+            # The router lists the Claude models a login offers; the dashboard and launcher ask without one.
+            self.reload_accounts()
+            names = [n for n in self.accounts if n not in self.disabled]
+            try:
+                if names:
+                    flow.request.headers["authorization"] = "Bearer " + self.token(names[0])
+            except Exception:  # noqa: BLE001 - the router then lists its built-in Claude models
+                pass
+            return
         if not supplied.startswith(PREFIX):
             return
         placeholder = supplied.removeprefix("Bearer ")

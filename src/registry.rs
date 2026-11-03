@@ -139,12 +139,22 @@ impl Registry {
     }
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
+        let live = (provider == "anthropic")
+            .then(crate::providers::anthropic::live_models)
+            .flatten();
         let mut models = if provider == "codex" {
             selectable_models()
+        } else if let Some(live) = live {
+            ANTHROPIC_STYLE_ALIASES
+                .iter()
+                .filter(|alias| !alias.contains('-'))
+                .map(|alias| (*alias).to_string())
+                .chain(live)
+                .collect()
         } else {
             self.models.get(provider).cloned().unwrap_or_default()
         };
-        if provider == self.alias_provider.as_str() {
+        if provider == self.alias_provider.as_str() && provider != "anthropic" {
             for alias in ANTHROPIC_STYLE_ALIASES {
                 if !models.iter().any(|value| value == alias) {
                     models.push((*alias).to_string());

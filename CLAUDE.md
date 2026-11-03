@@ -219,7 +219,11 @@ metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` p
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
 Each model-call row also stores `input_tokens`/`cache_read_tokens`/`output_tokens` from the reply (parser:
 `account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
-fills older rows. The dashboard's Usage view (`/api/usage?hours=`) totals calls and tokens per machine, session and
+fills older rows. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's
+`served_models()` adds the same non-Claude ids to the `/model` picker at launch. The router's Claude ids come from Anthropic's own `/v1/models`. A `/v1/models` call that
+carries a login refreshes them at most every 10 minutes (`providers::anthropic::live_models`). `account_inject.py` lends
+the first enabled account's login to a token-less one, such as a call from the dashboard or launcher. `ANTHROPIC_STYLE_ALIASES` is only the
+fallback list and the alias-routing set. Do not grow it to list models. The dashboard's Usage view (`/api/usage?hours=`) totals calls and tokens per machine, session and
 answering account. See `docs/devlog/claude_20261102-usage-by-machine-and-session.md` (plain path).
 `serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
 Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the

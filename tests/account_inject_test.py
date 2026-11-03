@@ -590,3 +590,26 @@ def test_counts_carry_the_same_pool_as_messages(monkeypatch):
         pools.append(json.loads(flow.request.headers[module.POOL_HEADER]))
     assert pools[0] == pools[1]
     assert [entry["alias"] for entry in pools[1]] == ["b", "a"]
+
+
+def test_model_listing_without_a_login_borrows_the_first_enabled_account(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"off": "2", "personal": "1"}
+    inject.disabled = {"off"}
+    flow = tflow.tflow()
+    flow.request = http.Request.make("GET", "https://api.anthropic.com/v1/models?limit=1000")
+    inject.requestheaders(flow)
+    assert flow.request.headers["authorization"] == "Bearer real-1"
+    other = tflow.tflow()
+    other.request = http.Request.make("GET", "https://api.anthropic.com/api/oauth/profile")
+    inject.requestheaders(other)
+    assert "authorization" not in other.request.headers
+
+
+def test_model_listing_borrows_nothing_when_the_next_proxy_holds_the_logins(monkeypatch):
+    inject = addon(monkeypatch, [])
+    inject.upstream = ("http", ("127.0.0.1", 1))
+    flow = tflow.tflow()
+    flow.request = http.Request.make("GET", "https://api.anthropic.com/v1/models")
+    inject.requestheaders(flow)
+    assert "authorization" not in flow.request.headers
