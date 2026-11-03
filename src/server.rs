@@ -435,12 +435,19 @@ async fn handler_models(
     let mut data: Vec<Value> = models
         .into_iter()
         .map(|(model, provider)| {
-            json!({
+            let mut entry = json!({
                 "type": "model",
                 "object": "model",
                 "id": model,
                 "display_name": format!("{model} ({provider})"),
-            })
+            });
+            if provider == "local" {
+                if let Ok(window) = crate::config::local_context_window() {
+                    entry["context_window"] = json!(window);
+                }
+                entry["experimental"] = json!(true);
+            }
+            entry
         })
         .collect();
     let has_more = query.limit.is_some_and(|limit| data.len() > limit);

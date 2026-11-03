@@ -48,6 +48,7 @@ struct FileConfig {
     #[serde(rename = "cursorCli")]
     pub cursor_cli: Option<CursorCliConfig>,
     pub gemini: Option<GeminiConfig>,
+    pub local: Option<LocalConfig>,
     pub grok: Option<GrokConfig>,
     pub auth: Option<AuthConfig>,
 }
@@ -108,6 +109,90 @@ struct GeminiConfig {
     pub base_url: Option<String>,
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
+}
+
+/// Optional local OpenAI-compatible backend. Disabled unless baseUrl is set.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalConfig {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub context_tokens: Option<u64>,
+}
+
+pub fn local_config() -> LocalConfig {
+    let mut config = read_file_config(&paths::config_dir())
+        .and_then(|file| file.local)
+        .unwrap_or_default();
+    for (name, target) in [
+        ("CCP_LOCAL_BASE_URL", &mut config.base_url),
+        ("CCP_LOCAL_API_KEY", &mut config.api_key),
+        ("CCP_LOCAL_MODEL", &mut config.model),
+        ("CCP_LOCAL_UPSTREAM_MODEL", &mut config.upstream_model),
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            *target = non_blank(value);
+        }
+    }
+    if let Ok(value) = std::env::var("CCP_LOCAL_TIMEOUT_SECS") {
+        config.timeout_secs = value.parse().ok();
+    }
+    config
+}
+
+/// Advertised local context must match the inference server's configured budget.
+/// Invalid overrides disable the local backend instead of advertising a default.
+pub fn local_context_window() -> anyhow::Result<u64> {
+    let raw = match std::env::var("CCP_LOCAL_CONTEXT_WINDOW") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(anyhow::anyhow!("invalid CCP_LOCAL_CONTEXT_WINDOW: {error}")),
+    };
+    parse_local_context_window(raw.as_deref(), local_config().context_tokens)
+}
+
+fn parse_local_context_window(raw: Option<&str>, configured: Option<u64>) -> anyhow::Result<u64> {
+    let value = match raw {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("CCP_LOCAL_CONTEXT_WINDOW must be a positive integer"))?,
+        None => configured.unwrap_or(200_000),
+    };
+    anyhow::ensure!(
+        (1..=u32::MAX as u64).contains(&value),
+        "local context window must be between 1 and {} tokens",
+        u32::MAX
+    );
+    Ok(value)
+}
+
+#[cfg(test)]
+mod local_context_tests {
+    use super::parse_local_context_window;
+
+    #[test]
+    fn context_default_file_and_environment_precedence() {
+        assert_eq!(parse_local_context_window(None, None).unwrap(), 200_000);
+        assert_eq!(
+            parse_local_context_window(None, Some(65_536)).unwrap(),
+            65_536
+        );
+        assert_eq!(
+            parse_local_context_window(Some("32768"), Some(200_000)).unwrap(),
+            32_768
+        );
+    }
+
+    #[test]
+    fn invalid_context_never_falls_back_to_a_false_budget() {
+        for raw in ["", "0", "-1", "not-a-number", "32768.0", "4294967296"] {
+            assert!(parse_local_context_window(Some(raw), Some(200_000)).is_err());
+        }
+        assert!(parse_local_context_window(None, Some(0)).is_err());
+    }
 }
 
 #[derive(Deserialize, Clone)]

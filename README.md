@@ -844,6 +844,53 @@ On a `--serve` host the router needs no restart for this: it reads
 once. The gemini server can run on another machine that has the signed-in
 Chrome; every `--via` client then gets gemini through the shared proxy.
 
+### Local OpenAI-compatible models
+
+The independent `local` backend reuses the chat-completion tool and SSE
+translation above without changing Gemini. It is disabled until
+`CCP_LOCAL_BASE_URL` or `local.baseUrl` is configured. For example, in the
+proxy's `config.json`:
+
+```json
+{
+  "local": {
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "model": "local-model",
+    "upstreamModel": "local-model",
+    "timeoutSecs": 3600,
+    "contextTokens": 200000
+  }
+}
+```
+
+Environment overrides: `CCP_LOCAL_BASE_URL`, `CCP_LOCAL_MODEL`,
+`CCP_LOCAL_UPSTREAM_MODEL`, `CCP_LOCAL_TIMEOUT_SECS`, and optional
+`CCP_LOCAL_API_KEY` (`local.apiKey` in the file). The model alias is independent
+of the upstream model name. The timeout defaults to 3600 seconds; Gemini
+retains its existing 600-second timeout. Only the configured local key is sent
+upstream; caller Anthropic credentials are not forwarded.
+
+`CCP_LOCAL_CONTEXT_WINDOW` overrides `local.contextTokens` for discovery.
+It must be a positive integer no larger than 4294967295; an invalid value
+disables the local backend rather than advertising a fallback budget. Without
+an override or file setting, the default is 200000. Set this to the actual
+inference-server allocation, such as 32768 for a smaller CPU deployment.
+
+Select `/model local-model`. Local model discovery marks its
+configured context window experimental: this metadata does not resize the
+upstream context or establish model quality at that length. Configure and test
+the inference server separately. Token counting uses the existing estimate.
+For a direct Claude Code trial, override both URL and context in that session's
+`--settings` environment; the account router launcher otherwise pins custom
+models to one million tokens. Local responses support tools and streaming,
+and request full history rather than Anthropic message-thread deltas.
+
+For the local backend, an explicit Anthropic named-tool choice sends only the
+matching tool definition with the string `required`. This preserves named
+selection on local servers that do not accept OpenAI's object selector. Unknown
+tool names return 400. Auto selection remains auto; Gemini retains its existing
+OpenAI object selector.
+
 ### Cursor CLI (`cursor-cli`)
 
 Drives the **`cursor-agent` binary you already have signed in**, rather than

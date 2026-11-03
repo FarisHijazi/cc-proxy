@@ -28,7 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 
 use crate::anthropic::{
     accumulate::accumulate_response,
@@ -43,10 +43,14 @@ use crate::provider::{
 
 use self::client::{GeminiClient, GeminiError};
 use self::models::{GEMINI_DEFAULT_MODEL, GEMINI_MODELS, assert_allowed_model, resolve_model};
-use self::translate::request::translate_request;
+use self::translate::request::translate_request_with;
 use self::translate::stream::StreamTranslator;
 
-pub struct GeminiProvider;
+/// Shared OpenAI chat-completions transport. Gemini retains its existing
+/// defaults; the optional local backend has independent endpoint/model config.
+pub struct GeminiProvider {
+    local: bool,
+}
 
 impl Default for GeminiProvider {
     fn default() -> Self {
@@ -56,36 +60,94 @@ impl Default for GeminiProvider {
 
 impl GeminiProvider {
     pub fn new() -> Self {
-        Self
+        Self { local: false }
+    }
+
+    pub fn local() -> Self {
+        Self { local: true }
+    }
+
+    fn client(&self) -> anyhow::Result<GeminiClient> {
+        if !self.local {
+            return GeminiClient::from_config();
+        }
+        crate::config::local_context_window()?;
+        let config = crate::config::local_config();
+        let base_url = config.base_url.ok_or_else(|| {
+            anyhow::anyhow!("local backend disabled: set CCP_LOCAL_BASE_URL or local.baseUrl")
+        })?;
+        GeminiClient::with_timeout(
+            base_url,
+            config.api_key,
+            std::time::Duration::from_secs(config.timeout_secs.unwrap_or(3600).max(1)),
+        )
     }
 
     /// Shared prologue: resolve the model and build the upstream request.
     fn prepare(
+        &self,
         body: &MessagesRequest,
         ctx: &RequestContext,
     ) -> Result<(String, translate::request::GeminiChatRequest), ProviderError> {
         let requested = body.model.as_deref().unwrap_or(GEMINI_DEFAULT_MODEL);
-        let resolved = resolve_model(requested);
-        assert_allowed_model(&resolved).map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_REQUEST,
-                ProviderErrorKind::InvalidRequest,
-                format!(
-                    "Model \"{requested}\" resolves to unsupported model \"{}\"",
-                    error.model
-                ),
-            )
-        })?;
+        let resolved = if self.local {
+            let config = crate::config::local_config();
+            config.upstream_model.unwrap_or_else(|| {
+                config
+                    .model
+                    .unwrap_or_else(|| "local-model".into())
+            })
+        } else {
+            resolve_model(requested)
+        };
+        if !self.local {
+            assert_allowed_model(&resolved).map_err(|error| {
+                ProviderError::new(
+                    StatusCode::BAD_REQUEST,
+                    ProviderErrorKind::InvalidRequest,
+                    format!(
+                        "Model \"{requested}\" resolves to unsupported model \"{}\"",
+                        error.model
+                    ),
+                )
+            })?;
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved);
         }
-        let translated = translate_request(body, &resolved).map_err(|error| {
+        let mut translated = translate_request_with(body, &resolved, self.local).map_err(|error| {
             ProviderError::new(
                 StatusCode::BAD_REQUEST,
                 ProviderErrorKind::InvalidRequest,
                 error.to_string(),
             )
         })?;
+        if self.local {
+            translated.stream_options = Some(serde_json::json!({"include_usage": true}));
+            // Some local servers accept only string tool_choice values. A
+            // single advertised function + required preserves named selection.
+            if let Some(name) = body
+                .extra
+                .get("tool_choice")
+                .filter(|choice| {
+                    choice.get("type").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+                .and_then(|choice| choice.get("name"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(tools) = translated.tools.as_mut() {
+                    tools.retain(|tool| tool.function.name == name);
+                }
+                if translated.tools.as_ref().is_none_or(Vec::is_empty) {
+                    return Err(ProviderError::new(
+                        StatusCode::BAD_REQUEST,
+                        ProviderErrorKind::InvalidRequest,
+                        "named local tool_choice must reference an advertised tool",
+                    ));
+                }
+                translated.tool_choice = Some(serde_json::json!("required"));
+            }
+        }
         Ok((resolved, translated))
     }
 }
@@ -98,21 +160,42 @@ impl Provider for GeminiProvider {
     /// A TCP connect rather than an HTTP request — enough to tell a listening
     /// server from nothing at all, and bounded so a listing never hangs on it.
     fn availability(&self) -> crate::provider::Availability {
-        if server_is_listening(&crate::config::gemini_base_url()) {
+        let base_url = if self.local {
+            if let Err(error) = crate::config::local_context_window() {
+                return crate::provider::Availability::unavailable(error.to_string());
+            }
+            let Some(url) = crate::config::local_config().base_url else {
+                return crate::provider::Availability::unavailable(
+                    "set CCP_LOCAL_BASE_URL or local.baseUrl",
+                );
+            };
+            url
+        } else {
+            crate::config::gemini_base_url()
+        };
+        if server_is_listening(&base_url) {
             crate::provider::Availability::Ready
         } else {
             crate::provider::Availability::unavailable(format!(
-                "start gemini-web-api at {}",
-                crate::config::gemini_base_url()
+                "start {} upstream at {}",
+                self.name(),
+                base_url
             ))
         }
     }
 
     fn name(&self) -> &'static str {
-        "gemini"
+        if self.local { "local" } else { "gemini" }
     }
 
     fn supported_models(&self) -> Vec<String> {
+        if self.local {
+            return vec![
+                crate::config::local_config()
+                    .model
+                    .unwrap_or_else(|| "local-model".into()),
+            ];
+        }
         GEMINI_MODELS
             .iter()
             .map(|model| (*model).to_string())
@@ -120,7 +203,7 @@ impl Provider for GeminiProvider {
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
-        &GEMINI_CLI
+        if self.local { &LOCAL_CLI } else { &GEMINI_CLI }
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -131,9 +214,14 @@ impl Provider for GeminiProvider {
         // two agree.
         let estimated_input_tokens = crate::providers::kimi::count_tokens::count_tokens(&body);
 
-        let (resolved, mut translated) = match Self::prepare(&body, &ctx) {
+        let (upstream_model, mut translated) = match self.prepare(&body, &ctx) {
             Ok(prepared) => prepared,
             Err(error) => return provider_error_response(&error),
+        };
+        let resolved = if self.local {
+            body.model.clone().unwrap_or(upstream_model)
+        } else {
+            upstream_model
         };
         // Always stream upstream: one code path feeds both reply shapes, and
         // a long browser-backed turn is less likely to hit an idle timeout.
@@ -146,19 +234,39 @@ impl Provider for GeminiProvider {
             );
         }
 
-        let client = match GeminiClient::from_config() {
+        let client = match self.client() {
             Ok(client) => client,
             Err(error) => {
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
-                    format!("gemini client setup failed: {error}"),
+                    format!("{} client setup failed: {error}", self.name()),
                 );
             }
         };
 
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
+        }
+        if self.local && want_stream {
+            // Start downstream streaming before even the upstream headers arrive:
+            // CPU prefill can exceed a forward proxy's response-idle deadline.
+            let upstream = futures_util::stream::once(async move {
+                client
+                    .post_chat(&translated)
+                    .await
+                    .map(|response| Box::pin(response.into_stream()))
+            })
+            .try_flatten();
+            return stream_anthropic_response(
+                Box::pin(upstream),
+                message_id,
+                resolved,
+                estimated_input_tokens,
+                ctx.monitor.clone(),
+                ctx.req_id.clone(),
+                Some(std::time::Duration::from_secs(15)),
+            );
         }
         let upstream = match client.post_chat(&translated).await {
             Ok(response) => response,
@@ -173,6 +281,7 @@ impl Provider for GeminiProvider {
                 estimated_input_tokens,
                 ctx.monitor.clone(),
                 ctx.req_id.clone(),
+                None,
             );
         }
 
@@ -234,14 +343,19 @@ impl Provider for GeminiProvider {
     ) -> Result<Generation, ProviderError> {
         body.stream = true;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let (resolved, mut translated) = Self::prepare(&body, &ctx)?;
+        let (upstream_model, mut translated) = self.prepare(&body, &ctx)?;
+        let resolved = if self.local {
+            body.model.clone().unwrap_or(upstream_model)
+        } else {
+            upstream_model
+        };
         translated.stream = true;
 
-        let client = GeminiClient::from_config().map_err(|error| {
+        let client = self.client().map_err(|error| {
             ProviderError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ProviderErrorKind::Api,
-                format!("gemini client setup failed: {error}"),
+                format!("{} client setup failed: {error}", self.name()),
             )
         })?;
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -290,6 +404,7 @@ fn stream_anthropic_response<S>(
     fallback_input_tokens: u64,
     monitor: Option<MonitorHandle>,
     req_id: String,
+    keepalive_interval: Option<std::time::Duration>,
 ) -> Response
 where
     S: Stream<Item = Result<Bytes, GeminiError>> + Unpin + Send + 'static,
@@ -301,6 +416,7 @@ where
         req_id: String,
         started: bool,
         terminal: bool,
+        heartbeat: Option<tokio::time::Interval>,
     }
 
     // `unfold` owns the upstream for the life of the response body.
@@ -312,6 +428,7 @@ where
         req_id,
         started: false,
         terminal: false,
+        heartbeat: keepalive_interval.map(tokio::time::interval),
     };
 
     let stream = futures_util::stream::unfold(state, |mut state| async move {
@@ -319,7 +436,26 @@ where
             return None;
         }
         loop {
-            match state.upstream.next().await {
+            let item = if let Some(heartbeat) = state.heartbeat.as_mut() {
+                tokio::select! {
+                    biased;
+                    item = state.upstream.next() => item,
+                    _ = heartbeat.tick() => {
+                        return Some((Ok(Bytes::from_static(b": keep-alive\n\n")), state));
+                    }
+                }
+            } else {
+                state.upstream.next().await
+            };
+            let item = match item {
+                None if state.heartbeat.is_some() => Some(Err(GeminiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "local upstream stream ended before its [DONE] marker".into(),
+                    retry_after: None,
+                })),
+                item => item,
+            };
+            match item {
                 Some(Ok(chunk)) => {
                     if !state.started {
                         state.started = true;
@@ -344,6 +480,16 @@ where
                 }
                 // A dropped connection still gets a terminated message, so the
                 // client is not left waiting on a stream that will never close.
+                Some(Err(error)) if state.heartbeat.is_some() => {
+                    state.terminal = true;
+                    let error = gemini_provider_error(error);
+                    let payload = serde_json::json!({
+                        "type": "error",
+                        "error": {"type": error.error_type(), "message": error.message},
+                    });
+                    let frame = format!("event: error\ndata: {payload}\n\n");
+                    return Some((Ok(Bytes::from(frame)), state));
+                }
                 Some(Err(_)) | None => {
                     state.terminal = true;
                     let mut out = Vec::new();
@@ -368,7 +514,31 @@ where
         .into_response()
 }
 
+/// A local server's context overflow, rewritten as Anthropic's own wording.
+/// Claude Code matches `prompt is too long: N tokens > M maximum` and compacts
+/// then retries; any other 400 just ends the turn with an error.
+fn context_overflow(error: &GeminiError) -> Option<ProviderError> {
+    if error.status != StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(&error.message).ok()?;
+    let detail = body.get("error")?;
+    if detail.get("type")?.as_str()? != "exceed_context_size_error" {
+        return None;
+    }
+    let prompt = detail.get("n_prompt_tokens")?.as_u64()?;
+    let window = detail.get("n_ctx")?.as_u64()?;
+    Some(ProviderError::new(
+        StatusCode::BAD_REQUEST,
+        ProviderErrorKind::InvalidRequest,
+        format!("prompt is too long: {prompt} tokens > {window} maximum"),
+    ))
+}
+
 fn gemini_provider_error(error: GeminiError) -> ProviderError {
+    if let Some(overflow) = context_overflow(&error) {
+        return overflow;
+    }
     let kind = match error.status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Authentication,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
@@ -474,9 +644,224 @@ impl CliHandlers for GeminiCli {
 
 pub(crate) static GEMINI_CLI: GeminiCli = GeminiCli;
 
+struct LocalCli;
+static LOCAL_CLI: LocalCli = LocalCli;
+
+impl CliHandlers for LocalCli {
+    fn login(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "local has no interactive login; configure local.baseUrl and optional local.apiKey"
+        )
+    }
+    fn device(&self) -> anyhow::Result<()> {
+        self.login()
+    }
+    fn status(&self) -> anyhow::Result<()> {
+        match GeminiProvider::local().availability() {
+            crate::provider::Availability::Ready => {
+                println!("Local upstream: reachable");
+                Ok(())
+            }
+            crate::provider::Availability::Unavailable { hint } => anyhow::bail!(hint),
+        }
+    }
+    fn logout(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_context_overflow_becomes_anthropic_prompt_too_long() {
+        let error = super::GeminiError {
+            status: http::StatusCode::BAD_REQUEST,
+            message: r#"{"error":{"code":400,"message":"request (140052 tokens) exceeds the available context size (131072 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":140052,"n_ctx":131072}}"#.into(),
+            retry_after: None,
+        };
+        let mapped = super::gemini_provider_error(error);
+        assert_eq!(mapped.status, http::StatusCode::BAD_REQUEST);
+        assert_eq!(mapped.message, "prompt is too long: 140052 tokens > 131072 maximum");
+        assert_eq!(mapped.error_type(), "invalid_request_error");
+    }
+
+    #[test]
+    fn other_bad_requests_are_not_rewritten() {
+        let error = super::GeminiError {
+            status: http::StatusCode::BAD_REQUEST,
+            message: "plain failure".into(),
+            retry_after: None,
+        };
+        assert_eq!(super::gemini_provider_error(error).message, "plain failure");
+    }
+
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn local_keepalive_covers_pending_headers_and_first_token_without_extending_gemini() {
+        use http_body_util::BodyExt;
+        use std::time::Duration;
+
+        fn delayed_upstream() -> impl Stream<Item = Result<Bytes, GeminiError>> + Send {
+            // The outer future represents waiting for response headers; the
+            // inner future represents an idle response body before generation.
+            futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<_, GeminiError>(Box::pin(futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"finished\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+                })))
+            })
+            .try_flatten()
+        }
+
+        let response = stream_anthropic_response(
+            Box::pin(delayed_upstream()),
+            "msg_local".into(),
+            "local".into(),
+            1,
+            None,
+            "req".into(),
+            Some(Duration::from_secs(15)),
+        );
+        let mut body = response.into_body();
+        let started = tokio::time::Instant::now();
+        let mut frames = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(20), body.frame())
+                .await
+                .expect("local stream must survive a shorter read-idle deadline");
+            let Some(frame) = frame else { break };
+            frames.push(frame.unwrap().into_data().unwrap());
+        }
+        assert!(started.elapsed() >= Duration::from_secs(120));
+        assert!(
+            frames
+                .iter()
+                .filter(|f| f.starts_with(b": keep-alive"))
+                .count()
+                >= 8
+        );
+        let text = frames
+            .iter()
+            .map(|f| String::from_utf8_lossy(f))
+            .collect::<String>();
+        assert!(text.contains("finished"));
+        assert!(text.contains("message_stop"));
+
+        let response = stream_anthropic_response(
+            Box::pin(delayed_upstream()),
+            "msg_gemini".into(),
+            "gemini".into(),
+            1,
+            None,
+            "req".into(),
+            None,
+        );
+        let mut body = response.into_body();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), body.frame())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_lazy_upstream_error_is_an_error_event_without_false_completion() {
+        use http_body_util::BodyExt;
+        let upstream = futures_util::stream::once(async {
+            Err::<Bytes, _>(GeminiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "toy upstream unavailable".into(),
+                retry_after: None,
+            })
+        });
+        let response = stream_anthropic_response(
+            Box::pin(upstream),
+            "msg_error".into(),
+            "local".into(),
+            1,
+            None,
+            "req".into(),
+            Some(std::time::Duration::from_secs(15)),
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("event: error"));
+        assert!(text.contains("rate_limit_error"));
+        assert!(!text.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn dropping_local_body_cancels_pending_upstream_without_a_background_task() {
+        use http_body_util::BodyExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct PendingRequest(Arc<AtomicBool>);
+        impl Drop for PendingRequest {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = PendingRequest(cancelled.clone());
+        let upstream = futures_util::stream::once(async move {
+            let _pending_request = guard;
+            futures_util::future::pending::<Result<Bytes, GeminiError>>().await
+        });
+        let response = stream_anthropic_response(
+            Box::pin(upstream),
+            "msg_cancel".into(),
+            "local".into(),
+            1,
+            None,
+            "req".into(),
+            Some(std::time::Duration::from_secs(15)),
+        );
+        let mut body = response.into_body();
+        body.frame().await.unwrap().unwrap();
+        assert!(!cancelled.load(Ordering::SeqCst));
+        drop(body);
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn local_premature_eof_is_not_a_successful_empty_or_partial_completion() {
+        use http_body_util::BodyExt;
+        for chunks in [
+            vec![],
+            vec![Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )],
+        ] {
+            let response = stream_anthropic_response(
+                futures_util::stream::iter(chunks.into_iter().map(Ok)),
+                "msg_eof".into(),
+                "local".into(),
+                1,
+                None,
+                "req".into(),
+                Some(std::time::Duration::from_secs(15)),
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("event: error"));
+            assert!(!text.contains("message_stop"));
+        }
+        let response = stream_anthropic_response(
+            futures_util::stream::empty(),
+            "msg_gemini".into(),
+            "gemini".into(),
+            1,
+            None,
+            "req".into(),
+            None,
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("message_stop"));
+    }
 
     #[test]
     fn provider_advertises_its_models() {
@@ -510,7 +895,7 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let (resolved, _) = GeminiProvider::prepare(&body, &ctx).expect("prepare");
+        let (resolved, _) = GeminiProvider::new().prepare(&body, &ctx).expect("prepare");
         assert_eq!(resolved, GEMINI_DEFAULT_MODEL);
     }
 }

@@ -41,9 +41,17 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub fn new(base_url: String, api_key: Option<String>) -> anyhow::Result<Self> {
+        Self::with_timeout(base_url, api_key, REQUEST_TIMEOUT)
+    }
+
+    pub fn with_timeout(
+        base_url: String,
+        api_key: Option<String>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .tcp_nodelay(true)
             .build()?;
         Ok(Self {
@@ -73,9 +81,7 @@ impl GeminiClient {
             // The most common failure by far is "the server isn't running",
             // so say that rather than surfacing a bare transport error.
             GeminiError::upstream(format!(
-                "cannot reach the gemini-web-api server at {} ({error}); \
-                 start it with `uvx --from git+https://github.com/FarisHijazi/gemini-web-api gemini-web-api` \
-                 or set CCP_GEMINI_BASE_URL",
+                "cannot reach the OpenAI-compatible server at {} ({error})",
                 self.endpoint()
             ))
         })?;

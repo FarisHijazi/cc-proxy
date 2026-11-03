@@ -32,6 +32,8 @@ pub struct GeminiChatRequest {
     pub max_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,6 +49,8 @@ pub enum GeminiMessage {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<GeminiToolCall>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     Tool {
         role: String,
@@ -90,6 +94,18 @@ pub fn translate_request(
     req: &MessagesRequest,
     resolved_model: &str,
 ) -> Result<GeminiChatRequest, anyhow::Error> {
+    translate_request_with(req, resolved_model, false)
+}
+
+/// `native_reasoning` sends prior thinking as `reasoning_content`, so a local
+/// server's own chat template decides what to keep (Qwen drops turns before the
+/// last user message). Replaying it as tagged text instead fills the context
+/// and the model starts echoing the tags.
+pub fn translate_request_with(
+    req: &MessagesRequest,
+    resolved_model: &str,
+    native_reasoning: bool,
+) -> Result<GeminiChatRequest, anyhow::Error> {
     let mut messages = Vec::new();
 
     if let Some(system) = flatten_system_text(req.extra.get("system")) {
@@ -100,7 +116,7 @@ pub fn translate_request(
     }
 
     for message in &req.messages {
-        push_message(&mut messages, &message.role, &message.content);
+        push_message(&mut messages, &message.role, &message.content, native_reasoning);
     }
 
     Ok(GeminiChatRequest {
@@ -112,10 +128,11 @@ pub fn translate_request(
         stream: req.stream,
         max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         temperature: req.extra.get("temperature").and_then(Value::as_f64),
+        stream_options: None,
     })
 }
 
-fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value) {
+fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value, native_reasoning: bool) {
     let blocks = normalize_content(content, json!({}));
 
     // Tool results are their own `tool` turns in the OpenAI format and must be
@@ -139,6 +156,7 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value) {
     let mut text = String::new();
     let mut image_parts: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<GeminiToolCall> = Vec::new();
+    let mut reasoning = String::new();
 
     for block in &blocks {
         match block {
@@ -151,6 +169,14 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value) {
             // Gemini has no native reasoning channel on input. Prior-turn
             // thinking is rehydrated as tagged text, the same shape the codex
             // and anthropic paths use, so a mid-conversation switch keeps it.
+            ContentBlock::Thinking { thinking, .. } if native_reasoning => {
+                if !thinking.trim().is_empty() {
+                    if !reasoning.is_empty() {
+                        reasoning.push_str("\n\n");
+                    }
+                    reasoning.push_str(thinking);
+                }
+            }
             ContentBlock::Thinking { thinking, .. } => {
                 if !thinking.trim().is_empty() {
                     if !text.is_empty() {
@@ -187,6 +213,7 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value) {
             role: "assistant".into(),
             content: (!text.is_empty()).then_some(text),
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         });
         return;
     }
@@ -440,6 +467,24 @@ mod tests {
         assert!(content.contains("<previous_reasoning>"), "{content}");
         assert!(content.contains("step one"), "{content}");
         assert!(content.contains("answer"), "{content}");
+    }
+
+    #[test]
+    fn local_prior_thinking_goes_to_reasoning_content() {
+        let messages = vec![Message {
+            role: "assistant".into(),
+            content: json!([
+                { "type": "thinking", "thinking": "step one" },
+                { "type": "text", "text": "answer" }
+            ]),
+        }];
+        let out = translate_request_with(&request(messages, serde_json::Map::new()), "local", true)
+            .expect("translate");
+        let GeminiMessage::Assistant { content, reasoning_content, .. } = &out.messages[0] else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(content.as_deref(), Some("answer"));
+        assert_eq!(reasoning_content.as_deref(), Some("step one"));
     }
 
     #[test]

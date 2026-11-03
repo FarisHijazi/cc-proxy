@@ -82,6 +82,10 @@ impl Registry {
                 .map(|model| (*model).to_string())
                 .collect(),
         );
+        models.insert(
+            "local".into(),
+            crate::providers::gemini::GeminiProvider::local().supported_models(),
+        );
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
@@ -91,6 +95,7 @@ impl Registry {
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "cursor-cli" => Arc::new(crate::providers::cursor_cli::CursorCliProvider::new()),
                 "gemini" => Arc::new(crate::providers::gemini::GeminiProvider::new()),
+                "local" => Arc::new(crate::providers::gemini::GeminiProvider::local()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };

@@ -223,7 +223,10 @@ fills older rows. The dashboard's Models view lists every id the router serves (
 `served_models()` adds the same non-Claude ids to the `/model` picker at launch. The router's Claude ids come from Anthropic's own `/v1/models`. A `/v1/models` call that
 carries a login refreshes them at most every 10 minutes (`providers::anthropic::live_models`). `account_inject.py` lends
 the first enabled account's login to a token-less one, such as a call from the dashboard or launcher. `ANTHROPIC_STYLE_ALIASES` is only the
-fallback list and the alias-routing set. Do not grow it to list models. The dashboard's Usage view (`/api/usage?hours=`) totals calls and tokens per machine, session and
+fallback list and the alias-routing set. Do not grow it to list models.
+The `local` backend is `GeminiProvider::local()`. It uses the same OpenAI chat translation and is configured by `CCP_LOCAL_*` or
+`local.*` (README, "Local OpenAI-compatible models"). The proxy host's router binary must be built from this repo,
+never from a scratch copy, or the next build silently drops a backend. The dashboard's Usage view (`/api/usage?hours=`) totals calls and tokens per machine, session and
 answering account. See `docs/devlog/claude_20261102-usage-by-machine-and-session.md` (plain path).
 `serve()` turns SIGTERM into its cleanup, so stopping the launcher stops the router and mitmdump.
 Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `python/cc_proxy/cli.py` downloads the
