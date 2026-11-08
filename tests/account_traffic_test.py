@@ -53,6 +53,7 @@ def test_inference_is_recorded_with_its_sender_and_no_credential(tmp_path):
     traffic.requestheaders(flow)
     assert "x-claude-client-host" not in flow.request.headers  # never reaches Anthropic
     flow.request.headers["authorization"] = "Bearer sk-real-secret"  # AccountInject's swap
+    flow.metadata["api_key"] = "laptop"
     flow.response = http.Response.make(200, b'{"ok": true}', {"x-claude-codex-served-by": "user@example.com/claude-opus-5-5"})
     traffic.response(flow)
     [row] = rows(tmp_path)
@@ -65,8 +66,25 @@ def test_inference_is_recorded_with_its_sender_and_no_credential(tmp_path):
     assert row["served_by"] == "user@example.com/claude-opus-5-5"
     assert row["url"] == "https://api.anthropic.com/v1/messages?beta=true"
     assert row["status"] == 200
+    assert row["api_key"] == "laptop"
     assert "sk-real-secret" not in json.dumps(row, default=str)
     assert json.loads(zlib.decompress(row["response_body"])) == {"ok": True}
+
+
+def test_api_key_name_survives_an_upstream_connection_error(tmp_path):
+    from mitmproxy.flow import Error
+
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.metadata["api_key"] = "laptop"
+    flow.response = None
+    flow.error = Error("upstream disconnected")
+    traffic.error(flow)
+    [row] = rows(tmp_path)
+    assert row["api_key"] == "laptop"
+    assert row["error"] == "upstream disconnected"
+    assert row["status"] is None
 
 
 def test_working_directory_from_a_system_role_message():
@@ -191,7 +209,9 @@ def test_older_databases_gain_the_token_columns(tmp_path):
     old.close()
     recorder(tmp_path).connection()
     columns = {row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(flows)")}
-    assert {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns
+    info = sqlite3.connect(path).execute("PRAGMA table_info(flows)").fetchall()
+    assert {"input_tokens", "cache_read_tokens", "output_tokens", "api_key"} <= columns
+    assert next(row[2] for row in info if row[1] == "api_key") == "TEXT"
 
 
 def test_backfill_fills_old_rows_and_leaves_unreported_ones_unknown(tmp_path):

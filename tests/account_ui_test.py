@@ -185,7 +185,7 @@ def usage_board(tmp_path, columns=True):
     db = sqlite3.connect(db_path)
     tokens = ", input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER" if columns else ""
     db.execute("CREATE TABLE flows (id TEXT, started REAL, client_ip TEXT, client_host TEXT, client_user TEXT, "
-               f"launch_cwd TEXT, cwd TEXT, session_id TEXT, account TEXT, served_by TEXT, model TEXT, url TEXT, status INTEGER{tokens})")
+               f"launch_cwd TEXT, cwd TEXT, session_id TEXT, account TEXT, served_by TEXT, model TEXT, url TEXT, status INTEGER, api_key TEXT{tokens})")
     now = clock.time()
     rows = [
         # id, age, host, session, served_by, url, tokens
@@ -197,7 +197,7 @@ def usage_board(tmp_path, columns=True):
         ("6", 10 * 86400, "vm-b", "old", "a/claude-opus-5-5", "/v1/messages", (5, 5, 5)),
     ]
     for flow_id, age, host, session, served, url, counts in rows:
-        values = [flow_id, now - age, None, host, "dev", None, "/work", session, None, served, "claude-opus-5-5", url, 200]
+        values = [flow_id, now - age, None, host, "dev", None, "/work", session, None, served, "claude-opus-5-5", url, 200, "laptop" if flow_id == "1" else None]
         if columns:
             values += list(counts or (None, None, None))
         db.execute(f"INSERT INTO flows VALUES ({','.join('?' * len(values))})", values)
@@ -220,9 +220,35 @@ def test_usage_totals_per_machine_session_and_account(tmp_path):
     assert unreported["tokens_reported"] == 0 and unreported["tokens"] == {"input": 0, "cache_read": 0, "output": 0}
     accounts = {a["account"]: a for a in usage["by_account"]}
     assert accounts["a"]["requests"] == 2 and accounts["codex"]["tokens"]["output"] == 3
+    by_key = {entry["api_key"]: entry for entry in usage["by_key"]}
+    assert by_key["laptop"]["requests"] == 1
+    assert by_key["Unknown / pre-key"]["requests"] == 3
 
 
 def test_usage_on_a_database_without_token_columns_reports_tokens_unknown(tmp_path):
     usage = usage_board(tmp_path, columns=False).usage(24)
     assert usage["total"]["requests"] == 4 and usage["tokens_recorded"] is False
     assert usage["total"]["tokens_reported"] == 0
+
+
+def test_api_keys_are_created_once_stored_hashed_and_revoked(tmp_path):
+    board, accounts = dashboard(tmp_path)
+    created = board.update({"api_keys": {"create": "laptop"}})
+    key = created["created_key"]
+    assert key.startswith("ccp-") and len(key) > 40
+    stored = json.loads(accounts.read_text())["api_keys"]
+    assert [k["name"] for k in stored] == ["laptop"]
+    assert key not in accounts.read_text(), "only the hash is saved"
+    assert stored[0]["sha256"] == ui["key_hash"](key)
+    assert "created_key" not in board.update({"traffic_days": 5})
+    board.update({"api_keys": {"revoke": stored[0]["id"]}})
+    assert "api_keys" not in json.loads(accounts.read_text())
+
+
+@pytest.mark.parametrize("change", [{"create": ""}, {"create": "x" * 65}, {"revoke": "nope"}, {"rename": "a"}])
+def test_invalid_api_key_changes_are_refused(tmp_path, change):
+    board, accounts = dashboard(tmp_path)
+    before = accounts.read_text()
+    with pytest.raises(ValueError):
+        board.update({"api_keys": change})
+    assert accounts.read_text() == before

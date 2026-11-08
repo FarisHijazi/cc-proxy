@@ -767,14 +767,39 @@ def test_generated_mcp_retains_other_servers_and_native_chrome(tmp_path):
     assert (login / "accounts.json").stat().st_mode & 0o777 == 0o600
 
 
-def test_native_chrome_selector_keeps_native_server_and_artifact_accounts(tmp_path):
-    manifest = {"main": "work", "chrome_account": "personal", "accounts": {}}
+def test_native_chrome_selector_keeps_native_server_and_artifact_accounts(tmp_path, monkeypatch):
+    import importlib.util
+    import time
+    from types import SimpleNamespace
+
+    entries = {}
+    for alias in ("work", "personal"):
+        config = tmp_path / f"{alias}-config"
+        secure = tmp_path / f"{alias}-secure"
+        config.mkdir()
+        secure.mkdir()
+        (config / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": f"00000000-0000-0000-0000-{1 if alias == 'work' else 2:012d}"}}))
+        (secure / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": f"token-{alias}", "scopes": ["user:profile"], "expiresAt": time.time() * 1000 + 60000}}))
+        entries[alias] = {"config_dir": str(config), "secure_storage_dir": str(secure)}
+    manifest = {"main": "work", "chrome_account": "personal", "accounts": entries}
     args = launcher["aggregate_mcp"](tmp_path, manifest, ["--model", "gpt-toy"])
     assert "--chrome" in args and "--disallowedTools" not in args
-    servers = json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
-    assert set(servers) == {"account-artifacts"}
+    artifact_manifest = json.loads((tmp_path / "accounts.json").read_text())
+    assert set(artifact_manifest["accounts"]) == {"work"}
+    chrome_manifest = tmp_path / "chrome-accounts.json"
+    assert set(json.loads(chrome_manifest.read_text())["accounts"]) == {"work", "personal"}
+
+    spec = importlib.util.spec_from_file_location("account_chrome_route", Path(__file__).parents[1] / "scripts/account_chrome_route.py")
+    route_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(route_module)
+    monkeypatch.setattr(route_module, "ctx", SimpleNamespace(options=SimpleNamespace(chrome_account_manifest=str(chrome_manifest))))
+    route = route_module.NativeChromeRoute()
+    route.configure({"chrome_account_manifest"})
+    assert route.target_id == "00000000-0000-0000-0000-000000000002"
+    assert route.source_id == "00000000-0000-0000-0000-000000000001"
+
     command = launcher["proxy_command"](
-        "http://127.0.0.1:18765", 19999, tmp_path, True, tmp_path / "accounts.json"
+        "http://127.0.0.1:18765", 19999, tmp_path, True, chrome_manifest
     )
     pattern = command[command.index("--allow-hosts") + 1]
     assert re.fullmatch(pattern, "bridge.claudeusercontent.com:443")
@@ -960,7 +985,7 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
     )
     assert launcher["main"]() == 0
     suffix = "+private" if private else ""
-    assert launched == [f"proxy-account-work+rc=personal{suffix}+chromes"]
+    assert launched == [f"proxy-account-work+rc=personal{suffix}+chrome=work"]
     assert sorted(filter(None, seen)) == ["Bearer proxy-account-personal", "Bearer proxy-account-work"]
 
 
@@ -1007,11 +1032,9 @@ def test_via_native_chrome_is_opted_in_without_broadening_mcp_children(tmp_path,
         "--via", "http://127.0.0.1:18790", "--via-ca", str(tmp_path / "ca.pem"), *selection,
     ])
     assert launcher["main"]() == 0
-    suffix = "+chromes" if selected is None else f"+chrome={selected}"
+    suffix = f"+chrome={selected or 'work'}"
     assert captured["main"] == "proxy-account-work+rc=personal" + suffix
-    assert captured["children"] == {
-        "work": "proxy-account-work+chrome=work", "personal": "proxy-account-personal+chrome=personal",
-    }
+    assert captured["children"] == {"work": "proxy-account-work+chrome=work"}
     assert captured["servers"] == {"account-artifacts"}
 
 

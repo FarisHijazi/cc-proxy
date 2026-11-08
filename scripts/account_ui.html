@@ -172,6 +172,7 @@
     <li><a href="#routing">Routing</a></li>
     <li><a href="#models">Models</a></li>
     <li><a href="#usage">Usage</a></li>
+    <li><a href="#keys">API keys</a></li>
     <li><a href="#sessions">Sessions</a></li>
     <li><a href="#requests">Requests</a></li>
   </ul>
@@ -225,6 +226,14 @@
   <div id="models"><div class="skeleton">Loading equivalence groups…</div></div>
   </section>
 
+  <section data-view="keys" hidden>
+  <h2>API keys</h2>
+  <div class="subhead">Let any Anthropic SDK or tool use the account pool and its failover. The key is shown once; only its hash is saved.</div>
+  <form class="panel" id="key-form"><input id="key-name" placeholder="Name, e.g. laptop script" maxlength="64" required autocomplete="off"> <button type="submit">Create key</button></form>
+  <div id="key-created"></div>
+  <div class="panel" id="keys"><div class="skeleton">Loading keys…</div></div>
+  </section>
+
   <section data-view="usage" hidden>
   <div class="row" style="margin-bottom:10px">
     <div class="seg" id="usage-range"><button data-h="24" class="on">24h</button><button data-h="168">7d</button><button data-h="720">30d</button><button data-h="2160">90d</button></div>
@@ -235,6 +244,8 @@
   <div class="panel scroll" style="padding:0" id="usage-hosts"><div class="skeleton">Loading machines…</div></div>
   <h2>By account</h2>
   <div class="panel scroll" style="padding:0" id="usage-accounts"><div class="skeleton">Loading accounts…</div></div>
+  <h2>By API key</h2>
+  <div class="panel scroll" style="padding:0" id="usage-keys"><div class="skeleton">Loading API-key usage…</div></div>
   <h2>By session <span class="muted" style="text-transform:none;letter-spacing:0" id="usage-filter"></span></h2>
   <div class="panel scroll" style="padding:0" id="usage-sessions"><div class="skeleton">Loading sessions…</div></div>
   </section>
@@ -862,7 +873,7 @@ const TOKEN_HEAD = `<th>Tokens</th><th>Input</th><th>Cache read</th><th>Output</
 function renderUsage() {
   if (!usage) return;
   if (!usage.traffic_db) {
-    for (const id of ["usage-total", "usage-hosts", "usage-accounts", "usage-sessions"]) $(id).innerHTML = `<div class="skeleton">Traffic recording is off, so no usage is known.</div>`;
+    for (const id of ["usage-total", "usage-hosts", "usage-accounts", "usage-keys", "usage-sessions"]) $(id).innerHTML = `<div class="skeleton">Traffic recording is off, so no usage is known.</div>`;
     return;
   }
   const t = usage.total;
@@ -880,6 +891,9 @@ function renderUsage() {
   const accountMax = maxOf(usage.by_account);
   $("usage-accounts").innerHTML = usage.by_account.length ? `<table><thead><tr><th>Answered by</th><th>Calls</th>${TOKEN_HEAD}</tr></thead><tbody>
     ${usage.by_account.map((a) => `<tr><td>${esc(a.account)}</td><td>${a.requests.toLocaleString()}</td>${tokenCells(a, accountMax)}</tr>`).join("")}</tbody></table>` : `<div class="skeleton">No model calls in this window.</div>`;
+  const keyMax = maxOf(usage.by_key || []);
+  $("usage-keys").innerHTML = (usage.by_key || []).length ? `<table><thead><tr><th>API key</th><th>Calls</th>${TOKEN_HEAD}</tr></thead><tbody>
+    ${usage.by_key.map((k) => `<tr><td>${esc(k.api_key)}</td><td>${k.requests.toLocaleString()}</td>${tokenCells(k, keyMax)}</tr>`).join("")}</tbody></table>` : `<div class="skeleton">No model calls in this window.</div>`;
   const rows = usage.by_session.filter((s) => !usageHost || s.host === usageHost);
   $("usage-filter").textContent = usageHost ? `on ${usageHost} (click it again for every machine)` : `largest first, top ${rows.length}`;
   const sessionMax = maxOf(rows);
@@ -896,7 +910,23 @@ async function loadUsage() {
   catch (e) { showError(e); }
 }
 
-const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", sessions: "Sessions", requests: "Requests"};
+function renderKeys() {
+  if (!hasLoaded) return;
+  const keys = state.api_keys || [];
+  $("keys").innerHTML = keys.length ? `<table><thead><tr><th>Name</th><th>Key</th><th>Created</th><th></th></tr></thead><tbody>${keys.map((k) =>
+    `<tr><td>${esc(k.name)}</td><td><code>${esc(k.prefix)}…</code></td><td>${esc(k.created)}</td><td><button class="secondary" data-revoke="${esc(k.id)}">Revoke</button></td></tr>`).join("")}</tbody></table>`
+    : `<div class="muted">No API keys yet.</div>`;
+  $("keys").querySelectorAll("[data-revoke]").forEach((b) => b.onclick = () => save({api_keys: {revoke: b.dataset.revoke}}));
+}
+$("key-form").onsubmit = async (event) => {
+  event.preventDefault();
+  if (!(await save({api_keys: {create: $("key-name").value}}))) return;
+  const base = state.api_base ? `<pre>ANTHROPIC_BASE_URL=${esc(state.api_base)}\nANTHROPIC_API_KEY=${esc(state.created_key)}</pre>` : "";
+  $("key-created").innerHTML = `<div class="panel"><strong>Copy it now, it is not shown again:</strong> <code>${esc(state.created_key)}</code>${base}</div>`;
+  $("key-name").value = "";
+};
+
+const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", keys: "API keys", sessions: "Sessions", requests: "Requests"};
 function showView() {
   const view = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : "overview";
   document.querySelectorAll("[data-view]").forEach((x) => { x.hidden = x.dataset.view !== view; });
@@ -909,7 +939,7 @@ addEventListener("hashchange", showView);
 $("catalog-filter").oninput = renderCatalog;
 showView();
 
-function render() { renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); }
+function render() { renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); renderKeys(); }
 
 async function loadState() {
   try { state = await api("/api/state"); hasLoaded = true; render(); showError(null); }

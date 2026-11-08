@@ -25,7 +25,7 @@ const USAGE = {
   },
 };
 
-async function open(browser, { reachable = true, usage = USAGE, stall = false, quota, hash = "accounts" } = {}) {
+async function open(browser, { reachable = true, usage = USAGE, stall = false, quota, hash = "accounts", onConfig, usageBreakdown } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   const page = await ctx.newPage();
   const state = {
@@ -42,8 +42,10 @@ async function open(browser, { reachable = true, usage = USAGE, stall = false, q
     const json = (body) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
     if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: html });
     if (url.pathname === "/api/state") return stall ? undefined : json(state);
+    if (url.pathname === "/api/config" && onConfig) return json(onConfig(state, route.request().postDataJSON()));
     if (url.pathname === "/api/stats") return json({ total: 0, errors: 0, series: {}, by_account: {}, by_host: {}, by_model: {} });
     if (url.pathname === "/api/sessions") return json({ days: 7, limit: 50, traffic_db: false, sessions: [] });
+    if (url.pathname === "/api/usage" && usageBreakdown) return stall ? undefined : json(usageBreakdown);
     return json({ rows: [] });
   });
   await page.goto(`http://dash.test/#${hash}`);
@@ -148,6 +150,45 @@ try {
     assert.match(await page.locator("#catalog").innerText(), /Loading/);
     await close();
     console.log("ok catalog loading");
+  }
+  {
+    const posted = [];
+    const onConfig = (state, change) => {
+      posted.push(change);
+      if (change.api_keys.create) return { ...state, api_base: "http://proxy.test:9", created_key: "ccp-full-secret",
+        api_keys: [{ id: "abc123", name: change.api_keys.create, prefix: "ccp-full", created: "2026-11-04T00:00:00+00:00" }] };
+      return { ...state, api_keys: [] };
+    };
+    const { page, close } = await open(browser, { hash: "keys", onConfig });
+    await page.locator("#keys").getByText("No API keys yet").waitFor();
+    await page.fill("#key-name", "laptop");
+    await page.click("#key-form button");
+    await page.locator("#key-created").getByText("ccp-full-secret").first().waitFor();
+    assert.match(await page.locator("#key-created").innerText(), /ANTHROPIC_BASE_URL=http:\/\/proxy\.test:9\s+ANTHROPIC_API_KEY=ccp-full-secret/);
+    assert.doesNotMatch(await page.locator("#keys").innerText(), /ccp-full-secret/, "the list shows only the prefix");
+    await page.click("[data-revoke]");
+    await page.locator("#keys").getByText("No API keys yet").waitFor();
+    assert.deepEqual(posted, [{ api_keys: { create: "laptop" } }, { api_keys: { revoke: "abc123" } }]);
+    await close();
+    console.log("ok api keys");
+  }
+  {
+    const bucket = { ...empty, requests: 2, tokens_reported: 1, tokens: { input: 10, cache_read: 20, output: 5 } };
+    const usageBreakdown = { traffic_db: true, tokens_recorded: true,
+      total: { ...bucket, sessions: 1, hosts: 1 }, by_host: [], by_account: [], by_session: [],
+      by_key: [{ ...bucket, api_key: "laptop <script>" }, { ...empty, requests: 1, api_key: "Unknown / pre-key" }] };
+    const { page, close } = await open(browser, { hash: "usage", usageBreakdown });
+    await page.locator("#usage-keys tbody tr").first().waitFor();
+    assert.match(await page.locator("#usage-keys").innerText(), /laptop <script>/);
+    assert.match(await page.locator("#usage-keys").innerText(), /Unknown \/ pre-key/);
+    assert.equal(await page.locator("#usage-keys script").count(), 0);
+    assert.match(await page.locator("#usage-keys tbody tr").last().innerText(), /unknown/i);
+    await close();
+    const pending = await open(browser, { hash: "usage", usageBreakdown, stall: true });
+    assert.match(await pending.page.locator("#usage-keys").innerText(), /Loading/);
+    assert.equal(await pending.page.locator("#usage-keys tbody tr").count(), 0);
+    await pending.close();
+    console.log("ok API-key usage and loading");
   }
 } finally {
   await browser.close();

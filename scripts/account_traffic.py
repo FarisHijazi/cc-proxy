@@ -27,7 +27,7 @@ TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "output_tokens")
 FLOW_COLUMNS = (
     "id, started, finished, client_ip, client_host, client_user, launch_cwd, cwd, session_id, account, "
     "served_by, model, method, url, status, error, request_headers, request_body, response_headers, "
-    "response_body, " + ", ".join(TOKEN_COLUMNS)
+    "response_body, api_key, " + ", ".join(TOKEN_COLUMNS)
 )
 
 # Set by `claude-account-router --via` clients; stripped here so they go no further.
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS flows (
     client_ip TEXT, client_host TEXT, client_user TEXT, launch_cwd TEXT, cwd TEXT,
     session_id TEXT, account TEXT, served_by TEXT, model TEXT,
     method TEXT, url TEXT, status INTEGER, error TEXT,
-    request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB,
+    request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB, api_key TEXT,
     input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS flows_started ON flows(started);
@@ -164,9 +164,11 @@ class TrafficDB:
                 except sqlite3.OperationalError:
                     pass
                 present = {row[1] for row in self.db.execute("PRAGMA table_info(flows)")}
-                for column in TOKEN_COLUMNS:  # databases written before token counts were kept
+                for column in TOKEN_COLUMNS:
                     if column not in present:
                         self.db.execute(f"ALTER TABLE flows ADD COLUMN {column} INTEGER")
+                if "api_key" not in present:
+                    self.db.execute("ALTER TABLE flows ADD COLUMN api_key TEXT")
         return self.db
 
     def prune(self):
@@ -254,12 +256,13 @@ class TrafficDB:
         except (ValueError, AttributeError):
             pass
         tokens = None
+        meta["api_key"] = flow.metadata.get("api_key")
         if response is not None:
             raw = b"".join(meta["chunks"]) if "chunks" in meta else response.raw_content
             response_body = clean_body(raw, response.headers.get("content-encoding", ""))
             tokens = reply_tokens(response_body) if model else None
         db.execute(
-            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 23)})",
+            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 24)})",
             (
                 flow.id, meta["started"], time.time(),
                 meta["client_ip"], meta.get("client_host"), meta.get("client_user"), meta.get("launch_cwd"), cwd,
@@ -269,7 +272,7 @@ class TrafficDB:
                 flow.error.msg if flow.error else None,
                 meta["request_headers"], request_body,
                 clean_headers(response.headers) if response is not None else None,
-                response_body if response is not None else None,
+                response_body if response is not None else None, meta.get("api_key"),
                 *((tokens["input"], tokens["cache_read"], tokens["output"]) if tokens else (None, None, None)),
             ),
         )

@@ -613,3 +613,45 @@ def test_model_listing_borrows_nothing_when_the_next_proxy_holds_the_logins(monk
     flow.request = http.Request.make("GET", "https://api.anthropic.com/v1/models")
     inject.requestheaders(flow)
     assert "authorization" not in flow.request.headers
+
+
+def keyed(inject, tmp_path, keys, main="b"):
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"main": main, "accounts": {"a": 1, "b": 2},
+                                "api_keys": [{"name": n, "sha256": module.key_hash(k)} for n, k in keys.items()]}))
+    inject.read_accounts(path)
+
+
+@pytest.mark.parametrize("header", ["x-api-key", "authorization"])
+def test_an_api_key_uses_the_account_pool_from_the_main_account(monkeypatch, tmp_path, header):
+    inject = addon(monkeypatch, [])
+    keyed(inject, tmp_path, {"laptop": "ccp-secret"})
+    flow = tflow.tflow()
+    value = "ccp-secret" if header == "x-api-key" else "Bearer ccp-secret"
+    flow.request = http.Request.make("POST", "https://api.anthropic.com/v1/messages", headers={header: value})
+    inject.requestheaders(flow)
+    assert flow.response is None
+    assert "x-api-key" not in flow.request.headers
+    assert flow.request.headers["authorization"] == "Bearer real-2"
+    assert [e["alias"] for e in json.loads(flow.request.headers[module.POOL_HEADER])] == ["b", "a"]
+    assert flow.metadata["api_key"] == "laptop"
+
+
+def test_an_unknown_or_revoked_api_key_is_refused_locally(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    keyed(inject, tmp_path, {"laptop": "ccp-secret"})
+    flow = tflow.tflow()
+    flow.request = http.Request.make("POST", "https://api.anthropic.com/v1/messages", headers={"x-api-key": "ccp-wrong"})
+    inject.requestheaders(flow)
+    assert flow.response.status_code == 401
+    assert b"ccp-wrong" not in flow.response.content
+
+
+def test_real_anthropic_api_keys_pass_through(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    keyed(inject, tmp_path, {"laptop": "ccp-secret"})
+    flow = tflow.tflow()
+    flow.request = http.Request.make("POST", "https://api.anthropic.com/v1/messages", headers={"x-api-key": "sk-ant-api03-own"})
+    inject.requestheaders(flow)
+    assert flow.response is None
+    assert flow.request.headers["x-api-key"] == "sk-ant-api03-own"

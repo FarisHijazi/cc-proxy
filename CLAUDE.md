@@ -140,17 +140,18 @@ ToolSearch and message-thread compatibility fixes, and session-owned launcher mo
 `docs/devlog/claude_20261018-account-endpoint-relay.md` (plain path, read on demand).
 
 The launcher also accepts account aliases and a selectable main login. Main owns
-Remote Control and, by default, the native Chrome UI; a separate MCP adapter reads artifacts
-across accounts. Credential snapshots remain access-only.
+Remote Control, the native Chrome UI, and artifacts. The artifacts MCP adapter receives only
+main's login; other accounts remain available for inference fallback. Credential snapshots remain access-only.
 Read `docs/devlog/claude_20261018-multi-account-tools.md` for boundaries, upstream
 reuse and live validation (deliberately a plain path, not an include).
 Local shortcuts and saved account maps are runtime configuration outside this
 repository; their setup and smoke checks are recorded in that devlog.
 
 Browsers use only the built-in `claude-in-chrome` tools; there is no custom Chrome MCP (the `account-chrome`
-adapter was removed on 2026-11-02, see `docs/devlog/claude_20261102-native-chrome-only.md`). For `--via`
-clients the `--serve` proxy's `account_chrome_bridge.py` merges every account's browsers into the native bridge
-(`+chromes`). `--chrome-account` routes the native Chrome bridge to a selected login independently of main. The protocol
+adapter was removed on 2026-11-02, see `docs/devlog/claude_20261102-native-chrome-only.md`). Direct and `--via`
+clients use main's native browser roster by default (`+chrome=<main>`, never default `+chromes`).
+Legacy explicit `+chromes` clients still use `account_chrome_bridge.py`; new sessions do not merge accounts.
+`--chrome-account` explicitly routes the native Chrome bridge to a selected login independently of main. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
 
@@ -206,7 +207,8 @@ See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 
 `--serve` runs the proxy for other machines with logins injected from that box's cswap
 (`scripts/account_inject.py`); `--via` clients hold placeholder logins only, built from the
-proxy's profile endpoint, and aggregate every alias. No proxy auth: bind `--serve` to a tailnet IP.
+proxy's profile endpoint. Chrome and artifacts stay on main, while inference pooling happens on the server.
+No proxy auth: bind `--serve` to a tailnet IP.
 Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
 `docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
 `--serve --via` chains proxies: `account_inject.cascades()` leaves aliases this hop
@@ -236,7 +238,7 @@ Run tests as CI does with an empty `HOME`: tests that read the machine's Codex l
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days`, `fallback`, `session_models` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 The dashboard has hash-routed sidebar views and locally vendored Pico conditional CSS (no build step).
 `src/fallback.rs::defaults()` owns the only default chains and equivalence groups, exposed through
@@ -297,3 +299,7 @@ launcher refuses it without `--via`, and `account_inject` never puts a token on 
 `x-hq-mirror: 1`; the route addon strips it and lets the request reach Anthropic (else it loops
 into HQ). A caller's `--settings` merges under the launcher's. Read
 `docs/devlog/claude_20261023-rc-owner-private-mirror.md` on demand (plain path).
+API keys: `account_ui.py` issues `ccp-` keys (`api_keys` holds name, id, prefix and SHA-256, never the key).
+`account_inject.api_key()` swaps a matching key for the accounts file's `main` placeholder, so it uses the normal
+pool; an unknown `ccp-` key is refused locally. `--serve --api-port` adds mitmproxy's built-in reverse mode for
+plain `ANTHROPIC_BASE_URL` clients. See `docs/devlog/claude_20261104-api-keys.md` (plain path).

@@ -363,8 +363,8 @@ def with_flags(args, *flags):
 
 def aggregate_mcp(login, manifest, forwarded):
     """Add shared tools while retaining the main account's native Chrome UI."""
-    accounts = dict(manifest["accounts"])
-    for alias, account in manifest["accounts"].items():
+    accounts = {manifest["main"]: manifest["accounts"][manifest["main"]]}
+    for alias, account in accounts.items():
         if "secure_storage_dir" not in account:
             continue
         credential = Path(account["secure_storage_dir"]) / ".credentials.json"
@@ -381,9 +381,23 @@ def aggregate_mcp(login, manifest, forwarded):
             oauth["accessToken"] = f"proxy-account-{alias}+chrome={alias}"
             (copy / ".credentials.json").write_text(json.dumps(data))
         accounts[alias] = {**account, "secure_storage_dir": str(copy)}
-    manifest = {**manifest, "accounts": accounts}
+    artifact_manifest = {**manifest, "accounts": accounts}
     manifest_path = login / "accounts.json"
-    write_private(manifest_path, json.dumps(manifest))
+    write_private(manifest_path, json.dumps(artifact_manifest))
+    chrome_manifest_path = None
+    selected = manifest.get("chrome_account")
+    if selected:
+        chrome_accounts = {manifest["main"]: accounts[manifest["main"]]}
+        selected_account = manifest["accounts"][selected]
+        if selected != manifest["main"] and "secure_storage_dir" in selected_account:
+            copy = login / f"{selected}-chrome-secure"
+            shutil.copytree(selected_account["secure_storage_dir"], copy)
+            chrome_accounts[selected] = {**selected_account, "secure_storage_dir": str(copy)}
+        chrome_manifest_path = login / "chrome-accounts.json"
+        write_private(
+            chrome_manifest_path,
+            json.dumps({**manifest, "accounts": chrome_accounts}),
+        )
     servers = {
         "account-artifacts": {
             "type": "stdio",
@@ -645,6 +659,9 @@ def serve(args, state):
         "--set",
         f"proxy_accounts_file={args.accounts_file.expanduser().resolve()}",
     ]
+    if args.api_port:
+        # mitmproxy's own reverse mode: SDK clients point ANTHROPIC_BASE_URL here; account_inject checks the key.
+        command += ["--mode", "regular", "--mode", f"reverse:https://api.anthropic.com@{args.api_port}"]
     # Every --via client's Remote Control registers through here, so HQ owns them all.
     if args.remote_control_backend:
         command += hq_remote_route(args, state)
@@ -680,6 +697,9 @@ def serve(args, state):
             wait_listener(processes[0], router_port, log.name)
             processes.append(subprocess.Popen(command, stdout=log, stderr=log))
             wait_listener(processes[1], args.port, log.name, host=args.listen_host)
+            if args.api_port:
+                wait_listener(processes[1], args.api_port, log.name, host=args.listen_host)
+                print(f"Anthropic API with issued keys on http://{args.listen_host}:{args.api_port}", file=sys.stderr)
             print(f"Serving accounts on {args.listen_host}:{args.port}", file=sys.stderr)
             while all(process.poll() is None for process in processes):
                 time.sleep(1)
@@ -862,7 +882,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     alias, found[alias], config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
-                    chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
+                    chrome=getattr(args, "chrome_account", None) or main_account if main else None,
                     pin=main and getattr(args, "pin_main", False),
                 )
             except (OSError, ValueError, KeyError) as error:
@@ -967,6 +987,11 @@ def main():
         help="serve the account map to other machines (router + proxy, no client)",
     )
     parser.add_argument("--listen-host", default="127.0.0.1", help="--serve bind address")
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        help="--serve: also accept plain Anthropic API calls (ANTHROPIC_BASE_URL) with an issued ccp- key",
+    )
     parser.add_argument("--router-bin", default="claude-codex", help="--serve router binary")
     parser.add_argument(
         "--via",
@@ -1066,7 +1091,7 @@ def main():
                 port,
                 state,
                 args.all_endpoints,
-                Path(login.name) / "accounts.json",
+                Path(login.name) / "chrome-accounts.json",
             )
             print(f"Native Chrome account: {args.chrome_account}", file=sys.stderr)
         print(

@@ -6,6 +6,8 @@ cswap owns every grant: the live default login is only read (claude refreshes
 it), any other slot is refreshed through cswap's `consume_backup_grant`.
 """
 
+import hashlib
+import hmac
 import json
 import re
 import runpy
@@ -17,6 +19,8 @@ from mitmproxy import ctx, exceptions, http
 from mitmproxy.net import server_spec
 
 PREFIX = "Bearer proxy-account-"
+# Keys this proxy issues (account_ui.py creates them; the accounts file keeps only their SHA-256).
+API_KEY_PREFIX = "ccp-"
 REMOTE_CONTROL_PATH = "/v1/code/"
 SESSIONS_PATH = "/v1/code/sessions"
 # Refresh a little early so a token never expires mid-request.
@@ -75,6 +79,10 @@ def slot_token(slot):
     return token["accessToken"], token["expiresAt"]
 
 
+def key_hash(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 def chrome_selection(placeholder):
     suffixes = placeholder.split("+")[1:]
     targets = [part[7:] for part in suffixes if part.startswith("chrome=")]
@@ -113,6 +121,7 @@ class AccountInject:
         self.disabled = set()
         self.fallback = {}
         self.session_models = {}
+        self.api_keys, self.main = {}, None
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
@@ -157,6 +166,8 @@ class AccountInject:
                    for s, m in session_models.items()):
             raise ValueError("session_models maps session ids to model ids")
         self.session_models = dict(session_models)
+        self.api_keys = {k["sha256"]: k["name"] for k in data.get("api_keys", [])}
+        self.main = data.get("main")
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
         balance = data.get("balance", {})
@@ -362,6 +373,28 @@ class AccountInject:
         if self.chrome is not None:
             self.chrome.close()
 
+    def api_key(self, flow):
+        """Swap an issued API key for the main account's placeholder; False when the key is refused."""
+        headers = flow.request.headers
+        key = headers.get("x-api-key", "") or headers.get("authorization", "").removeprefix("Bearer ")
+        if not key.startswith(API_KEY_PREFIX):
+            return True
+        self.reload_accounts()
+        digest = key_hash(key)
+        name = next((n for h, n in self.api_keys.items() if hmac.compare_digest(h, digest)), None)
+        if name is None:
+            flow.response = http.Response.make(
+                401,
+                json.dumps({"type": "error", "error": {"type": "authentication_error", "message": "invalid API key"}}),
+                {"content-type": "application/json"},
+            )
+            return False
+        headers.pop("x-api-key", None)
+        main = self.main if self.main in self.accounts else next(iter(self.accounts), "")
+        headers["authorization"] = PREFIX + main
+        flow.metadata["api_key"] = name
+        return True
+
     def requestheaders(self, flow):
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
@@ -375,6 +408,8 @@ class AccountInject:
         if self.upstream and flow.request.host == "bridge.claudeusercontent.com":
             # The router reaches Anthropic through the next proxy; the Chrome bridge must too.
             flow.server_conn.via = self.upstream
+        if not self.api_key(flow):
+            return
         supplied = flow.request.headers.get("authorization", "")
         if not supplied and not self.upstream and flow.request.method == "GET" and (
                 flow.request.host == "api.anthropic.com" and flow.request.path.split("?")[0] == "/v1/models"):

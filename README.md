@@ -238,6 +238,26 @@ Claude exits. Leave it out if you only use the tailnet. Account profiles are cac
 day, so a launch takes well under a second. The client's `main` decides which login
 claude.ai sees for artifacts and Remote Control.
 
+### API keys for other apps
+
+Any tool that speaks the Anthropic API can use the account pool, and its failover, with a key
+that the proxy issues. Start `--serve` with `--api-port 18793`. That port is mitmproxy's own
+reverse mode for `https://api.anthropic.com`, so no proxy setting or CA is needed. Create a key
+in the dashboard's **API keys** view. The key is shown once, and the accounts file keeps only
+its SHA-256. Then:
+
+```sh
+export ANTHROPIC_BASE_URL=http://SERVER_TAILNET_IP:18793
+export ANTHROPIC_API_KEY=ccp-...
+```
+
+A `ccp-` key in `x-api-key` or `Authorization: Bearer` becomes the accounts file's `main`
+account, then walks the same pool as a Claude Code session. An unknown or revoked key gets a
+401 from the proxy, and nothing is sent upstream. Any other key, such as a real `sk-ant-` key,
+passes through unchanged. Pass `--api-base http://SERVER_TAILNET_IP:18793` to `account_ui.py`
+to print the two lines above next to a new key. The port has no TLS, so keep it on the tailnet,
+like the proxy port.
+
 ## Quickstart
 
 **1. Install `claude-codex`** using a prebuilt binary:
@@ -569,8 +589,8 @@ full-history resend; Anthropic-bound threads continue unchanged. See the
 
 ### Multiple accounts, one main login
 
-Aggregate native Chrome browsers and read artifacts from several full Claude
-logins while choosing one account for Remote Control and default account features:
+Choose one main login for Chrome, artifacts, Remote Control, and account features.
+Other configured logins remain available to the inference fallback pool:
 
 ```sh
 python scripts/claude-account-router --start-router \
@@ -589,8 +609,8 @@ pass `--accounts-file /path/to/accounts.json` containing:
 `--main-account personal` overrides that default for a new session. Each main
 account gets separate session state. Remote Control belongs to that account;
 selecting another browser does not change it. Browsers use only the built-in
-Chrome tools. With `--via`, the `--serve` proxy merges every account's browsers
-into the native Chrome bridge. Without `--via`, native `/chrome` sees main's browsers. To choose a different
+Chrome tools. Both direct and `--via` sessions use main's native browser roster by
+default, without merging other accounts. To explicitly choose a different
 account for the native picker, add `--chrome-account personal` before `--`:
 
 ```sh
@@ -601,13 +621,11 @@ python scripts/claude-account-router --start-router \
 ```
 
 This routes native Chrome's bridge to the selected login while Remote Control
-stays on main. It replaces the aggregate Chrome tools for this session; the
-native picker lists only the selected account's browsers. Both accounts need
-unexpired full logins. Native CLI permissions and file-upload preprocessing stay
-in place; the aggregate adapter still rejects uploads because it cannot run that
-private preprocessing. File uploads were not exercised in the live routing test.
-The `account-artifacts` MCP tools list across accounts and read metadata or files
-with their owning account. They do not publish or share artifacts between accounts.
+stays on main. The native picker lists only the selected account's browsers.
+Both accounts need unexpired full logins. Native CLI permissions and file-upload
+preprocessing stay in place. File uploads were not exercised in the live routing test.
+The `account-artifacts` MCP tools receive only main's login and list and read its
+artifacts. They do not publish or share artifacts between accounts.
 
 Expired secondary logins are reported explicitly. Renew the source login and
 relaunch; the launcher never refreshes or switches source credentials.

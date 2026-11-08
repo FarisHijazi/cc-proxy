@@ -8,9 +8,11 @@ bind it to the same private address as the proxy.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import runpy
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -128,6 +130,30 @@ def checked_session_models(current, change):
 COLUMNS = "id, started, client_host, client_ip, client_user, cwd, launch_cwd, account, served_by, model, status, method, url"
 
 
+def key_hash(key):
+    """Same digest account_inject.py checks issued keys against."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def checked_api_keys(current, change):
+    """Apply {"create": name} or {"revoke": id}; returns (keys, new plaintext key or None)."""
+    if not isinstance(change, dict) or len(change) != 1 or not {"create", "revoke"} & set(change):
+        raise ValueError('api_keys takes {"create": name} or {"revoke": id}')
+    if "revoke" in change:
+        kept = [k for k in current if k["id"] != change["revoke"]]
+        if len(kept) == len(current):
+            raise ValueError("no such API key")
+        return kept, None
+    name = change["create"]
+    if not isinstance(name, str) or not 0 < len(name.strip()) <= 64:
+        raise ValueError("an API key needs a name of 1 to 64 characters")
+    key = "ccp-" + secrets.token_urlsafe(32)
+    digest = key_hash(key)
+    entry = {"id": digest[:12], "name": name.strip(), "sha256": digest, "prefix": key[:8],
+             "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    return [*current, entry], key
+
+
 def inference_only(error):
     """A `claude setup-token` may only call the model, so usage and profile answer 401/403."""
     return bool(error) and ("401" in error or "403" in error)
@@ -157,8 +183,9 @@ def usage_size(entry):
 
 
 class Dashboard:
-    def __init__(self, accounts_file, proxy, ca, hq=None, hq_public=None):
+    def __init__(self, accounts_file, proxy, ca, hq=None, hq_public=None, api_base=None):
         self.accounts_file = accounts_file
+        self.api_base = api_base
         self.links = RemoteLinks(hq, hq_public or hq) if hq else None
         self.links_lock, self.links_at, self.links_result = threading.Lock(), 0, ({}, None)
         self.proxy = urlsplit(proxy)
@@ -294,6 +321,8 @@ class Dashboard:
             "renamed": cfg.get("renamed", {}),
             "fallback": cfg.get("fallback", {}),
             "session_models": cfg.get("session_models", {}),
+            "api_base": self.api_base,
+            "api_keys": [{k: v for k, v in key.items() if k != "sha256"} for key in cfg.get("api_keys", [])],
             "providers": providers,
             "fallback_defaults": providers["fallback_defaults"],
             "provider_usage": self.recorded_provider_usage(cfg),
@@ -388,16 +417,17 @@ class Dashboard:
         answering account. Tokens are only what replies reported; `tokens_reported` says how many did."""
         db = self.database(self.config())
         result = {"hours": hours, "traffic_db": db is not None, "tokens_recorded": False,
-                  "total": None, "by_host": [], "by_session": [], "by_account": []}
+                  "total": None, "by_host": [], "by_session": [], "by_account": [], "by_key": []}
         if db is None:
             return result
         columns = {row[1] for row in db.execute("PRAGMA table_info(flows)")}
         recorded = {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns
         result["tokens_recorded"] = recorded
         counts = ("input_tokens, cache_read_tokens, output_tokens" if recorded else "NULL, NULL, NULL")
+        api_key = "api_key" if "api_key" in columns else "NULL"
         rows = db.execute(
             f"SELECT coalesce(client_host, client_ip, 'unknown'), session_id, client_user, coalesce(cwd, launch_cwd), "
-            f"served_by, account, started, {counts} FROM flows WHERE started > ? AND model IS NOT NULL "
+            f"served_by, account, started, {api_key}, {counts} FROM flows WHERE started > ? AND model IS NOT NULL "
             "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'",
             (time.time() - hours * 3600,)).fetchall()
 
@@ -414,8 +444,8 @@ class Dashboard:
                 for key, value in zip(("input", "cache_read", "output"), tokens):
                     entry["tokens"][key] += value or 0
 
-        total, hosts, sessions, accounts = bucket(), {}, {}, {}
-        for host, session, user, cwd, served_by, account, started, *tokens in rows:
+        total, hosts, sessions, accounts, keys = bucket(), {}, {}, {}, {}
+        for host, session, user, cwd, served_by, account, started, api_key, *tokens in rows:
             who = (served_by or "").split("/")[0] or alias_of(account) or "unknown"
             add(total, started, tokens)
             add(hosts.setdefault(host, bucket(host=host, session_ids=set())), started, tokens)
@@ -424,13 +454,16 @@ class Dashboard:
             add(entry, started, tokens)
             entry["accounts"][who] = entry["accounts"].get(who, 0) + 1
             add(accounts.setdefault(who, bucket(account=who)), started, tokens)
+            key_label = api_key or "Unknown / pre-key"
+            add(keys.setdefault(key_label, bucket(api_key=key_label)), started, tokens)
         for entry in hosts.values():
             entry["sessions"] = len(entry.pop("session_ids"))
         total["sessions"] = len({key for key in sessions if key[1] is not None})
         total["hosts"] = len(hosts)
         result.update(total=total, by_host=sorted(hosts.values(), key=usage_size, reverse=True),
                       by_session=sorted(sessions.values(), key=usage_size, reverse=True)[:USAGE_SESSION_LIMIT],
-                      by_account=sorted(accounts.values(), key=usage_size, reverse=True))
+                      by_account=sorted(accounts.values(), key=usage_size, reverse=True),
+                      by_key=sorted(keys.values(), key=usage_size, reverse=True))
         return result
 
     def flow(self, flow_id):
@@ -481,6 +514,13 @@ class Dashboard:
                 cfg["session_models"] = session_models
             else:
                 cfg.pop("session_models", None)
+        created = None
+        if "api_keys" in change:
+            keys, created = checked_api_keys(cfg.get("api_keys", []), change["api_keys"])
+            if keys:
+                cfg["api_keys"] = keys
+            else:
+                cfg.pop("api_keys", None)
         if "fallback" in change:
             fallback = checked_fallback(change["fallback"], cfg.get("fallback"))
             if fallback is None:
@@ -492,7 +532,8 @@ class Dashboard:
         tmp.write_text(json.dumps(cfg, indent=2) + "\n")
         tmp.chmod(0o600)
         tmp.replace(self.accounts_file)
-        return self.state()
+        state = self.state()
+        return {**state, "created_key": created} if created else state
 
 
 def handler(dashboard):
@@ -554,9 +595,10 @@ def main():
     parser.add_argument("--proxy", required=True, help="the --serve proxy, http://HOST:PORT")
     parser.add_argument("--proxy-ca", type=Path, required=True, help="the --serve proxy's CA certificate")
     parser.add_argument("--hq", help="HQ (cchq) API origin, e.g. http://127.0.0.1:8389, for Remote Control links")
+    parser.add_argument("--api-base", help="the --serve proxy's --api-port address, e.g. http://HOST:PORT, shown with new keys")
     parser.add_argument("--hq-public-url", help="HQ's browser URL, e.g. https://hq.example.com (default: --hq)")
     args = parser.parse_args()
-    dashboard = Dashboard(args.accounts_file.expanduser(), args.proxy, args.proxy_ca.expanduser(), args.hq, args.hq_public_url)
+    dashboard = Dashboard(args.accounts_file.expanduser(), args.proxy, args.proxy_ca.expanduser(), args.hq, args.hq_public_url, args.api_base)
     server = ThreadingHTTPServer((args.listen_host, args.port), handler(dashboard))
     print(f"cc-proxy dashboard on http://{args.listen_host}:{args.port}", flush=True)
     server.serve_forever()
