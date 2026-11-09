@@ -655,3 +655,71 @@ def test_real_anthropic_api_keys_pass_through(monkeypatch, tmp_path):
     inject.requestheaders(flow)
     assert flow.response is None
     assert flow.request.headers["x-api-key"] == "sk-ant-api03-own"
+
+
+def test_a_rejected_injected_token_is_dropped_and_renewed_once_a_minute(monkeypatch):
+    calls, renewals = [], []
+    inject = addon(monkeypatch, calls)
+
+    class Thread:
+        def __init__(self, target, args, daemon):
+            self.run = lambda: renewals.append(args)
+
+        def start(self):
+            self.run()
+
+    monkeypatch.setattr(module.threading, "Thread", Thread)
+    for _ in range(2):
+        flow = request("Bearer proxy-account-personal")
+        inject.requestheaders(flow)
+        flow.response = http.Response.make(401, b"")
+        inject.responseheaders(flow)
+    assert calls == ["1", "1"], "the rejected token is re-read, never reused"
+    assert renewals == [("1", "real-1")], "a burst of rejections renews the slot once"
+
+
+def test_a_401_for_a_token_already_replaced_changes_nothing(monkeypatch):
+    calls = []
+    inject = addon(monkeypatch, calls)
+    flow = request("Bearer proxy-account-personal")
+    inject.requestheaders(flow)
+    inject.cache["personal"] = ("newer", time.time() * 1000 + 3_600_000)
+    flow.response = http.Response.make(401, b"")
+    inject.responseheaders(flow)
+    assert inject.cache["personal"][0] == "newer"
+
+
+def test_cswap_renews_only_the_credential_that_was_rejected(monkeypatch):
+    import claude_swap.switcher
+
+    def creds(token):
+        return json.dumps({"claudeAiOauth": {"accessToken": token, "refreshToken": "grant"}})
+
+    done = []
+
+    class Switcher:
+        def current_account_number(self):
+            return "1"
+
+        def _get_sequence_data(self):
+            return {"accounts": {"1": {"email": "user@example.com"}, "2": {"email": "other@example.com"}}}
+
+        def _read_credentials(self):
+            return creds("live-token")
+
+        def _read_account_credentials_ex(self, slot, email):
+            return creds("backup-token"), None
+
+        def _fetch_active_usage(self, slot, email, live):
+            done.append(("live", slot))
+
+        def consume_backup_grant(self, slot, email, raw):
+            done.append(("backup", slot))
+
+    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", Switcher)
+    module.renew_rejected("1", "older-token")
+    module.renew_rejected("2", "older-token")
+    assert done == [], "a credential that already moved on is left alone"
+    module.renew_rejected("1", "live-token")
+    module.renew_rejected("2", "backup-token")
+    assert done == [("live", "1"), ("backup", "2")]

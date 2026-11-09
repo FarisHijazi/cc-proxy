@@ -11,6 +11,7 @@ import hmac
 import json
 import re
 import runpy
+import threading
 import time
 from pathlib import Path
 from uuid import UUID
@@ -28,6 +29,8 @@ MARGIN_MS = 5 * 60 * 1000
 # A `claude setup-token` has no expiry or refresh grant (about a year, inference only);
 # re-read it this often so a replaced one is picked up.
 SETUP_TOKEN_REREAD_MS = 60 * 1000
+# A rejected login is renewed at most this often, however many requests it fails.
+RENEW_EVERY_S = 60
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
@@ -79,6 +82,31 @@ def slot_token(slot):
     return token["accessToken"], token["expiresAt"]
 
 
+def renew_rejected(slot, rejected):
+    """Have cswap renew a slot whose unexpired token Anthropic rejected (revoked out of band)."""
+    from claude_swap import oauth
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    email = switcher._get_sequence_data()["accounts"][slot]["email"]
+    if switcher.current_account_number() == slot:
+        live = switcher._read_credentials()
+        if oauth.extract_access_token(live) == rejected:
+            # cswap re-probes, then refreshes under Claude Code's own locks, so a running claude adopts it.
+            switcher._fetch_active_usage(slot, email, live)
+        return
+    raw, _ = switcher._read_account_credentials_ex(slot, email)
+    if oauth.extract_access_token(raw) == rejected:
+        switcher.consume_backup_grant(slot, email, raw)
+
+
+def renew_in_background(slot, rejected):
+    try:
+        renew_rejected(slot, rejected)
+    except Exception as error:  # noqa: BLE001 - the next rejection retries
+        ctx.log.warn(f"renewing cswap slot {slot} failed: {type(error).__name__}")
+
+
 def key_hash(key):
     return hashlib.sha256(key.encode()).hexdigest()
 
@@ -111,6 +139,7 @@ class AccountInject:
         self.accounts = {}
         self.renamed = {}
         self.cache = {}
+        self.renewed = {}
         self.unusable = {}
         self.strategy, self.prefer = "session", None
         self.sticky, self.turn = {}, -1
@@ -249,8 +278,13 @@ class AccountInject:
         )
 
     def responseheaders(self, flow):
+        if flow.response is None:
+            return
+        login = flow.metadata.get("account_login")
+        if flow.response.status_code == 401 and login in self.accounts:
+            self.rejected(login, flow.request.headers.get("authorization", "").removeprefix("Bearer "))
         # Every reply carries the answering account's utilization; remember it for hot().
-        if not flow.metadata.get("account_pool") or flow.response is None:
+        if not flow.metadata.get("account_pool"):
             return
         headers = flow.response.headers
         alias = headers.get(SERVED_BY_HEADER, "").split("/")[0]
@@ -276,14 +310,29 @@ class AccountInject:
             alias = owner
         return self.name(alias) not in self.accounts
 
-    def resolve(self, placeholder, path=""):
+    def login_alias(self, placeholder, path=""):
         alias, owner, _ = parse(placeholder)
         if owner and path.startswith(REMOTE_CONTROL_PATH):
             alias = owner
-        alias = self.name(alias)
+        return self.name(alias)
+
+    def resolve(self, placeholder, path=""):
+        alias = self.login_alias(placeholder, path)
         if alias not in self.accounts:
             raise ValueError(f"unknown account alias {alias!r}")
         return self.token(alias)
+
+    def rejected(self, alias, sent):
+        """Anthropic refused a token this proxy injected: forget it and let cswap renew it."""
+        cached = self.cache.get(alias)
+        if not cached or cached[0] != sent:
+            return  # already replaced since this request went out
+        del self.cache[alias]
+        now = time.time()
+        if now - self.renewed.get(alias, 0) < RENEW_EVERY_S:
+            return
+        self.renewed[alias] = now
+        threading.Thread(target=renew_in_background, args=(self.accounts[alias], sent), daemon=True).start()
 
     def identity(self, alias):
         from claude_swap.paths import get_backup_root
@@ -448,6 +497,7 @@ class AccountInject:
                 flow.metadata["account_pool"] = True
                 return
             token = self.resolve(placeholder, flow.request.path)
+            flow.metadata["account_login"] = self.login_alias(placeholder, flow.request.path)
             private = parse(placeholder)[2]
             # account_remote_route reads this after the placeholder is gone.
             flow.metadata["account_private"] = private
