@@ -196,11 +196,15 @@ Remote Control, `/usage`); `balance.prefer` only picks inference. Read
 
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
 spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
-A 401 on a token `account_inject` injected (non-pool requests) drops it from the cache, and
-`renew_rejected` hands the slot to cswap, at most once a minute, but only while cswap still holds that
-rejected token. The live login uses cswap's locked `_fetch_active_usage` refresh, which a running claude
-adopts. A backup slot uses `consume_backup_grant`. Anthropic revokes unexpired tokens out of band; a
-36-minute outage is recorded in `docs/devlog/claude_20261109-renew-rejected-login.md` (plain path).
+`AccountInject.renew` (one background thread, at most once a minute per account) renews a login in two cases.
+The first is a 401 on a token `account_inject` injected (non-pool requests), which also drops the token from the cache.
+The second is a token within `MARGIN_MS` of expiry or already expired, noticed in `token()`. A backup slot is renewed
+through cswap's `consume_backup_grant`, and only when it still holds the rejected token. The live login is renewed
+by `renew_live_login`, which runs headless `claude -p` with the proxy env stripped, so Claude Code refreshes it under
+its own locks. Nothing else on the proxy host renews it. cswap's `_fetch_active_usage` defers an expired live login
+whose lineage the stale slot backup cannot vouch for, and Claude Code refreshes only within 5 minutes of expiry, so
+renewing 30 minutes early is impossible. Outages: `docs/devlog/claude_20261109-renew-rejected-login.md` and
+`docs/devlog/claude_20261110-renew-expiring-live-login.md` (plain paths).
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
 (appears only from a config dir's second launch) and the fact that 2.1.302 keeps
 computer-use approvals terminal-only are in

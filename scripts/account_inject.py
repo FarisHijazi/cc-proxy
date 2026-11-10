@@ -2,15 +2,18 @@
 
 Clients carry `Bearer proxy-account-<alias>`; this proxy holds the logins. A
 real token passes through untouched, so a client's own login still works.
-cswap owns every grant: the live default login is only read (claude refreshes
-it), any other slot is refreshed through cswap's `consume_backup_grant`.
+cswap owns every grant: the live default login is renewed by running Claude Code
+itself (`renew_live_login`), any other slot through cswap's `consume_backup_grant`.
 """
 
 import hashlib
 import hmac
 import json
+import logging
+import os
 import re
 import runpy
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -24,8 +27,11 @@ PREFIX = "Bearer proxy-account-"
 API_KEY_PREFIX = "ccp-"
 REMOTE_CONTROL_PATH = "/v1/code/"
 SESSIONS_PATH = "/v1/code/sessions"
-# Refresh a little early so a token never expires mid-request.
+# Refresh a little early so a token never expires mid-request. Also when the live login is
+# renewed: Claude Code refreshes only inside this same 5-minute window (2.1.318 `now+300000>=expiresAt`).
 MARGIN_MS = 5 * 60 * 1000
+# Claude Code must reach Anthropic directly to refresh, not through a proxy.
+PROXY_ENV = {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "ANTHROPIC_BASE_URL"}
 # A `claude setup-token` has no expiry or refresh grant (about a year, inference only);
 # re-read it this often so a replaced one is picked up.
 SETUP_TOKEN_REREAD_MS = 60 * 1000
@@ -82,29 +88,40 @@ def slot_token(slot):
     return token["accessToken"], token["expiresAt"]
 
 
-def renew_rejected(slot, rejected):
-    """Have cswap renew a slot whose unexpired token Anthropic rejected (revoked out of band)."""
+def renew_live_login():
+    """Claude Code refreshes its own login, under its own locks, when a run starts near expiry."""
+    env = {k: v for k, v in os.environ.items() if k not in PROXY_ENV}
+    subprocess.run(
+        ["claude", "-p", "reply ok", "--model", "haiku", "--settings", '{"disableAllHooks": true}'],
+        env=env, cwd=Path.home(), stdin=subprocess.DEVNULL, capture_output=True, timeout=180, check=True,
+    )
+
+
+def renew(slot, stale):
+    """Renew a slot whose token Anthropic rejected (`stale`) or that is about to expire (`stale` None)."""
     from claude_swap import oauth
     from claude_swap.switcher import ClaudeAccountSwitcher
 
     switcher = ClaudeAccountSwitcher()
     email = switcher._get_sequence_data()["accounts"][slot]["email"]
     if switcher.current_account_number() == slot:
-        live = switcher._read_credentials()
-        if oauth.extract_access_token(live) == rejected:
-            # cswap re-probes, then refreshes under Claude Code's own locks, so a running claude adopts it.
-            switcher._fetch_active_usage(slot, email, live)
+        live = oauth.extract_oauth_data(switcher._read_credentials()) or {}
+        expiring = "expiresAt" in live and live["expiresAt"] - MARGIN_MS <= time.time() * 1000
+        if live.get("accessToken") == stale or expiring:
+            # cswap's `_fetch_active_usage` defers an expired live login whose lineage the slot
+            # backup cannot vouch for ("refresh deferred to Claude Code's next use"), so do that.
+            renew_live_login()
         return
     raw, _ = switcher._read_account_credentials_ex(slot, email)
-    if oauth.extract_access_token(raw) == rejected:
+    if stale and oauth.extract_access_token(raw) == stale:
         switcher.consume_backup_grant(slot, email, raw)
 
 
-def renew_in_background(slot, rejected):
+def renew_in_background(slot, stale):
     try:
-        renew_rejected(slot, rejected)
-    except Exception as error:  # noqa: BLE001 - the next rejection retries
-        ctx.log.warn(f"renewing cswap slot {slot} failed: {type(error).__name__}")
+        renew(slot, stale)
+    except Exception as error:  # noqa: BLE001 - the next rejection or expiry check retries
+        logging.warning(f"renewing cswap slot {slot} failed: {type(error).__name__}")
 
 
 def key_hash(key):
@@ -221,7 +238,11 @@ class AccountInject:
         cached = self.cache.get(alias)
         if cached and cached[1] - MARGIN_MS > time.time() * 1000:
             return cached[0]
-        self.cache[alias] = slot_token(self.accounts[alias])
+        try:
+            self.cache[alias] = slot_token(self.accounts[alias])
+        finally:
+            if self.cache.get(alias, (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
+                self.renew(alias, None)  # nothing on this host renews the live login before it dies
         return self.cache[alias][0]
 
     def name(self, alias):
@@ -328,11 +349,14 @@ class AccountInject:
         if not cached or cached[0] != sent:
             return  # already replaced since this request went out
         del self.cache[alias]
+        self.renew(alias, sent)
+
+    def renew(self, alias, stale):
         now = time.time()
         if now - self.renewed.get(alias, 0) < RENEW_EVERY_S:
             return
         self.renewed[alias] = now
-        threading.Thread(target=renew_in_background, args=(self.accounts[alias], sent), daemon=True).start()
+        threading.Thread(target=renew_in_background, args=(self.accounts[alias], stale), daemon=True).start()
 
     def identity(self, alias):
         from claude_swap.paths import get_backup_root

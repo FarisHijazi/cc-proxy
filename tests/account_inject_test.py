@@ -16,6 +16,12 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+@pytest.fixture(autouse=True)
+def no_real_renewal(monkeypatch):
+    # A near-expiry token in any test must never run the real cswap or claude.
+    monkeypatch.setattr(module, "renew_in_background", lambda slot, stale: None)
+
+
 def addon(monkeypatch, calls):
     def slot_token(slot):
         calls.append(slot)
@@ -689,13 +695,12 @@ def test_a_401_for_a_token_already_replaced_changes_nothing(monkeypatch):
     assert inject.cache["personal"][0] == "newer"
 
 
-def test_cswap_renews_only_the_credential_that_was_rejected(monkeypatch):
-    import claude_swap.switcher
-
-    def creds(token):
-        return json.dumps({"claudeAiOauth": {"accessToken": token, "refreshToken": "grant"}})
-
-    done = []
+def switcher_with(live_token, live_expires, done):
+    def creds(token, expires=None):
+        oauth = {"accessToken": token, "refreshToken": "grant"}
+        if expires is not None:
+            oauth["expiresAt"] = expires
+        return json.dumps({"claudeAiOauth": oauth})
 
     class Switcher:
         def current_account_number(self):
@@ -705,21 +710,73 @@ def test_cswap_renews_only_the_credential_that_was_rejected(monkeypatch):
             return {"accounts": {"1": {"email": "user@example.com"}, "2": {"email": "other@example.com"}}}
 
         def _read_credentials(self):
-            return creds("live-token")
+            return creds(live_token, live_expires)
 
         def _read_account_credentials_ex(self, slot, email):
             return creds("backup-token"), None
 
-        def _fetch_active_usage(self, slot, email, live):
-            done.append(("live", slot))
-
         def consume_backup_grant(self, slot, email, raw):
             done.append(("backup", slot))
 
-    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", Switcher)
-    module.renew_rejected("1", "older-token")
-    module.renew_rejected("2", "older-token")
-    assert done == [], "a credential that already moved on is left alone"
-    module.renew_rejected("1", "live-token")
-    module.renew_rejected("2", "backup-token")
+    return Switcher
+
+
+def test_renew_acts_only_on_the_rejected_or_expiring_credential(monkeypatch):
+    import claude_swap.switcher
+
+    done = []
+    monkeypatch.setattr(module, "renew_live_login", lambda: done.append(("live", "1")))
+    hour = time.time() * 1000 + 3_600_000
+    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", switcher_with("live-token", hour, done))
+    module.renew("1", "older-token")
+    module.renew("2", "older-token")
+    module.renew("1", None)
+    module.renew("2", None)
+    assert done == [], "a credential that already moved on, or is far from expiry, is left alone"
+    module.renew("1", "live-token")
+    module.renew("2", "backup-token")
     assert done == [("live", "1"), ("backup", "2")]
+    done.clear()
+    for expires in (time.time() * 1000 + 60_000, time.time() * 1000 - 60_000):
+        monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", switcher_with("live-token", expires, done))
+        module.renew("1", None)
+    assert done == [("live", "1"), ("live", "1")], "an expiring or expired live login is renewed"
+    done.clear()
+    monkeypatch.setattr(claude_swap.switcher, "ClaudeAccountSwitcher", switcher_with("setup-token", None, done))
+    module.renew("1", None)
+    assert done == [], "a setup-token has no expiry to renew"
+
+
+def test_an_expiring_or_expired_login_is_renewed_once_a_minute(monkeypatch):
+    renewals = []
+
+    class Thread:
+        def __init__(self, target, args, daemon):
+            self.run = lambda: renewals.append(args)
+
+        def start(self):
+            self.run()
+
+    monkeypatch.setattr(module.threading, "Thread", Thread)
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(module, "slot_token", lambda slot: ("soon", time.time() * 1000 + 60_000))
+    for _ in range(3):
+        assert inject.token("personal") == "soon", "the token is still served until it expires"
+    assert renewals == [("1", None)]
+    inject.renewed.clear()
+    monkeypatch.setattr(module, "slot_token", lambda slot: (_ for _ in ()).throw(ValueError("expired")))
+    with pytest.raises(ValueError):
+        inject.token("personal")
+    assert renewals == [("1", None), ("1", None)], "an already expired login is renewed too"
+
+
+def test_claude_code_renews_the_live_login_without_the_proxy_env(monkeypatch):
+    runs = []
+    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kw: runs.append((argv, kw)))
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+    module.renew_live_login()
+    (argv, kw), = runs
+    assert argv[:2] == ["claude", "-p"]
+    assert not module.PROXY_ENV & set(kw["env"]), "Claude Code must reach Anthropic directly"
+    assert kw["check"] and kw["timeout"]
