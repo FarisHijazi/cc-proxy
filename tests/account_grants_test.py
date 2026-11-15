@@ -295,6 +295,23 @@ def test_live_default_login_cannot_be_a_shared_login(monkeypatch, tmp_path, live
     assert inject.accounts == {"a@example.com": "1"}
 
 
+def test_setup_token_aliases_stay_on_cswap_and_skip_the_live_guard(monkeypatch, tmp_path):
+    inject = opted_in(monkeypatch, tmp_path, "unused", "unit")
+    monkeypatch.setattr(module, "live_login", lambda: ("1", None))
+    monkeypatch.setattr(module, "setup_token_slot", lambda slot: slot == "1")
+    monkeypatch.setattr(module, "slot_token", lambda slot: ("setup-1", time.time() * 1000 + HOUR_MS))
+    accounts = tmp_path / "accounts.json"
+    accounts.write_text(json.dumps({"accounts": {"a": "1"}}))
+    inject.read_accounts(accounts)
+    assert inject.copyable == {"a"}
+    assert served(inject).request.headers["authorization"] == "Bearer setup-1"
+    inject.rejected("a", "setup-1")
+    assert not inject.stale
+    monkeypatch.setattr(module, "setup_token_slot", lambda slot: (_ for _ in ()).throw(OSError("unreadable")))
+    with pytest.raises(module.LiveLoginShared):
+        inject.read_accounts(accounts)
+
+
 def jwt(exp_ms, label):
     payload = base64.urlsafe_b64encode(json.dumps({"exp": int(exp_ms // 1000), "jti": label}).encode()).decode()
     return f"eyJhbGciOiJub25lIn0.{payload.rstrip('=')}.sig"

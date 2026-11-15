@@ -140,6 +140,25 @@ def live_login():
     return switcher.current_account_number(), identity[0] if identity else None
 
 
+def setup_token_slot(slot):
+    """A `claude setup-token` login has no refresh grant, so every host may hold a copy of it."""
+    from claude_swap import oauth
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    email = switcher._get_sequence_data()["accounts"][slot]["email"]
+    raw, _ = switcher._read_account_credentials_ex(slot, email)
+    token = oauth.extract_oauth_data(raw) or {}
+    return bool(token.get("accessToken")) and "expiresAt" not in token and not token.get("refreshToken")
+
+
+def copyable(slot):
+    try:
+        return setup_token_slot(slot)
+    except Exception:  # noqa: BLE001 - an unreadable slot is treated as a rotating grant
+        return False
+
+
 class LiveLoginShared(ValueError):
     """Claude Code refreshes the live login outside any lease, so it can never be a shared login."""
 
@@ -270,7 +289,7 @@ class AccountInject:
             self.affinity_slots = threading.BoundedSemaphore(AFFINITY_MAX_PENDING)
             self.affinity_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account-affinity")
             self.requestheaders = self.shared_requestheaders
-        self.grants, self.stale = None, {}
+        self.grants, self.stale, self.copyable = None, {}, set()
         grants = [os.environ.get(n) for n in ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")]
         if any(v is not None for v in grants):
             dsn, namespace, key_file = grants
@@ -320,8 +339,12 @@ class AccountInject:
         data = json.loads(path.read_text())
         accounts = {a: str(s) for a, s in data["accounts"].items()}
         if self.grants is not None:
+            # Setup-tokens never rotate: they stay in cswap; only rotating grants are shared.
+            self.copyable = {alias for alias, account_slot in accounts.items() if copyable(account_slot)}
             slot, email = live_login()
             for alias, account_slot in accounts.items():
+                if alias in self.copyable:
+                    continue
                 if account_slot == slot or email and alias.lower() == email.lower():
                     raise LiveLoginShared(
                         f"{alias} is this host's live Claude login, which Claude Code refreshes outside the "
@@ -385,7 +408,7 @@ class AccountInject:
             raise error(f"login for {alias} is still being fetched")
         if future is not None and future.exception() is not None and time.time() < future.failed_at + FETCH_RETRY_S:
             raise error(f"login for {alias} is unavailable")
-        if self.grants is None:
+        if self.grants is None or alias in self.copyable:
             future = self.fetching[alias] = FETCHER.submit(slot_token, self.accounts[alias])
         else:
             future = self.fetching[alias] = FETCHER.submit(self.grants.token, alias, self.stale.pop(alias, None))
@@ -518,6 +541,8 @@ class AccountInject:
 
     def renew(self, alias, stale):
         if self.grants is not None:
+            if alias in self.copyable:
+                return  # a setup-token has nothing to renew
             # The next fetch refreshes under the shared lease; expiry needs no hint.
             if stale and time.time() - self.renewed.get(alias, 0) >= RENEW_EVERY_S:
                 self.renewed[alias], self.stale[alias] = time.time(), stale
