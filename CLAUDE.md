@@ -261,6 +261,10 @@ its own locks. Nothing else on the proxy host renews it. cswap's `_fetch_active_
 whose lineage the stale slot backup cannot vouch for, and Claude Code refreshes only within 5 minutes of expiry, so
 renewing 30 minutes early is impossible. Outages: `docs/devlog/claude_20261109-renew-rejected-login.md` and
 `docs/devlog/claude_20261110-renew-expiring-live-login.md` (plain paths).
+With `CCP_GRANTS_DSN` set (opt-in, for primary + standby proxies), PostgreSQL owns every Claude grant instead
+of cswap: a committed lease on generation G before any refresh POST, an encrypted local journal of G+1, and
+refusal to start when an alias is the host's live login. Codex is not covered. See `docs/postgres-grants.md`
+(plain path).
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
 (appears only from a config dir's second launch) and the fact that 2.1.302 keeps
 computer-use approvals terminal-only are in
