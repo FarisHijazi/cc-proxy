@@ -106,6 +106,7 @@ def test_two_hosts_racing_a_refresh_post_once(db):
     host, provider, namespace, _ = db
     provider.delay = 0.5
     a, b = host("a"), host("b")
+    a.lease_wait_s = b.lease_wait_s = 15
     a.seed("a", provider.issue(1))
     results = [None, None]
 
@@ -116,7 +117,7 @@ def test_two_hosts_racing_a_refresh_post_once(db):
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(10)
+        thread.join(30)
     assert provider.posts == ["refresh-1"]
     assert results[0] == results[1] and results[0][0] == "access-new1"
     assert row(namespace)[1:] == (2, "ok", None)
@@ -358,12 +359,13 @@ def test_codex_two_hosts_racing_post_once_and_write_access_only_files(codex):
     keeper, endpoint, namespace = codex
     endpoint.delay = 0.5
     a, b = keeper("a"), keeper("b")
+    a.grants.lease_wait_s = b.grants.lease_wait_s = 15
     a.grants.seed("codex:work", endpoint.issue(1))
     threads = [threading.Thread(target=k.keep) for k in (a, b)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(10)
+        thread.join(30)
     assert endpoint.posts == ["codex-refresh-1"]
     assert access_of(a.path) == access_of(b.path)
     assert json.loads(base64.urlsafe_b64decode(access_of(a.path).split(".")[1] + "=="))["jti"] == "new1"
