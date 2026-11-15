@@ -17,6 +17,7 @@ on G. OAuth refresh tokens rotate on every use, so two holders of one grant burn
 2. Bootstrap once as the schema owner:
    `PGSERVICE=ccp-grants psql -v ON_ERROR_STOP=1 -f scripts/account_grants.sql`.
    The runtime role needs SELECT, INSERT, UPDATE on `ccp_grants`. Runtime never creates tables.
+   The file is idempotent; rerun it after an upgrade (it widens the `state` check to `exported`).
 3. Make a key, the same file on every host of the deployment:
    `umask 077; head -c 32 /dev/urandom | base64 > ~/.config/cc-proxy/grants.key`.
    The proxy refuses a key file readable by group or others.
@@ -27,7 +28,10 @@ on G. OAuth refresh tokens rotate on every use, so two holders of one grant burn
    ```
 
    It encrypts the slot's login into the table and deletes nothing. It refuses the live login and an
-   existing row (`--replace` stores a new generation and clears `needs-reconcile`).
+   existing row (`--replace` stores a new generation and clears `needs-reconcile` or `exported`).
+   To keep a way back without a new login, run `cswap export <file> --account <slot>` (0600) before
+   `cswap remove`: it keeps the slot's identity. Its token goes dead at the first shared refresh;
+   until then the file is a second holder, so nothing may use it but `cswap import`.
 5. Set all three variables for the proxy process (partial settings refuse startup):
 
    ```sh
@@ -100,6 +104,26 @@ export CCP_CODEX_AUTH_FILE=~/.local/state/cc-proxy/codex-auth.json
 
 With both variables unset, the router and the CLI file behave exactly as before.
 
+## Rolling back
+
+`scripts/account_grants_export.py` is the reverse of the seed. It marks the row `exported` (only
+once no lease is live, waiting up to 15 s for a refresh in flight), then writes that generation
+where a non-shared proxy reads it, and prints only the account, generation and destination.
+
+```sh
+cswap import <file>                                   # only if the slot was removed
+scripts/account_grants_export.py <alias> <slot>       # cswap's own locked backup write
+scripts/account_grants_export.py --codex work ~/.codex/auth.json   # full file, refresh token included
+```
+
+- An `exported` row answers the sanitized 503 (`was exported`) and is never leased or POSTed; a
+  journal does not write it back. Then turn shared mode off for the account.
+- The cswap slot must exist and must not be the live login. The Codex file is written atomically at
+  mode 0600 and never over an existing file without `--force`.
+- If the write fails, the row stays out of service; run the export again (an exported row can be
+  exported again).
+- `account_grants_seed.py <slot> <alias> --replace` puts it back in service as a new generation.
+
 ## Failure cases that remain
 
 - Async failover can lose a committed G+1. Only the refreshing host's journal can write it back.
@@ -120,6 +144,9 @@ With both variables unset, the router and the CLI file behave exactly as before.
 - The live-login guard runs on start and on accounts file reload, not when someone runs `/login` on
   the host later.
 - One connection per statement group, no pooling; a refresh opens about four connections.
+- Export takes the row's generation. If another host crashed after POSTing it (G+1 only in that
+  host's journal), the exported login is already spent, and that journal no longer writes back.
+- A refresh POST that outlives its 120 s lease can still commit G+1 after an export of G.
 - Codex: the keeper learns nothing from the router. A Codex access token revoked before its expiry
   keeps failing (with the router's clear error) until the keeper's next refresh near expiry, or a
   reseed. The router does not wait for a rewrite; it answers at once.
@@ -136,7 +163,10 @@ unreachable store answers a sanitized 503, the live-login guard, and feature off
 `slot_token` and `renew`. The Codex half runs the same file with a fake token endpoint: two
 keepers racing post once and write access-only 0600 files, a crash after the POST recovers from
 the journal, `invalid_grant` never loops, the refresh's request and error mapping, the opt-in
-guards, and `--serve` setting `CCP_CODEX_EXTERNAL_REFRESH` only when opted in. Rust unit tests
+guards, and `--serve` setting `CCP_CODEX_EXTERNAL_REFRESH` only when opted in. Rollback: export
+into a temp cswap slot then reseed round-trips the login, an exported row is never served, POSTed
+or revived by a journal, export waits for a refresh in flight and refuses a lease that stays, and
+the Codex export keeps the refresh token at 0600 and never overwrites without `--force`. Rust unit tests
 in `src/providers/codex/auth/manager.rs` (`external_refresh_*`) pin the router side on a real
 temp `auth.json` against a listener that must never be dialed. DB tests use `CCP_HA_TEST_DSN` (database `ccp_ha_validation` only, a
 unique namespace, its rows deleted) and skip without it.
