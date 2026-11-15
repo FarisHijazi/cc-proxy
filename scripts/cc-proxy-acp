@@ -128,11 +128,12 @@ class HQ:
 class Attached:
     seen: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
-    aliases: dict = field(default_factory=dict)
+    message_metadata: dict = field(default_factory=dict)
     observer: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending: str | None = None
     prompt_id: str | None = None
+    client_message_id: str | None = None
     prompt_started: float = 0
     echoed: bool = False
     answered: bool = False
@@ -163,7 +164,8 @@ class FleetAgent(Agent):
         self.client_capabilities = capabilities or s.ClientCapabilities()
         return s.InitializeResponse(protocol_version=2,
             info=s.Implementation(name="cc-proxy-fleet", title="CC fleet", version="0.1.0"),
-            capabilities=s.AgentCapabilities(session=s.SessionCapabilities()), auth_methods=[])
+            capabilities=s.AgentCapabilities(session=s.SessionCapabilities()), auth_methods=[],
+            field_meta={"t3.codes/externalSession": True})
 
     async def new_session(self, cwd, **kwargs):
         # T3 probes providers with session/new; this is an unbound ACP handle, never an agent launch.
@@ -195,9 +197,10 @@ class FleetAgent(Agent):
         attached.history = rows
         for message in rows:
             key = message["key"]
-            if attached.pending and message["role"] == "user" and attached.pending in message["text"] and key not in attached.seen:
+            if attached.pending and not attached.echoed and message["role"] == "user" and attached.pending in message["text"] and key not in attached.seen:
                 attached.echoed = True
-                attached.aliases[key] = attached.prompt_id
+                if attached.client_message_id:
+                    attached.message_metadata[key] = {"t3.codes/messageId": attached.client_message_id}
             if attached.seen.get(key) == message["text"]:
                 continue
             attached.seen[key] = message["text"]
@@ -206,7 +209,7 @@ class FleetAgent(Agent):
                 attached.answered = True
             cls = s.UserMessageUpdate if message["role"] == "user" else s.AgentMessageUpdate
             await self.conn.session_update(session_id, cls(content=[s.TextContentBlock(text=message["text"])],
-                                                           message_id=attached.aliases.get(key, key)))
+                                                           message_id=key, field_meta=attached.message_metadata.get(key)))
         return fresh
 
     async def resume_session(self, cwd, session_id, **kwargs):
@@ -361,6 +364,8 @@ class FleetAgent(Agent):
                 raise failure("The existing session has an unanswered request. Answer it before sending another prompt.")
             await self.hq.action(session_id, "send", text=text)
             attached.pending, attached.prompt_id = text, uuid.uuid4().hex
+            client_id = kwargs.get("t3.codes/messageId")
+            attached.client_message_id = client_id if isinstance(client_id, str) and 0 < len(client_id) <= 256 else None
             attached.echoed = attached.answered = attached.cancelled = False
             attached.settled = 0
             attached.prompt_started = time.monotonic()
@@ -370,7 +375,12 @@ class FleetAgent(Agent):
     async def cancel_session(self, session_id, **kwargs):
         attached = self.sessions.get(session_id)
         if attached is not None:
-            await self.hq.action(session_id, "interrupt")
+            try:
+                await self.hq.action(session_id, "interrupt")
+            except (RequestError, httpx.TransportError):
+                await self.conn.session_update(session_id, s.SessionNotice(severity="error",
+                    title="Stop was not confirmed", description="Check HQ or the original terminal before trying again. No action was retried."))
+                return
             attached.cancelled = True
 
     async def ext_method(self, method, params):

@@ -118,6 +118,51 @@ def test_prompt_waits_for_its_own_response_and_sends_once():
     asyncio.run(check())
 
 
+def test_prompt_echo_keeps_native_identity_and_exact_client_binding_after_reload():
+    async def check():
+        complete = row(messages=[*row()["messages"],
+            {"id": "native-user", "role": "user", "text": "new task"},
+            {"id": "native-answer", "role": "assistant", "text": "Task complete"}])
+        hq = mock_hq(row(), row(), complete, complete)
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.resume_session("/local/fleet", SID)
+        await agent.prompt(SID, [s.TextContentBlock(text="new task")], **{"t3.codes/messageId": "app-user"})
+        await agent.poll(SID, agent.sessions[SID])
+        echoed = next(update for _, update in conn.updates if update.get("sessionUpdate") == "user_message")
+        assert echoed["_meta"] == {"t3.codes/messageId": "app-user"}
+        before_reload = echoed["messageId"]
+        conn.updates.clear()
+        await agent.resume_session("/local/fleet", SID)
+        replayed = next(update for _, update in conn.updates if update.get("sessionUpdate") == "user_message")
+        assert replayed["messageId"] == before_reload
+        assert "_meta" not in replayed
+        assert hq.actions == [(SID, "send", {"text": "new task"})]
+    asyncio.run(check())
+
+
+def test_uncertain_cancel_is_visible_and_never_marks_the_worker_stopped():
+    async def check():
+        hq = mock_hq(row(status="working"))
+        attempts = []
+        async def uncertain(session_id, action, **fields):
+            attempts.append((session_id, action))
+            raise RequestError(-32000, "Delivery is unknown; do not resend")
+        hq.action = uncertain
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.resume_session("/local/fleet", SID)
+        await agent.cancel_session(SID)
+        assert attempts == [(SID, "interrupt")]
+        assert agent.sessions[SID].cancelled is False
+        assert conn.updates[-1][1]["sessionUpdate"] == "notice"
+        assert conn.updates[-1][1]["severity"] == "error"
+        assert "No action was retried" in conn.updates[-1][1]["description"]
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("content", [s.ImageContentBlock(type="image", data="AA==", mime_type="image/png"),
                                        s.TextContentBlock(text="x" * 16385),
                                        s.TextContentBlock(text="é" * 8193)])

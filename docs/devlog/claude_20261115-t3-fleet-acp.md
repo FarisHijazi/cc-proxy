@@ -51,3 +51,15 @@ T3's native getConfig RPC reported the provider ready and native session list,
 load and resume enabled, with delete disabled. The UI listed all 26 rows and
 imported the existing toy tmux route without sending a prompt. The original T3
 service PID did not change.
+
+T3 must treat this provider as an attachment to external work: initialize metadata
+`t3.codes/externalSession` selects cancel-and-observe behavior for Stop. Closing
+the adapter only detaches it. Cancellation failures produce a visible notice and
+never trigger a retry or a false idle state.
+
+T3 supplies `t3.codes/messageId` in prompt metadata. The bridge echoes that exact
+binding with the original HQ user message ID; replay retains the original ID.
+The T3 adapter and ingestor use existing persisted native item references to keep
+the app-owned user prompt and active replies aligned with replayed history.
+The focused bridge suite passes 19 tests, including reconnect binding and
+uncertain cancellation; Ruff passes.
