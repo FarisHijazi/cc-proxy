@@ -42,6 +42,12 @@ on G. OAuth refresh tokens rotate on every use, so two holders of one grant burn
 
    The namespace follows the affinity rules. Keep the password in `PGPASSFILE`, never in the DSN.
 
+Setup-tokens (`claude setup-token`: no refresh grant, no expiry) never rotate, so any number of hosts
+may hold a copy. In this mode an alias whose cswap slot holds one stays on cswap (`AccountInject.copyable`)
+and is never seeded or renewed; only rotating logins come from the table. A host's live login can be
+seeded with `scripts/account_grants_seed.py --file ~/.claude/.credentials.json <alias>`; then move that
+file aside and drop `oauthAccount` from `~/.claude.json` before the proxy restarts.
+
 The proxy refuses to start when an alias is this host's live default Claude login (cswap's current
 slot, or the `~/.claude.json` email). Claude Code refreshes that login itself, outside any lease.
 
