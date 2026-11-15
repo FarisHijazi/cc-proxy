@@ -4,6 +4,7 @@ Clients carry `Bearer proxy-account-<alias>`; this proxy holds the logins. A
 real token passes through untouched, so a client's own login still works.
 cswap owns every grant: the live default login is renewed by running Claude Code
 itself (`renew_live_login`), any other slot through cswap's `consume_backup_grant`.
+With `CCP_GRANTS_DSN` set, PostgreSQL owns every grant instead (account_grants.py).
 """
 
 import asyncio
@@ -69,6 +70,8 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # Prompt caches last at most an hour, so an idle session may be reassigned.
 STICKY_IDLE_S = 3600
 AFFINITY_MAX_PENDING = 16
+_grants = runpy.run_path(str(Path(__file__).with_name("account_grants.py")))
+GrantsUnavailable, PostgresGrants, read_key = (_grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key"))
 
 
 def slot_token(slot):
@@ -125,6 +128,19 @@ def renew(slot, stale):
     raw, _ = switcher._read_account_credentials_ex(slot, email)
     if stale and oauth.extract_access_token(raw) == stale:
         switcher.consume_backup_grant(slot, email, raw)
+
+
+def live_login():
+    """(slot, email) of this host's live default Claude login, read from ~/.claude.json, never its token."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    identity = switcher._get_current_account()
+    return switcher.current_account_number(), identity[0] if identity else None
+
+
+class LiveLoginShared(ValueError):
+    """Claude Code refreshes the live login outside any lease, so it can never be a shared login."""
 
 
 def renew_in_background(slot, stale):
@@ -232,6 +248,19 @@ class AccountInject:
             self.affinity_slots = threading.BoundedSemaphore(AFFINITY_MAX_PENDING)
             self.affinity_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account-affinity")
             self.requestheaders = self.shared_requestheaders
+        self.grants, self.stale = None, {}
+        grants = [os.environ.get(n) for n in ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")]
+        if any(v is not None for v in grants):
+            dsn, namespace, key_file = grants
+            if not dsn or not namespace or not key_file or not SESSION_ID.fullmatch(namespace):
+                raise exceptions.OptionsError(
+                    "Shared logins require CCP_GRANTS_DSN, a valid CCP_GRANTS_NAMESPACE and CCP_GRANTS_KEY_FILE"
+                )
+            try:
+                key = read_key(key_file)
+            except (OSError, ValueError):
+                raise exceptions.OptionsError("CCP_GRANTS_KEY_FILE must be a private file of 32 base64 bytes") from None
+            self.grants = PostgresGrants(dsn, namespace, key, Path(key_file).parent / "grants-journal")
 
     def load(self, loader):
         loader.add_option(
@@ -248,14 +277,30 @@ class AccountInject:
             return
         try:
             self.read_accounts(Path(ctx.options.proxy_accounts_file))
+        except LiveLoginShared as error:
+            raise exceptions.OptionsError(str(error)) from None
         except (OSError, ValueError, KeyError, AttributeError):
             raise exceptions.OptionsError("Invalid proxy accounts file") from None
+        if self.grants is not None:
+            try:
+                self.grants.reconcile_all()
+            except Exception as error:  # noqa: BLE001 - each account reconciles again on its next read
+                logging.warning(f"reconciling shared logins failed: {type(error).__name__}")
 
     def read_accounts(self, path):
         self.accounts_file = path
         self.accounts_mtime = path.stat().st_mtime
         data = json.loads(path.read_text())
-        self.accounts = {a: str(s) for a, s in data["accounts"].items()}
+        accounts = {a: str(s) for a, s in data["accounts"].items()}
+        if self.grants is not None:
+            slot, email = live_login()
+            for alias, account_slot in accounts.items():
+                if account_slot == slot or email and alias.lower() == email.lower():
+                    raise LiveLoginShared(
+                        f"{alias} is this host's live Claude login, which Claude Code refreshes outside the "
+                        "shared lease; log this host's Claude Code into another account or drop the alias"
+                    )
+        self.accounts = accounts
         # Old alias -> current alias, so sessions launched before a rename keep working.
         self.renamed = dict(data.get("renamed", {}))
         # Where account_traffic.py records every flow; unset records nothing.
@@ -308,11 +353,15 @@ class AccountInject:
 
     def fetch(self, alias):
         future = self.fetching.get(alias)
+        error = ValueError if self.grants is None else GrantsUnavailable
         if future is not None and not future.done():
-            raise ValueError(f"login for {alias} is still being fetched")
+            raise error(f"login for {alias} is still being fetched")
         if future is not None and future.exception() is not None and time.time() < future.failed_at + FETCH_RETRY_S:
-            raise ValueError(f"login for {alias} is unavailable")
-        future = self.fetching[alias] = FETCHER.submit(slot_token, self.accounts[alias])
+            raise error(f"login for {alias} is unavailable")
+        if self.grants is None:
+            future = self.fetching[alias] = FETCHER.submit(slot_token, self.accounts[alias])
+        else:
+            future = self.fetching[alias] = FETCHER.submit(self.grants.token, alias, self.stale.pop(alias, None))
         future.failed_at = float("inf")
 
         def settle(done):
@@ -325,7 +374,7 @@ class AccountInject:
         try:
             return future.result(timeout=FETCH_WAIT_S)
         except FetchTimeout:
-            raise ValueError(f"login for {alias} is still being fetched") from None
+            raise error(f"login for {alias} is still being fetched") from None
 
     def name(self, alias):
         return self.renamed.get(alias, alias)
@@ -441,6 +490,11 @@ class AccountInject:
         self.renew(alias, sent)
 
     def renew(self, alias, stale):
+        if self.grants is not None:
+            # The next fetch refreshes under the shared lease; expiry needs no hint.
+            if stale and time.time() - self.renewed.get(alias, 0) >= RENEW_EVERY_S:
+                self.renewed[alias], self.stale[alias] = time.time(), stale
+            return
         now = time.time()
         if now - self.renewed.get(alias, 0) < RENEW_EVERY_S:
             return
@@ -560,14 +614,12 @@ class AccountInject:
         return True
 
     @staticmethod
-    def affinity_failure(flow):
+    def affinity_failure(flow, message="shared account affinity unavailable"):
         for name in ("authorization", "x-api-key", POOL_HEADER, POLICY_HEADER, SESSION_MODEL_HEADER):
             flow.request.headers.pop(name, None)
         flow.response = http.Response.make(
             503,
-            json.dumps({"type": "error", "error": {
-                "type": "api_error", "message": "shared account affinity unavailable",
-            }}),
+            json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}),
             {"content-type": "application/json"},
         )
 
@@ -662,6 +714,8 @@ class AccountInject:
             flow.request.headers["authorization"] = "Bearer " + token
         except AffinityUnavailable:
             self.affinity_failure(flow)
+        except GrantsUnavailable as error:
+            self.affinity_failure(flow, str(error))
         except Exception as error:
             # Never forward a placeholder upstream.
             flow.response = http.Response.make(
