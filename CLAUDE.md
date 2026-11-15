@@ -1,5 +1,12 @@
 # cc-proxy
 
+`scripts/cc-proxy-acp` is the ACP v2 client adapter for T3's existing local-command
+provider. HQ remains the only session/action owner; MCP supplies compact discovery,
+and selected-session detail/actions use the private HQ origin. Never spawn/resume a
+replacement Claude process, map remote workdirs onto the local T3 workspace, retry
+an uncertain write, or guess native/tmux equivalence. Read README "Existing fleet
+sessions in T3 Code" and `docs/devlog/claude_20261115-t3-fleet-acp.md` on demand.
+
 `cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
 dashboard listener. `scripts/account_mcp_relay.py` owns transport forwarding only;
 HQ remains the fleet, action and OAuth token verifier. Preserve dashboard SSO and

@@ -161,6 +161,56 @@ Claude token. Like the proxy it has no login and shows full conversations, so bi
 a private address only. To keep it running, use the systemd or launchd snippet above with
 this command in place of `cc-proxy --serve`.
 
+### Existing fleet sessions in T3 Code
+
+`scripts/cc-proxy-acp` connects T3 Code's existing **Local ACP command** provider to
+the fleet. It lists the sessions already running on every configured HQ node,
+replays the conversation text HQ holds, and sends new prompts to the same process.
+Disconnecting the adapter detaches its observer and leaves the original process running.
+No additional server or per-node deployment is needed.
+
+The script uses the official Python ACP and MCP SDKs, with pinned dependencies
+declared inline. Run it with `uv run --script`:
+
+```sh
+uv run --script /path/to/cc-proxy/scripts/cc-proxy-acp \
+  --mcp-url https://proxy.example.com/mcp \
+  --mcp-token-file /path/to/existing-mcp-token \
+  --hq-url http://private-hq:8389 \
+  --token-file /path/to/existing-hq-token
+```
+
+Use a stable installed copy of the script. In T3 Code's provider settings choose
+**Local ACP command**, set the executable to `uv`, and add the arguments above one
+per row. Select a local project for the fleet conversation views, choose **List
+sessions**, then **Import** the desired row. T3's import binds its native session
+ID; the bridge does not start or resume another Claude process. New blank threads
+cannot launch fleet agents. Rows show their host and native/tmux transport; two
+provenance paths are kept separate instead of guessing that they are identical.
+
+The selected worker keeps its real workdir, account and tools on its own node.
+T3's local project file browser and git controls still belong to the selected T3
+project; they do not browse or modify that remote workdir. Conversation updates
+come from the selected session's existing HQ history, including new messages while
+the worker is active. Unidentified token previews are not persisted as separate
+messages. Large or older history remains bounded by the existing HQ reader.
+
+Discovery uses the compact, authenticated MCP list. History and actions use only
+the configured private HQ origin. An existing HQ token is sent when configured;
+an empty token preserves an HQ that already relies on its private network boundary.
+The public MCP always requires its bearer token. Do not make a private HQ public
+to use this bridge.
+
+Imported threads start in T3's supervised permission mode. Native tool approvals
+and questions retain their original request IDs and revisions. Supported terminal
+choices use a question form; complex terminal menus and computer-use dialogs must
+be answered in HQ or the original terminal. Stale answers are rejected. A lost
+action response reports uncertain delivery and is never retried automatically.
+T3's explicit Stop targets the attached session; disconnecting does not stop it.
+
+This requires an ACP v2 capable T3 build; it is verified against T3 Code 0.1.8.
+See T3's [local command and native session guide](https://github.com/pingdotgg/t3code/blob/v0.1.8/docs/user/providers-acp.md).
+
 ### Fleet MCP for Claude.ai
 
 Add `--mcp-upstream http://127.0.0.1:8392` to the existing `cc-proxy-ui` command to
