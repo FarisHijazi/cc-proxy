@@ -161,6 +161,39 @@ Claude token. Like the proxy it has no login and shows full conversations, so bi
 a private address only. To keep it running, use the systemd or launchd snippet above with
 this command in place of `cc-proxy --serve`.
 
+### Fleet MCP for Claude.ai
+
+Add `--mcp-upstream http://127.0.0.1:8392` to the existing `cc-proxy-ui` command to
+expose an existing authenticated HQ MCP through this same listener at `/mcp`.
+It remains one MCP server. HQ owns node discovery, session identity, history and
+guarded input; cc-proxy forwards the MCP transport and authentication challenge.
+Sessions launched through `claude-accounts` remain discoverable by the configured
+HQ fleet and native Remote Control integration. No per-node MCP process is needed.
+
+Configure the HQ adapter's `CC_TMUX_MCP_PUBLIC_URL` as the cc-proxy public origin
+(for example `https://proxy.example.com`). Reuse the existing Cloudflare Tunnel and
+reverse proxy. Route exactly `/mcp`, `/mcp/`, `/.well-known/oauth-protected-resource`,
+`/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`
+to the dashboard listener without
+an interactive forward-auth redirect: the MCP upstream itself validates Authentik
+OAuth JWTs and its owner allowlist. Preserve SSO on every dashboard/API path.
+Keep the adapter's existing static bearer authentication for already configured
+machine clients; anonymous calls must return 401 with `WWW-Authenticate` metadata.
+
+In Claude.ai's custom connector settings, enter `https://proxy.example.com/mcp`,
+choose your own OAuth client, and use the existing Authentik application's public
+client ID. Sign in with an identity on that application's allowlist. The issuer must
+permit Claude's `https://claude.ai/api/mcp/auth_callback` callback. Never put a bearer
+token in a URL. A working connection should list sessions, read their messages and
+send through the same HQ action path used by the dashboard. The existing HQ MCP URL
+can stay routed through the same cc-proxy listener for machine-client compatibility.
+
+The relay forwards caller bearer tokens without adding credentials, does not forward
+dashboard cookies, and never retries actions. It streams SSE as it arrives. Omitting
+`--mcp-upstream` leaves these routes disabled. Configure a fixed upstream origin;
+caller-selected upstreams and redirects are not followed. Authorization discovery's
+redirect is passed to the client so it can fetch the issuer's metadata directly.
+
 The sidebar separates Overview, Accounts, Routing, Models, Sessions, and Requests.
 It uses locally bundled Pico CSS, with no frontend build or CDN requirement. The mobile menu
 keeps the same views available. Models edits the equivalent-model groups used by fallback

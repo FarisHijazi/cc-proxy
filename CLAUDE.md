@@ -1,5 +1,11 @@
 # cc-proxy
 
+`cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
+dashboard listener. `scripts/account_mcp_relay.py` owns transport forwarding only;
+HQ remains the fleet, action and OAuth token verifier. Preserve dashboard SSO and
+never add credentials or retry writes in the relay. Read README "Fleet MCP for
+Claude.ai" and `docs/devlog/claude_20261115-fleet-mcp.md` on demand (plain paths).
+
 Local Rust proxy that speaks the Anthropic Messages API and routes each request
 to a backend based on the model name. Repo: `FarisHijazi/cc-proxy`. It started as a
 GitHub fork of [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex)
