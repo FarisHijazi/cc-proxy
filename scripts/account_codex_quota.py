@@ -20,7 +20,8 @@ TIMEOUT = 10
 
 
 def auth_path():
-    return os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
+    explicit = os.environ.get("CCP_CODEX_AUTH_FILE")
+    return explicit or os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
 
 
 def read_login(path=None):

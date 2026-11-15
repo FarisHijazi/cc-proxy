@@ -3,8 +3,8 @@
 Off by default. With `CCP_GRANTS_DSN` unset, `account_inject.py` serves logins exactly as before:
 cswap slots through `slot_token`, renewal through `renew`. With it set, every alias in the accounts
 file is served from the `ccp_grants` table instead, so a primary and a standby proxy share ONE login
-per account. Codex grants are not covered yet. Account affinity is a separate opt-in
-(`docs/postgres-affinity.md`, plain path).
+per account. The Codex CLI login can join the same table (below). Account affinity is a separate
+opt-in (`docs/postgres-affinity.md`, plain path).
 
 Invariant: in this mode an account's refresh token lives only in PostgreSQL (plus this host's
 encrypted journal, below), and no host POSTs generation G to the provider without a committed lease
@@ -63,6 +63,43 @@ slot, or the `~/.claude.json` email). Claude Code refreshes that login itself, o
 - Encryption is AES-256-GCM with a random nonce. Associated data is namespace, account and
   generation, so a row copied to another account or generation fails closed.
 
+## The Codex login (opt-in on top)
+
+The router's Codex backend normally refreshes `$CODEX_HOME/auth.json` itself, under a lock that
+covers one process only. To share one Codex login across hosts, set two more variables for the
+`--serve` launcher (both processes inherit them):
+
+```sh
+export CCP_GRANTS_CODEX_ACCOUNT=work            # row "codex:work"
+export CCP_CODEX_AUTH_FILE=~/.local/state/cc-proxy/codex-auth.json
+```
+
+- The row is `codex:<name>`. `<name>` is `[A-Za-z0-9][A-Za-z0-9._@-]{0,63}`; Claude aliases match
+  that same pattern, so no alias contains the `:` and the two kinds never collide.
+- Seed it once, from a host's Codex CLI file:
+  `scripts/account_grants_seed.py --codex ~/.codex/auth.json work`. Then remove that file as the
+  seed prints, so the CLI no longer holds the grant. Do not use `codex logout`; whether it revokes
+  the grant upstream is unverified.
+- `account_inject.py` starts one `CodexKeeper` thread. Every 60 s it reads the row through the
+  same `PostgresGrants` protocol (lease, POST, journal, CAS). Only the credential parser
+  (`codex_login`: the access token's JWT `exp`) and the refresh function (`codex_refresh`) differ.
+  The refresh mirrors the router: form POST to `https://auth.openai.com/oauth/token` with
+  `client_id=app_EMoamEEZ73f0CkXaXp7hrann`, `grant_type=refresh_token`. A 401, OAuth
+  `invalid_grant` or a `refresh_token_expired`/`_reused`/`_invalidated` code marks
+  `needs-reconcile`.
+- After each new generation, and whenever the file is missing, the keeper writes
+  `CCP_CODEX_AUTH_FILE` atomically (temp file, fsync, rename, directory fsync, mode 0600) with the
+  current access token and **no refresh token**.
+- `claude-account-router --serve` then starts the router with `CCP_CODEX_EXTERNAL_REFRESH=1`. In
+  that mode the router never POSTs a refresh. It re-reads the file on every request, uses a token
+  until its real expiry (the 5-minute margin no longer triggers anything), and answers a clear
+  error naming the file when the token is missing, expired, or the one Codex just rejected.
+- The proxy refuses to start when `CCP_CODEX_AUTH_FILE` is the Codex CLI's own file
+  (`$CODEX_HOME/auth.json` or `~/.codex/auth.json`), or when the `CCP_GRANTS_*` settings are absent.
+  The dashboard's Codex quota card reads `CCP_CODEX_AUTH_FILE` first, as the router does.
+
+With both variables unset, the router and the CLI file behave exactly as before.
+
 ## Failure cases that remain
 
 - Async failover can lose a committed G+1. Only the refreshing host's journal can write it back.
@@ -83,6 +120,12 @@ slot, or the `~/.claude.json` email). Claude Code refreshes that login itself, o
 - The live-login guard runs on start and on accounts file reload, not when someone runs `/login` on
   the host later.
 - One connection per statement group, no pooling; a refresh opens about four connections.
+- Codex: the keeper learns nothing from the router. A Codex access token revoked before its expiry
+  keeps failing (with the router's clear error) until the keeper's next refresh near expiry, or a
+  reseed. The router does not wait for a rewrite; it answers at once.
+- Codex: if the keeper stops, the router serves the last written token until it expires, then
+  errors. The access token in `CCP_CODEX_AUTH_FILE` is plaintext at rest (mode 0600), as the
+  Codex CLI's own file is.
 
 ## Tests
 
@@ -90,5 +133,10 @@ slot, or the `~/.claude.json` email). Claude Code refreshes that login itself, o
 crash before commit and a lost commit recover from the journal, `invalid_grant` never loops,
 tampered ciphertext or wrong associated data fails closed, proxy 401 renewal posts once, the
 unreachable store answers a sanitized 503, the live-login guard, and feature off keeps
-`slot_token` and `renew`. DB tests use `CCP_HA_TEST_DSN` (database `ccp_ha_validation` only, a
+`slot_token` and `renew`. The Codex half runs the same file with a fake token endpoint: two
+keepers racing post once and write access-only 0600 files, a crash after the POST recovers from
+the journal, `invalid_grant` never loops, the refresh's request and error mapping, the opt-in
+guards, and `--serve` setting `CCP_CODEX_EXTERNAL_REFRESH` only when opted in. Rust unit tests
+in `src/providers/codex/auth/manager.rs` (`external_refresh_*`) pin the router side on a real
+temp `auth.json` against a listener that must never be dialed. DB tests use `CCP_HA_TEST_DSN` (database `ccp_ha_validation` only, a
 unique namespace, its rows deleted) and skip without it.

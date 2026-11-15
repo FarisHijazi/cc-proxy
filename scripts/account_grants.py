@@ -1,18 +1,28 @@
-"""Opt-in shared Claude logins: one refresh grant per account, held only in PostgreSQL.
+"""Opt-in shared logins: one refresh grant per account, held only in PostgreSQL.
 
 Nobody POSTs generation G to the provider without a committed lease on G. A refresh is
 lease (commit) -> POST (no transaction open) -> fsync an encrypted journal of G+1 -> CAS
 commit on G. The journal stays until a newer generation is committed, so a commit lost to
 a failover or a crash before the commit is written back by `reconcile`.
+
+Claude logins and the Codex CLI login differ only in their credential shape (`parse`) and
+token endpoint (`refresh`); both run this one protocol. A Codex row is named `codex:<name>`,
+which no Claude alias (an email-like `[A-Za-z0-9._@-]` name) can be.
 """
 
 import base64
 import hashlib
 import json
+import logging
 import os
+import re
 import socket
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+from collections import namedtuple
 from pathlib import Path
 
 MARGIN_MS = 5 * 60 * 1000
@@ -24,6 +34,18 @@ LEASE_POLL_S = 0.5
 NEEDS_RECONCILE = "needs-reconcile"
 # The grant itself is dead: only a new login (seed) or another host's journal can fix it.
 DEAD = {"invalid_grant", "no_refresh_token"}
+CODEX_PREFIX = "codex:"
+CODEX_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
+# How often the keeper re-reads the Codex row; it refreshes once inside MARGIN_MS of expiry.
+KEEP_EVERY_S = 60
+# The Codex CLI's OAuth client and token endpoint, as src/providers/codex/auth/ uses them.
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
+# Codex answers a spent refresh token with one of these codes, or plain OAuth invalid_grant.
+CODEX_DEAD_CODES = {"invalid_grant", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"}
+
+Login = namedtuple("Login", "access refresh expires")
+Outcome = namedtuple("Outcome", "credentials error")
 
 
 class GrantsUnavailable(ValueError):
@@ -62,11 +84,11 @@ def unseal(key, namespace, account, generation, blob):
         raise GrantsUnavailable(f"shared login for {account} failed its integrity check") from None
 
 
-def oauth_of(credentials):
+def claude_login(credentials):
     oauth = json.loads(credentials).get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("accessToken") or not oauth.get("expiresAt"):
         raise GrantsUnavailable("shared login has no access token and expiry")
-    return oauth
+    return Login(oauth["accessToken"], oauth.get("refreshToken"), oauth["expiresAt"])
 
 
 def default_refresh(credentials):
@@ -75,12 +97,107 @@ def default_refresh(credentials):
     return oauth.try_refresh_oauth_credentials(credentials, timeout_s=POST_TIMEOUT_S)
 
 
+def jwt_exp_ms(token):
+    try:
+        payload = token.split(".")[1]
+        exp = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"]
+        return int(exp) * 1000
+    except (IndexError, ValueError, KeyError, TypeError):
+        return None
+
+
+def codex_login(credentials):
+    """The Codex CLI's auth.json: the access token's JWT `exp`, else the expiry stored at refresh."""
+    doc = json.loads(credentials)
+    tokens = doc.get("tokens") if isinstance(doc, dict) else None
+    access = tokens.get("access_token") if isinstance(tokens, dict) else None
+    expires = isinstance(access, str) and access and (jwt_exp_ms(access) or doc.get("ccp_expires_at_ms"))
+    if not expires:
+        raise GrantsUnavailable("shared Codex login has no access token and expiry")
+    return Login(access, tokens.get("refresh_token"), expires)
+
+
+def codex_post(form):
+    """(status, JSON body or None) from the Codex token endpoint; never raises on an HTTP status."""
+    request = urllib.request.Request(
+        CODEX_TOKEN_ENDPOINT, data=urllib.parse.urlencode(form).encode(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def codex_refresh(credentials, post=codex_post):
+    """Spend the Codex refresh token once; the outcome holds the new auth.json, unowned fields kept."""
+    doc = json.loads(credentials)
+    tokens = doc["tokens"]
+    if not tokens.get("refresh_token"):
+        return Outcome(None, "no_refresh_token")
+    try:
+        status, body = post({
+            "client_id": CODEX_CLIENT_ID, "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+        })
+    except (OSError, urllib.error.URLError):
+        return Outcome(None, "network")
+    if status != 200:
+        error = body.get("error") if isinstance(body, dict) else None
+        code = error.get("code") if isinstance(error, dict) else error
+        return Outcome(None, "invalid_grant" if status == 401 or code in CODEX_DEAD_CODES else f"http_{status}")
+    if not isinstance(body, dict) or not body.get("access_token") or not body.get("refresh_token"):
+        return Outcome(None, "malformed_response")
+    tokens = {**tokens, "access_token": body["access_token"], "refresh_token": body["refresh_token"]}
+    if body.get("id_token"):
+        tokens["id_token"] = body["id_token"]
+    expires_in = body.get("expires_in") if isinstance(body.get("expires_in"), int) else 3600
+    refreshed = {
+        **doc, "tokens": tokens, "ccp_expires_at_ms": int(time.time() * 1000) + expires_in * 1000,
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return Outcome(json.dumps(refreshed), None)
+
+
+def write_codex_auth(path, credentials):
+    """Atomically write the router's auth.json: the current access token and no refresh token."""
+    path = Path(path)
+    doc = json.loads(credentials)
+    doc["tokens"] = {k: v for k, v in doc["tokens"].items() if k != "refresh_token"}
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(doc, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+
+
+def fsync_directory(directory):
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class PostgresGrants:
-    def __init__(self, dsn, namespace, key, journal_dir, refresh=default_refresh, sleep=time.sleep):
+    def __init__(self, dsn, namespace, key, journal_dir, refresh=default_refresh, sleep=time.sleep,
+                 parse=claude_login):
         self.dsn, self.namespace, self.key = dsn, namespace, key
         self.journal_dir = Path(journal_dir)
         self.journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.refresh, self.sleep = refresh, sleep
+        self.refresh, self.sleep, self.parse = refresh, sleep, parse
         self.host = socket.gethostname()
         self.lease_wait_s = LEASE_WAIT_S
 
@@ -118,17 +235,22 @@ class PostgresGrants:
         return rows[0]
 
     def token(self, account, stale=None):
-        """(accessToken, expiresAt ms) for an account, refreshing at most once across every host."""
+        """(access token, expiry ms) for an account, refreshing at most once across every host."""
+        login = self.parse(self.current(account, stale))
+        return login.access, login.expires
+
+    def current(self, account, stale=None):
+        """The account's decrypted credentials, refreshed first when due (at most once across hosts)."""
         self.reconcile(account)
         deadline = time.monotonic() + self.lease_wait_s
         while True:
             ciphertext, generation, state, leased = self.row(account)
             if state == NEEDS_RECONCILE:
                 raise GrantsUnavailable(f"shared login for {account} needs a new login")
-            oauth = oauth_of(unseal(self.key, self.namespace, account, generation, ciphertext))
-            due = oauth["expiresAt"] - MARGIN_MS <= time.time() * 1000 or oauth["accessToken"] == stale
-            if not due:
-                return oauth["accessToken"], oauth["expiresAt"]
+            credentials = unseal(self.key, self.namespace, account, generation, ciphertext)
+            login = self.parse(credentials)
+            if login.expires - MARGIN_MS > time.time() * 1000 and login.access != stale:
+                return credentials
             if not leased:
                 fresh = self.refresh_generation(account, generation)
                 if fresh is not None:
@@ -160,17 +282,17 @@ class PostgresGrants:
             raise GrantsUnavailable(
                 f"shared login for {account} " + ("needs a new login" if dead else "could not be renewed")
             )
-        oauth = oauth_of(outcome.credentials)
+        expires = self.parse(outcome.credentials).expires
         sealed = seal(self.key, self.namespace, account, generation + 1, outcome.credentials)
         try:
-            self.write_journal(account, generation + 1, oauth["expiresAt"], sealed)
+            self.write_journal(account, generation + 1, expires, sealed)
         except OSError:
             pass  # G is already spent: committing G+1 matters more than the local copy
         try:
-            self.commit(account, generation, sealed, oauth["expiresAt"])
+            self.commit(account, generation, sealed, expires)
         except GrantsUnavailable:
             pass  # the journal writes G+1 back on the next read; the token in hand is valid
-        return oauth["accessToken"], oauth["expiresAt"]
+        return outcome.credentials
 
     def commit(self, account, generation, sealed, expires_ms):
         # CAS on G only, not on the lease holder: G is spent once POSTed, so G+1 must land.
@@ -198,11 +320,7 @@ class PostgresGrants:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory = os.open(self.journal_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(self.journal_dir)
 
     def reconcile(self, account):
         """Write this host's journaled generation back when the row is older; drop it when newer."""
@@ -239,8 +357,8 @@ class PostgresGrants:
 
     def seed(self, account, credentials, replace=False):
         """Store a login as the account's newest generation; returns that generation."""
-        oauth = oauth_of(credentials)
-        if not oauth.get("refreshToken"):
+        login = self.parse(credentials)
+        if not login.refresh:
             raise GrantsUnavailable("a shared login needs a refresh token")
         (rows, _), = self.transaction([(
             "SELECT generation FROM ccp_grants WHERE namespace = %s AND account = %s",
@@ -257,8 +375,33 @@ class PostgresGrants:
             " generation = excluded.generation, expires_at = excluded.expires_at,"
             " lease_holder = NULL, lease_until = NULL, state = 'ok'"
             " WHERE ccp_grants.generation = %s",
-            (self.namespace, account, sealed, generation, oauth["expiresAt"] / 1000, generation - 1),
+            (self.namespace, account, sealed, generation, login.expires / 1000, generation - 1),
         )])
         if not written:
             raise GrantsUnavailable(f"{account} changed while seeding; run it again")
         return generation
+
+
+class CodexKeeper:
+    """Keeps the router's auth.json on the shared Codex login; the refresh token stays in PostgreSQL.
+
+    The router runs with CCP_CODEX_EXTERNAL_REFRESH=1, so it only re-reads this file.
+    """
+
+    def __init__(self, grants, name, path):
+        self.grants, self.account, self.path, self.written = grants, CODEX_PREFIX + name, Path(path), None
+
+    def keep(self):
+        credentials = self.grants.current(self.account)
+        if credentials != self.written or not self.path.exists():
+            write_codex_auth(self.path, credentials)
+            self.written = credentials
+
+    def run(self, every=KEEP_EVERY_S):
+        while True:
+            try:
+                self.keep()
+            except Exception as error:  # noqa: BLE001 - retried next tick; never log a token or DSN
+                reason = error if isinstance(error, GrantsUnavailable) else type(error).__name__
+                logging.warning(f"shared Codex login: {reason}")
+            time.sleep(every)
