@@ -3,6 +3,8 @@
 import base64
 import json
 import os
+import runpy
+import sys
 import threading
 import time
 from uuid import uuid4
@@ -515,3 +517,127 @@ def test_serve_turns_on_external_refresh_only_for_a_shared_codex_login(monkeypat
     monkeypatch.setenv("CCP_CODEX_AUTH_FILE", str(tmp_path / "router-auth.json"))
     env = router_env_of(monkeypatch, tmp_path)
     assert env["CCP_CODEX_EXTERNAL_REFRESH"] == "1" and env["CCP_CODEX_AUTH_FILE"] == str(tmp_path / "router-auth.json")
+
+
+def run_script(name, monkeypatch, *argv):
+    monkeypatch.setattr(sys, "argv", [name, *argv])
+    runpy.run_path(str(module.Path(module.__file__).with_name(name)), run_name="__main__")
+
+
+@pytest.fixture
+def operator(db, monkeypatch, tmp_path):
+    """The operator scripts' environment, with cswap rooted in a temp home holding slot 1."""
+    host, provider, namespace, dsn = db
+    home = tmp_path / "home"
+    home.mkdir()
+    for name, value in (("HOME", home), ("XDG_DATA_HOME", home / "data"), ("CLAUDE_CONFIG_DIR", home / ".claude")):
+        monkeypatch.setenv(name, str(value))
+    monkeypatch.setenv("CCP_GRANTS_DSN", dsn)
+    monkeypatch.setenv("CCP_GRANTS_NAMESPACE", namespace)
+    monkeypatch.setenv("CCP_GRANTS_KEY_FILE", str(key_file(tmp_path)))
+    from claude_swap.switcher import ClaudeAccountSwitcher
+    from claude_swap.transfer import import_accounts
+
+    switcher = ClaudeAccountSwitcher()
+    assert str(switcher.backup_dir).startswith(str(home)), "cswap must never touch the real store"
+    envelope = tmp_path / "identity.json"
+    envelope.write_text(json.dumps({"version": 1, "encrypted": False, "accounts": [{
+        "number": 1, "email": "a@example.com", "uuid": "u-toy", "organizationUuid": "",
+        "credentials": json.loads(login("access-pre", "refresh-pre", time.time() * 1000 + HOUR_MS)),
+        "config": {"oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "u-toy"}},
+    }]}))
+    import_accounts(switcher, str(envelope))
+
+    def slot_credentials():
+        fresh = ClaudeAccountSwitcher()
+        return fresh._read_account_credentials_ex("1", "a@example.com")[0]
+
+    yield host, provider, namespace, slot_credentials
+
+
+def test_export_to_cswap_then_reseed_round_trips_the_same_login(operator, monkeypatch, capsys):
+    host, provider, namespace, slot_credentials = operator
+    a = host("a")
+    a.seed("a@example.com", provider.issue(1))
+    assert a.token("a@example.com")[0] == "access-new1"
+    capsys.readouterr()
+    run_script("account_grants_export.py", monkeypatch, "a@example.com", "1")
+    printed = capsys.readouterr().out
+    assert "a@example.com generation 2 exported to cswap slot 1" in printed
+    assert "access-" not in printed and "refresh-" not in printed
+    exported = json.loads(slot_credentials())["claudeAiOauth"]
+    assert (exported["accessToken"], exported["refreshToken"]) == ("access-new1", "refresh-new1")
+    assert row(namespace, "a@example.com")[1:3] == (2, "exported")
+    run_script("account_grants_seed.py", monkeypatch, "1", "a@example.com", "--replace")
+    assert "refresh-" not in capsys.readouterr().out
+    assert row(namespace, "a@example.com")[1:3] == (3, "ok")
+    assert a.token("a@example.com")[0] == "access-new1"
+    assert provider.posts == ["refresh-1"]
+
+
+def test_an_exported_row_refuses_token_and_is_never_posted(db):
+    host, provider, namespace, _ = db
+    a = host("a")
+    a.seed("a", provider.issue(1))
+    credentials, generation = a.export("a")
+    assert generation == 1 and json.loads(credentials)["claudeAiOauth"]["refreshToken"] == "refresh-1"
+    for grants, stale in ((a, None), (host("b"), "access-1")):
+        with pytest.raises(module.GrantsUnavailable, match="was exported"):
+            grants.token("a", stale)
+    a.write_journal("a", 5, time.time() * 1000 + HOUR_MS, module._grants["seal"](KEY, namespace, "a", 5, credentials))
+    with pytest.raises(module.GrantsUnavailable, match="was exported"):
+        a.token("a")
+    assert provider.posts == [] and row(namespace)[1:] == (1, "exported", None), "a journal never revives it"
+    assert a.export("a")[1] == 1, "exporting again is the retry after a failed write"
+
+
+def test_export_waits_for_a_refresh_in_flight_and_refuses_a_lease_that_stays(db):
+    host, provider, namespace, _ = db
+    provider.delay = 1.0
+    a, b = host("a"), host("b")
+    a.seed("a", provider.issue(1))
+    refreshing = threading.Thread(target=a.token, args=("a",))
+    refreshing.start()
+    deadline = time.monotonic() + 5
+    while row(namespace)[3] is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert row(namespace)[3] is not None, "the refresh holds the lease"
+    credentials, generation = b.export("a")
+    refreshing.join(10)
+    assert generation == 2 and json.loads(credentials)["claudeAiOauth"]["accessToken"] == "access-new1"
+    assert provider.posts == ["refresh-1"]
+    with connection() as conn:
+        conn.execute(
+            "UPDATE ccp_grants SET state = 'ok', lease_holder = 'elsewhere', lease_until = now() + interval '60 seconds'"
+            " WHERE namespace = %s",
+            (namespace,),
+        )
+    with pytest.raises(module.GrantsUnavailable, match="renewed elsewhere"):
+        b.export("a")
+    assert row(namespace)[1:3] == (2, "ok")
+
+
+def test_codex_export_writes_the_full_login_privately_and_never_overwrites(codex, monkeypatch, tmp_path, capsys):
+    keeper, endpoint, namespace = codex
+    a = keeper("a")
+    a.grants.seed("codex:work", endpoint.issue(1, time.time() * 1000 + HOUR_MS))
+    monkeypatch.setenv("CCP_GRANTS_DSN", os.environ["CCP_HA_TEST_DSN"])
+    monkeypatch.setenv("CCP_GRANTS_NAMESPACE", namespace)
+    monkeypatch.setenv("CCP_GRANTS_KEY_FILE", str(key_file(tmp_path)))
+    target = tmp_path / "cli" / "auth.json"
+    target.parent.mkdir()
+    run_script("account_grants_export.py", monkeypatch, "--codex", "work", str(target))
+    printed = capsys.readouterr().out
+    assert f"codex:work generation 1 exported to {target}." in printed and "codex-refresh" not in printed
+    assert json.loads(target.read_text())["tokens"]["refresh_token"] == "codex-refresh-1"
+    assert (target.stat().st_mode & 0o777) == 0o600
+    assert row(namespace, "codex:work")[1:3] == (1, "exported")
+    with pytest.raises(module.GrantsUnavailable, match="was exported"):
+        a.keep()
+    target.write_text("kept")
+    with pytest.raises(SystemExit, match="exists; pass --force"):
+        run_script("account_grants_export.py", monkeypatch, "--codex", "work", str(target))
+    assert target.read_text() == "kept"
+    run_script("account_grants_export.py", monkeypatch, "--codex", "work", str(target), "--force")
+    assert json.loads(target.read_text())["tokens"]["refresh_token"] == "codex-refresh-1"
+    assert endpoint.posts == []

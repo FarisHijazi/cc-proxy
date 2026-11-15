@@ -8,7 +8,6 @@ account from PostgreSQL, or two holders spend the same refresh grant.
 """
 
 import argparse
-import os
 import runpy
 import sys
 from pathlib import Path
@@ -34,25 +33,18 @@ def main():
     parser.add_argument("--codex", action="store_true", help="seed a Codex CLI login as codex:<alias>")
     parser.add_argument("--replace", action="store_true", help="overwrite an existing shared login")
     args = parser.parse_args()
-    names = ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")
-    if not all(os.environ.get(n) for n in names):
-        sys.exit("set " + ", ".join(names))
-    dsn, namespace, key_file = (os.environ[n] for n in names)
     if args.codex and not grants["CODEX_NAME"].fullmatch(args.alias):
         sys.exit("a Codex name is letters, digits and . _ @ -")
     account = grants["CODEX_PREFIX"] + args.alias if args.codex else args.alias
     try:
         credentials = Path(args.source).read_text() if args.codex else claude_login(args.source)
-        parse = grants["codex_login"] if args.codex else grants["claude_login"]
-        store = grants["PostgresGrants"](
-            dsn, namespace, grants["read_key"](key_file), Path(key_file).parent / "grants-journal", parse=parse,
-        )
+        store = grants["store_from_env"](grants["codex_login"] if args.codex else grants["claude_login"])
         generation = store.seed(account, credentials, args.replace)
     except (KeyError, TypeError):
         sys.exit(f"cswap has no slot {args.source}")
     except (ValueError, OSError) as error:
         sys.exit(f"not seeded: {error if isinstance(error, grants['GrantsUnavailable']) else type(error).__name__}")
-    print(f"{account} stored as generation {generation} in namespace {namespace}.")
+    print(f"{account} stored as generation {generation} in namespace {store.namespace}.")
     print("Before any proxy serves it, remove every other holder of this grant, starting with the source:")
     if args.codex:
         print(f"  rm {args.source}   # a Codex CLI on that host must not keep this login")

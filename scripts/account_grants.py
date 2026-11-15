@@ -32,6 +32,10 @@ POST_TIMEOUT_S = 10
 LEASE_WAIT_S = 15
 LEASE_POLL_S = 0.5
 NEEDS_RECONCILE = "needs-reconcile"
+# Exported back to a local holder for a rollback: no host serves or refreshes it until a reseed.
+EXPORTED = "exported"
+OUT_OF_SERVICE = {NEEDS_RECONCILE: "needs a new login", EXPORTED: "was exported; reseed it with --replace"}
+GRANTS_ENV = ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")
 # The grant itself is dead: only a new login (seed) or another host's journal can fix it.
 DEAD = {"invalid_grant", "no_refresh_token"}
 CODEX_PREFIX = "codex:"
@@ -165,9 +169,14 @@ def codex_refresh(credentials, post=codex_post):
 
 def write_codex_auth(path, credentials):
     """Atomically write the router's auth.json: the current access token and no refresh token."""
-    path = Path(path)
     doc = json.loads(credentials)
     doc["tokens"] = {k: v for k, v in doc["tokens"].items() if k != "refresh_token"}
+    write_private_json(path, doc)
+
+
+def write_private_json(path, doc):
+    """Temp file (0600), fsync, rename, directory fsync."""
+    path = Path(path)
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -189,6 +198,14 @@ def fsync_directory(directory):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def store_from_env(parse=claude_login):
+    """The PostgresGrants the proxy would build from CCP_GRANTS_*, for the operator scripts."""
+    if not all(os.environ.get(n) for n in GRANTS_ENV):
+        raise GrantsUnavailable("set " + ", ".join(GRANTS_ENV))
+    dsn, namespace, key_file = (os.environ[n] for n in GRANTS_ENV)
+    return PostgresGrants(dsn, namespace, read_key(key_file), Path(key_file).parent / "grants-journal", parse=parse)
 
 
 class PostgresGrants:
@@ -245,8 +262,8 @@ class PostgresGrants:
         deadline = time.monotonic() + self.lease_wait_s
         while True:
             ciphertext, generation, state, leased = self.row(account)
-            if state == NEEDS_RECONCILE:
-                raise GrantsUnavailable(f"shared login for {account} needs a new login")
+            if state in OUT_OF_SERVICE:
+                raise GrantsUnavailable(f"shared login for {account} {OUT_OF_SERVICE[state]}")
             credentials = unseal(self.key, self.namespace, account, generation, ciphertext)
             login = self.parse(credentials)
             if login.expires - MARGIN_MS > time.time() * 1000 and login.access != stale:
@@ -338,7 +355,7 @@ class PostgresGrants:
                 " ON CONFLICT (namespace, account) DO UPDATE SET ciphertext = excluded.ciphertext,"
                 " generation = excluded.generation, expires_at = excluded.expires_at,"
                 " lease_holder = NULL, lease_until = NULL, state = 'ok'"
-                " WHERE ccp_grants.generation < excluded.generation",
+                " WHERE ccp_grants.generation < excluded.generation AND ccp_grants.state <> 'exported'",
                 (self.namespace, account, sealed, generation, record["expires_at_ms"] / 1000),
             ),
             (
@@ -354,6 +371,31 @@ class PostgresGrants:
             record = json.loads(path.read_text())
             if record.get("namespace") == self.namespace:
                 self.reconcile(record["account"])
+
+    def export(self, account):
+        """(credentials, generation) of the newest generation, taken out of service first.
+
+        Only once no live lease is held, so no host is mid-refresh and none refreshes it after.
+        Exporting an exported row again is allowed: it is the retry when writing the copy failed.
+        """
+        self.reconcile(account)
+        deadline = time.monotonic() + self.lease_wait_s
+        while True:
+            (rows, _), = self.transaction([(
+                "UPDATE ccp_grants SET state = 'exported'"
+                " WHERE namespace = %s AND account = %s AND state IN ('ok', 'exported')"
+                " AND (lease_until IS NULL OR lease_until < now()) RETURNING ciphertext, generation",
+                (self.namespace, account),
+            )])
+            if rows:
+                ciphertext, generation = rows[0]
+                return unseal(self.key, self.namespace, account, generation, ciphertext), generation
+            _, _, state, _ = self.row(account)
+            if state == NEEDS_RECONCILE:
+                raise GrantsUnavailable(f"shared login for {account} {OUT_OF_SERVICE[state]}")
+            if time.monotonic() >= deadline:
+                raise GrantsUnavailable(f"shared login for {account} is being renewed elsewhere; try again")
+            self.sleep(LEASE_POLL_S)
 
     def seed(self, account, credentials, replace=False):
         """Store a login as the account's newest generation; returns that generation."""
