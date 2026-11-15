@@ -11,6 +11,9 @@ dependencies = [
     "claude-swap @ git+https://github.com/FarisHijazi/claude-swap",
 ]
 
+[project.optional-dependencies]
+affinity = ["psycopg[binary]>=3.2,<4"]
+
 [project.scripts]
 cc-proxy = "cc_proxy.cli:main"
 cc-proxy-traffic = "cc_proxy.cli:traffic"
