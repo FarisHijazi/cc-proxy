@@ -68,7 +68,7 @@ The existing SSH `dev` host persists its loopback 3773 forward alongside the
 previous forwards. T3 remains private at `http://127.0.0.1:3773` while that existing
 connection is active. No public T3 listener or extra daemon was added.
 
-The 32 bridge tests cover real SDK stdio negotiation, safe discovery/load, exact
+The 44 bridge tests cover real SDK stdio negotiation, safe discovery/load, exact
 opaque routes, growing message identity, concurrent prompts, stale revisions,
 uncertain delivery, approval identity, user questions and cancel versus detach.
 Ruff passes. Run with:

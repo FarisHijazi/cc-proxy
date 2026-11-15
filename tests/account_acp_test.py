@@ -633,3 +633,167 @@ def test_cancel_queued_during_pre_send_read_is_still_sent_only_once():
         assert (await prompt).stop_reason == "cancelled"
         assert hq.actions == [(SID, "send", {"text": "task"}), (SID, "interrupt", {})]
     asyncio.run(check())
+
+
+def test_definitively_rejected_prompt_does_not_block_another_send():
+    async def check():
+        writes, sent = [], asyncio.Event()
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=row())
+            writes.append(json.loads(request.content))
+            if len(writes) == 1:
+                return httpx.Response(403, json={"error": "action refused"})
+            sent.set()
+            return httpx.Response(200, json={"accepted": True})
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        agent = FleetAgent(hq, observe=False)
+        agent.on_connect(client())
+        await agent.load_session("/local/fleet", SID)
+        with pytest.raises(RequestError, match="rejected"):
+            await agent.prompt(SID, [s.TextContentBlock(text="first")])
+        assert agent.sessions[SID].pending is None
+        second = asyncio.create_task(agent.prompt(SID, [s.TextContentBlock(text="second")]))
+        await asyncio.wait_for(sent.wait(), 1)
+        assert [write["text"] for write in writes] == ["first", "second"]
+        second.cancel()
+        await agent.close_session(SID)
+        await hq.http.aclose()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("kind", ["native", "menu"])
+def test_stale_control_is_offered_again_with_a_fresh_revision(kind):
+    async def check():
+        writes = []
+        control = {"native_control": {"request_id": "permission", "tool_name": "Bash", "input": {}}} if kind == "native" else {
+            "menu": {"signature": "menu-one", "question": "Pick", "options": [{"index": 0, "label": "A"}]}}
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=row(revision="r2", **control))
+            writes.append(json.loads(request.content))
+            return httpx.Response(200, json={"accepted": True})
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        agent = FleetAgent(hq, observe=False)
+        conn, forms = client(), []
+        async def answer(message, mode, **kwargs):
+            forms.append(message)
+            return s.AcceptElicitationResponse(content={"choice": "0"})
+        conn.create_elicitation = answer
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({"elicitation": {"form": {}}}))
+        attached = bridge["Attached"]()
+        await agent.handle_control(SID, row(revision="r1", **control), attached)
+        assert not attached.controls
+        await agent.handle_control(SID, row(revision="r2", **control), attached)
+        assert len(conn.permissions if kind == "native" else forms) == 2
+        assert len(writes) == 1 and writes[0]["revision"] == "r2"
+        await hq.http.aclose()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("kind", ["native", "menu"])
+def test_declined_control_stays_suppressed_until_its_identity_changes(kind):
+    async def check():
+        hq = mock_hq()
+        agent = FleetAgent(hq, observe=False)
+        conn, forms = client(), []
+        async def decline(message, mode, **kwargs):
+            forms.append(message)
+            return s.DeclineElicitationResponse()
+        conn.create_elicitation = decline
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({"elicitation": {"form": {}}}))
+        def question(key):
+            return row(native_control={"request_id": key, "tool_name": "AskUserQuestion", "input": {
+                "questions": [{"question": "Pick", "options": [{"label": "A"}]}]}}) if kind == "native" else row(
+                    menu={"signature": key, "question": "Pick", "options": [{"index": 0, "label": "A"}]})
+        attached = bridge["Attached"]()
+        await agent.handle_control(SID, question("one"), attached)
+        await agent.handle_control(SID, question("one"), attached)
+        assert len(forms) == 1 and hq.actions == []
+        await agent.handle_control(SID, question("two"), attached)
+        assert len(forms) == 2 and hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("failure_mode", ["transport", "server_error", "bad_receipt", "in_progress_receipt", "conflicting_receipt"])
+def test_ambiguous_send_keeps_the_pending_fence(failure_mode):
+    async def check():
+        writes = []
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=row())
+            writes.append(request)
+            if failure_mode == "transport":
+                raise httpx.ReadTimeout("response lost", request=request)
+            if failure_mode == "server_error":
+                return httpx.Response(502, text="upstream unavailable")
+            if failure_mode == "in_progress_receipt":
+                return httpx.Response(409, text="Request is already in progress; do not resend with a new ID")
+            if failure_mode == "conflicting_receipt":
+                return httpx.Response(409, text="request_id was already used with a different payload")
+            return httpx.Response(200, text="invalid receipt")
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        agent = FleetAgent(hq, observe=False)
+        agent.on_connect(client())
+        await agent.load_session("/local/fleet", SID)
+        with pytest.raises(RequestError, match="Delivery is unknown"):
+            await agent.prompt(SID, [s.TextContentBlock(text="task")])
+        with pytest.raises(RequestError, match="still being observed"):
+            await agent.prompt(SID, [s.TextContentBlock(text="task")])
+        assert len(writes) == 1
+        await agent.close_session(SID)
+        await hq.http.aclose()
+    asyncio.run(check())
+
+
+def test_owner_rejected_control_requires_fresh_consent_before_another_post():
+    async def check():
+        writes = []
+        snapshot = row(native_control={"request_id": "permission", "tool_name": "Bash", "input": {}})
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=snapshot)
+            writes.append(json.loads(request.content))
+            return httpx.Response(409, text="refresh the session") if len(writes) == 1 else httpx.Response(200, json={"accepted": True})
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        attached = bridge["Attached"]()
+        await agent.handle_control(SID, snapshot, attached)
+        assert len(writes) == 1 and len(conn.permissions) == 1
+        assert not attached.controls
+        await agent.handle_control(SID, snapshot, attached)
+        assert len(writes) == 2 and len(conn.permissions) == 2
+        assert writes[0]["request_id"] != writes[1]["request_id"]
+        await hq.http.aclose()
+    asyncio.run(check())
+
+
+def test_selected_external_session_control_requires_the_owners_explicit_decision():
+    async def check():
+        offered, decision = asyncio.Event(), asyncio.Event()
+        snapshot = row(native_control={"request_id": "external-permission", "tool_name": "Bash", "input": {"command": "example"}})
+        hq = mock_hq(snapshot, snapshot)
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        async def approve(session_id, tool_call, options, **kwargs):
+            assert session_id == SID and tool_call.tool_call_id == "external-permission"
+            assert [option.kind for option in options] == ["allow_once", "reject_once"]
+            offered.set()
+            await decision.wait()
+            return s.RequestPermissionResponse.model_validate({"outcome": {"outcome": "selected", "optionId": "allow"}})
+        conn.request_permission = approve
+        agent.on_connect(conn)
+        await agent.load_session("/local/fleet", SID)
+        assert agent.sessions[SID].pending is None
+        poll = asyncio.create_task(agent.poll(SID, agent.sessions[SID]))
+        await offered.wait()
+        assert hq.actions == []
+        decision.set()
+        await poll
+        assert hq.actions == [(SID, "respond", {"revision": "r1", "response": {
+            "request_id": "external-permission", "behavior": "allow", "updated_input": {"command": "example"}}})]
+    asyncio.run(check())

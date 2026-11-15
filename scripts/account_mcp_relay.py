@@ -2,6 +2,8 @@
 
 import http.client
 import ssl
+from threading import BoundedSemaphore
+from time import monotonic
 from urllib.parse import urlsplit
 
 PATHS = {"/mcp", "/mcp/", "/.well-known/oauth-protected-resource",
@@ -14,6 +16,8 @@ RESPONSE_HEADERS = {"content-type", "www-authenticate", "mcp-session-id",
                     "access-control-allow-origin", "access-control-allow-methods",
                     "access-control-allow-headers", "access-control-expose-headers", "vary"}
 MAX_BODY = 1024 * 1024
+BODY_TIMEOUT = 10
+MAX_IN_FLIGHT = 32
 
 
 class MCPRelay:
@@ -24,11 +28,22 @@ class MCPRelay:
                 or self.origin.fragment or self.origin.path not in ("", "/")):
             raise ValueError("--mcp-upstream must be a fixed http(s) origin without credentials or a path")
         self.port = self.origin.port
+        self.slots = BoundedSemaphore(MAX_IN_FLIGHT)
 
     def handle(self, handler):
         url = urlsplit(handler.path)
         if url.path not in PATHS:
             return False
+        handler.close_connection = True
+        if not self.slots.acquire(blocking=False):
+            handler.reply(503, {"error": "MCP relay is at capacity"})
+            return True
+        try:
+            return self.forward(handler, url)
+        finally:
+            self.slots.release()
+
+    def forward(self, handler, url):
         if url.scheme or url.netloc or url.query or url.fragment:
             handler.reply(400, {"error": "MCP requests require an exact endpoint path"})
             return True
@@ -49,11 +64,23 @@ class MCPRelay:
         if handler.command == "POST" and not lengths:
             handler.reply(411, {"error": "Content-Length is required"})
             return True
-        handler.connection.settimeout(65)
-        body = handler.rfile.read(length)
-        if len(body) != length:
-            handler.reply(400, {"error": "Incomplete request body"})
+        body = bytearray()
+        deadline = monotonic() + BODY_TIMEOUT
+        try:
+            while len(body) < length:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                handler.connection.settimeout(remaining)
+                chunk = handler.rfile.read1(min(length - len(body), 65536))
+                if not chunk:
+                    handler.reply(400, {"error": "Incomplete request body"})
+                    return True
+                body.extend(chunk)
+        except TimeoutError:
+            handler.reply(408, {"error": "MCP request body deadline exceeded"})
             return True
+        handler.connection.settimeout(65)
         headers = {k: v for k, v in handler.headers.items() if k.lower() in REQUEST_HEADERS}
         headers["Content-Length"] = str(length)
         connection_type = http.client.HTTPSConnection if self.origin.scheme == "https" else http.client.HTTPConnection
@@ -64,7 +91,10 @@ class MCPRelay:
         started = False
         try:
             connection.request(handler.command, url.path, body=body, headers=headers)
+            upstream_socket = connection.sock
             response = connection.getresponse()
+            if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() == "text/event-stream":
+                upstream_socket.settimeout(None)
             handler.send_response(response.status)
             for key, value in response.getheaders():
                 if (key.lower() in RESPONSE_HEADERS

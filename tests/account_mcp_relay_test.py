@@ -1,10 +1,12 @@
 """The public MCP entry uses one existing upstream and preserves authentication and streaming."""
 
 import http.client
+import io
 import json
 import runpy
 import threading
 from contextlib import contextmanager
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 ui = runpy.run_path(str(Path(__file__).parents[1] / "scripts/account_ui.py"), run_name="account_ui")
+relay_globals = ui["MCPRelay"].handle.__globals__
 
 
 @contextmanager
@@ -195,3 +198,79 @@ def test_dropped_action_is_never_retried():
         status, _, body = request(public)
     assert status == 502 and b"Do not retry writes" in body
     assert attempts == ["/mcp"]
+
+
+def test_body_receive_has_a_total_deadline(monkeypatch):
+    elapsed = [0]
+    reads, replies = [], []
+    headers = Message()
+    headers["Content-Length"] = "3"
+
+    def slow_read(_):
+        reads.append(True)
+        elapsed[0] += 6
+        return b"x"
+
+    monkeypatch.setitem(relay_globals, "BODY_TIMEOUT", 10)
+    monkeypatch.setitem(relay_globals, "monotonic", lambda: elapsed[0])
+    handler = SimpleNamespace(path="/mcp", command="POST", headers=headers,
+        connection=SimpleNamespace(settimeout=lambda _: None),
+        rfile=SimpleNamespace(read1=slow_read, read=slow_read),
+        reply=lambda status, _: replies.append(status))
+    assert ui["MCPRelay"]("http://unused.example.com").handle(handler)
+    assert replies == [408]
+    assert len(reads) == 2
+
+
+def test_sse_stream_keeps_waiting_across_idle_gaps(monkeypatch):
+    socket = SimpleNamespace(timeout=65)
+    socket.settimeout = lambda value: setattr(socket, "timeout", value)
+    chunks = iter([b"data: first\n\n", b"data: after-idle\n\n", b""])
+
+    def read_chunk(_):
+        if socket.timeout is not None:
+            raise TimeoutError("simulated idle gap exceeds the socket timeout")
+        return next(chunks)
+
+    response = SimpleNamespace(status=200, getheaders=lambda: [("Content-Type", "text/event-stream")],
+        getheader=lambda name, default=None: "text/event-stream" if name.lower() == "content-type" else default,
+        read1=read_chunk)
+    connection = SimpleNamespace(sock=socket, request=lambda *a, **k: None,
+        getresponse=lambda: response, close=lambda: None)
+    monkeypatch.setattr(http.client, "HTTPConnection", lambda *a, **k: connection)
+    output = io.BytesIO()
+    handler = SimpleNamespace(path="/mcp", command="GET", headers=Message(),
+        connection=SimpleNamespace(settimeout=lambda _: None), rfile=io.BytesIO(), wfile=output,
+        send_response=lambda _: None, send_header=lambda *args: None, end_headers=lambda: None,
+        reply=lambda *args: pytest.fail("The stream must remain open"))
+    assert ui["MCPRelay"]("http://upstream.example.com").handle(handler)
+    assert output.getvalue() == b"data: first\n\ndata: after-idle\n\n"
+
+
+def test_mcp_concurrency_limit_preserves_dashboard_access(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setitem(relay_globals, "MAX_IN_FLIGHT", 1)
+
+    class SSE(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: first\n\n")
+            self.wfile.flush()
+            release.wait(3)
+
+        def log_message(self, *_):
+            pass
+
+    dashboard = SimpleNamespace(state=lambda: {"dashboard": True})
+    with serving(SSE) as origin, serving(ui["handler"](dashboard, ui["MCPRelay"](origin))) as public:
+        connection = http.client.HTTPConnection(public.removeprefix("http://"), timeout=1)
+        try:
+            connection.request("GET", "/mcp")
+            assert connection.getresponse().read(13) == b"data: first\n\n"
+            assert request(public, method="GET")[0] == 503
+            assert json.loads(request(public, "/api/state", "GET")[2]) == {"dashboard": True}
+        finally:
+            release.set()
+            connection.close()

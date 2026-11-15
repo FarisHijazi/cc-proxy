@@ -8,10 +8,14 @@ The deployed adapter remains the OAuth verifier; deployment instructions are in
 README's "Fleet MCP for Claude.ai" section.
 
 Validation on the dev VM: `uv run --no-project --with pytest pytest -q
-tests/account_mcp_relay_test.py tests/account_ui_test.py` passed 65 tests, and Ruff
+tests/account_mcp_relay_test.py tests/account_ui_test.py` passed 68 tests, and Ruff
 passed for the new module/tests. Coverage includes credential/header isolation,
 transport methods, unchanged dashboard routes, bounded requests, live chunked SSE
 forwarding, discovery redirects and no retry after a dropped action response.
+The relay bounds active MCP requests to 32 and body receipt to a total 10 seconds.
+SSE response reads have no idle cutoff; connection/header establishment and
+downstream writes remain bounded. Regression tests cover idle gaps, slow body
+receipt and dashboard access while all MCP slots are occupied.
 
 Deployment on ftower uses the existing `cc-proxy-ui.service` on port 18792 and sole
 MCP adapter on port 8392. Its additional `zz-fleet-mcp.conf` drop-in preserves every

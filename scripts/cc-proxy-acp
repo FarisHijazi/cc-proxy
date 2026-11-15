@@ -4,6 +4,7 @@
 # dependencies = [
 #     "agent-client-protocol==1.0.0",
 #     "httpx==0.28.1",
+#     "httpx2==2.16.0",
 #     "mcp==2.3.0",
 # ]
 # ///
@@ -30,6 +31,17 @@ from mcp.client.streamable_http import streamable_http_client
 
 def failure(message):
     return RequestError(-32000, message)
+
+
+class ActionRejected(RequestError):
+    """The owner confirmed that the action was not delivered."""
+
+    def __init__(self, message):
+        super().__init__(-32000, message)
+
+
+class ControlDeclined(RequestError):
+    """The user left this exact control unanswered."""
 
 
 def available(row):
@@ -106,21 +118,32 @@ class HQ:
         path = f"/api/sessions/{quote(session_id, safe='')}"
         for attempt in range(3):
             request_id = uuid.uuid4().hex
-            row = await self.detail(session_id)
+            try:
+                row = await self.detail(session_id)
+            except (RequestError, httpx.TransportError, ValueError) as exc:
+                raise ActionRejected("Fleet action was not sent because its current state could not be verified.") from exc
             if revision is not None and revision != row["revision"]:
-                raise failure("The request changed. Read the session again before answering.")
+                raise ActionRejected("The request changed. Read the session again before answering.")
             body = {"action": action, "revision": revision or row["revision"],
                     "request_id": request_id, **fields}
             try:
                 response = await self.http.post(f"{path}/action", json=body)
             except httpx.TransportError as exc:
                 raise failure(f"Delivery is unknown; do not resend. request_id={request_id}") from exc
+            if response.status_code == 409 and any(phrase in response.text.lower() for phrase in (
+                    "already in progress", "already used with a different payload")):
+                raise failure(f"Delivery is unknown; conflicting action receipt. Do not resend. request_id={request_id}")
             if (response.status_code == 409 and "refresh" in response.text.lower()
                     and revision is None and attempt < 2):
                 continue
+            if response.status_code in {400, 401, 403, 404, 409, 422}:
+                raise ActionRejected(f"Fleet action rejected (HTTP {response.status_code}); request_id={request_id}")
             if response.status_code >= 400:
-                raise failure(f"Fleet action rejected (HTTP {response.status_code}); request_id={request_id}")
-            return response.json()
+                raise failure(f"Delivery is unknown (HTTP {response.status_code}); do not resend. request_id={request_id}")
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise failure(f"Delivery is unknown; invalid action receipt. Do not resend. request_id={request_id}") from exc
 
 
 @dataclass
@@ -295,7 +318,7 @@ class FleetAgent(Agent):
         response = await self.conn.create_elicitation(message, "form", session_id=session_id,
             requested_schema=s.ElicitationSchema(properties=properties, required=list(properties)))
         if response.action != "accept":
-            raise failure("Question left unanswered; the existing session is still waiting.")
+            raise ControlDeclined(-32000, "Question left unanswered; the existing session is still waiting.")
         return response.content or {}
 
     async def handle_control(self, session_id, row, attached):
@@ -305,6 +328,17 @@ class FleetAgent(Agent):
         key = key or (row["revision"] if menu else None)
         if key is None or key in attached.controls:
             return
+        attached.controls.add(key)
+        try:
+            await self.answer_control(session_id, row, control, menu)
+        except ControlDeclined:
+            return
+        except ActionRejected:
+            attached.controls.discard(key)
+            await self.conn.session_update(session_id, s.SessionUpdateNotice(severity="warning",
+                title="Answer was not delivered", description="Review the current session request and answer it again."))
+
+    async def answer_control(self, session_id, row, control, menu):
         if control:
             if control.get("subtype") == "request_user_dialog":
                 raise failure("This native dialog requires HQ or the original terminal; no permission was granted.")
@@ -334,7 +368,6 @@ class FleetAgent(Agent):
                 response.update(behavior="allow" if allowed else "deny")
                 if allowed:
                     response["updated_input"] = control.get("input", {})
-            attached.controls.add(key)
             await self.hq.action(session_id, "respond", revision=row["revision"], response=response)
         elif menu:
             if menu.get("multi_select") or any(option.get("kind") == "free_text" for option in menu.get("options", [])):
@@ -346,9 +379,7 @@ class FleetAgent(Agent):
                            "enumNames": list(choices.values())}})
             if answer.get("choice") not in choices:
                 raise failure("No valid option selected.")
-            attached.controls.add(key)
             await self.hq.action(session_id, "select", revision=row["revision"], index=int(answer["choice"]))
-        attached.controls.add(key)
 
     async def prompt(self, session_id, prompt, **kwargs):
         attached = self.sessions.get(session_id)
@@ -377,6 +408,10 @@ class FleetAgent(Agent):
             completion = attached.completion
             try:
                 await self.hq.action(session_id, "send", text=text)
+            except ActionRejected:
+                attached.pending = None
+                completion.cancel()
+                raise
             except BaseException:
                 completion.cancel()
                 raise
