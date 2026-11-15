@@ -165,7 +165,7 @@ this command in place of `cc-proxy --serve`.
 
 `scripts/cc-proxy-acp` connects T3 Code's existing **Local ACP command** provider to
 the fleet. It lists the sessions already running on every configured HQ node,
-replays the conversation text HQ holds, and sends new prompts to the same process.
+offers the conversation text HQ holds, and sends new prompts to the same process.
 Disconnecting the adapter detaches its observer and leaves the original process running.
 No additional server or per-node deployment is needed.
 
@@ -190,10 +190,10 @@ provenance paths are kept separate instead of guessing that they are identical.
 
 The selected worker keeps its real workdir, account and tools on its own node.
 T3's local project file browser and git controls still belong to the selected T3
-project; they do not browse or modify that remote workdir. Conversation updates
-come from the selected session's existing HQ history, including new messages while
-the worker is active. Unidentified token previews are not persisted as separate
-messages. Large or older history remains bounded by the existing HQ reader.
+project; they do not browse or modify that remote workdir. The bridge supplies
+updates from the selected session's existing HQ history. Unidentified token
+previews are excluded; large or older history remains bounded by the existing HQ
+reader. Display and persistence depend on the T3 client's ACP support.
 
 Discovery uses the compact, authenticated MCP list. History and actions use only
 the configured private HQ origin. An existing HQ token is sent when configured;
@@ -206,14 +206,18 @@ and questions retain their original request IDs and revisions. Supported termina
 choices use a question form; complex terminal menus and computer-use dialogs must
 be answered in HQ or the original terminal. Stale answers are rejected. A lost
 action response reports uncertain delivery and is never retried automatically.
-T3's explicit Stop targets the attached session; disconnecting does not stop it.
+During a T3-initiated turn, explicit Stop targets the attached session;
+disconnecting does not stop it.
 
-This requires ACP v2 plus T3 support for activating imported sessions, persisting
-external history updates, and interrupting an attached worker. The installed local
-T3 build is `0.1.8-ccfleet.20261115.1`; upstream 0.1.8 lists/imports sessions but
-does not provide this complete attachment behavior. Preserve or rebase the local
-patch before replacing that build. Deployment details and the patch commit are in
+This uses official T3 Code 0.1.8, with no T3 patch to maintain. Its native import
+selects the existing session; the first T3 prompt activates it. Prior history and
+updates from work started outside T3 are not displayed or persisted by that
+client, and Stop requires a T3 turn. Use Claude.ai's fleet MCP or the existing HQ
+view for those operations. Deployment details are in
 `docs/devlog/claude_20261115-t3-fleet-acp.md`.
+Newer official builds containing the [upstream native-history import fix](https://github.com/pingdotgg/t3code/pull/22155)
+can address initial history without a fork; that change does not cover output
+produced outside a T3 turn. The deployed stable version is unchanged.
 See T3's [local command and native session guide](https://github.com/pingdotgg/t3code/blob/v0.1.8/docs/user/providers-acp.md).
 
 ### Fleet MCP for Claude.ai

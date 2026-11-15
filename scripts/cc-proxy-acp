@@ -22,9 +22,8 @@ from urllib.parse import quote
 
 import httpx
 import httpx2
-from acp import RequestError
-from acp.experimental.v2 import Agent, run_agent
-from acp.experimental.v2 import schema as s
+from acp import Agent, RequestError, run_agent
+from acp import schema as s
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -128,22 +127,21 @@ class HQ:
 class Attached:
     seen: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
-    message_metadata: dict = field(default_factory=dict)
     observer: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending: str | None = None
-    prompt_id: str | None = None
-    client_message_id: str | None = None
+    completion: asyncio.Future | None = None
+    own_user_key: str | None = None
     prompt_started: float = 0
     echoed: bool = False
     answered: bool = False
     settled: int = 0
-    state: str | None = None
     cancelled: bool = False
+    cancel_attempted: bool = False
     controls: set = field(default_factory=set)
 
 
-CONFIG_OPTIONS = [{"configId": "model", "name": "Model", "category": "model", "type": "select",
+CONFIG_OPTIONS = [{"id": "model", "name": "Model", "category": "model", "type": "select",
                    "currentValue": "attached", "options": [{"value": "attached", "name": "Existing session"}]}]
 
 
@@ -160,12 +158,12 @@ class FleetAgent(Agent):
     def on_connect(self, conn):
         self.conn = conn
 
-    async def initialize(self, protocol_version, info=None, capabilities=None, **kwargs):
-        self.client_capabilities = capabilities or s.ClientCapabilities()
-        return s.InitializeResponse(protocol_version=2,
-            info=s.Implementation(name="cc-proxy-fleet", title="CC fleet", version="0.1.0"),
-            capabilities=s.AgentCapabilities(session=s.SessionCapabilities()), auth_methods=[],
-            field_meta={"t3.codes/externalSession": True})
+    async def initialize(self, protocol_version, client_info=None, client_capabilities=None, **kwargs):
+        self.client_capabilities = client_capabilities or s.ClientCapabilities()
+        return s.InitializeResponse(protocol_version=1,
+            agent_info=s.Implementation(name="cc-proxy-fleet", title="CC fleet", version="0.2.0"),
+            agent_capabilities=s.AgentCapabilities.model_validate({"loadSession": True,
+                "sessionCapabilities": {"list": {}, "resume": {}, "close": {}}}), auth_methods=[])
 
     async def new_session(self, cwd, **kwargs):
         # T3 probes providers with session/new; this is an unbound ACP handle, never an agent launch.
@@ -195,21 +193,27 @@ class FleetAgent(Agent):
         fresh = []
         rows = identify_messages(messages(row), attached.history)
         attached.history = rows
-        for message in rows:
+        own_index = next((i for i, m in enumerate(rows) if m["key"] == attached.own_user_key), None)
+        for index, message in enumerate(rows):
             key = message["key"]
             if attached.pending and not attached.echoed and message["role"] == "user" and attached.pending in message["text"] and key not in attached.seen:
                 attached.echoed = True
-                if attached.client_message_id:
-                    attached.message_metadata[key] = {"t3.codes/messageId": attached.client_message_id}
-            if attached.seen.get(key) == message["text"]:
+                attached.own_user_key = key
+                own_index = index
+            previous = attached.seen.get(key, "")
+            if previous == message["text"]:
                 continue
+            if not message["text"].startswith(previous):
+                raise failure("A remote message changed its existing text. Reload the session history to read the correction.")
             attached.seen[key] = message["text"]
             fresh.append(message)
-            if message["role"] == "assistant" and attached.echoed:
+            if message["role"] == "assistant" and own_index is not None and index > own_index:
                 attached.answered = True
-            cls = s.UserMessageUpdate if message["role"] == "user" else s.AgentMessageUpdate
-            await self.conn.session_update(session_id, cls(content=[s.TextContentBlock(text=message["text"])],
-                                                           message_id=key, field_meta=attached.message_metadata.get(key)))
+            if key == attached.own_user_key:
+                continue
+            cls = s.UserMessageChunk if message["role"] == "user" else s.AgentMessageChunk
+            await self.conn.session_update(session_id, cls(content=s.TextContentBlock(text=message["text"][len(previous):]),
+                                                           message_id=key))
         return fresh
 
     async def resume_session(self, cwd, session_id, **kwargs):
@@ -220,6 +224,10 @@ class FleetAgent(Agent):
         if self.observe:
             attached.observer = asyncio.create_task(self.watch(session_id, attached))
         return s.ResumeSessionResponse(config_options=CONFIG_OPTIONS)
+
+    async def load_session(self, cwd, session_id, **kwargs):
+        await self.resume_session(cwd, session_id, **kwargs)
+        return s.LoadSessionResponse(config_options=CONFIG_OPTIONS)
 
     async def set_config_option(self, config_id, session_id, value, **kwargs):
         if config_id != "model" or value != "attached":
@@ -234,52 +242,51 @@ class FleetAgent(Agent):
                 await attached.observer
             except asyncio.CancelledError:
                 pass
+        if attached and attached.completion and not attached.completion.done():
+            attached.completion.cancel()
         return s.CloseSessionResponse()
 
-    async def state(self, session_id, attached, state, stop_reason="end_turn"):
-        if state == attached.state:
-            return
-        attached.state = state
-        update = (s.RunningSessionStateUpdate() if state == "running" else
-                  s.RequiresActionSessionStateUpdate() if state == "requires_action" else
-                  s.IdleSessionStateUpdate(stop_reason=stop_reason))
-        await self.conn.session_update(session_id, update)
+    def finish(self, attached, stop_reason):
+        attached.pending = None
+        if attached.completion is not None and not attached.completion.done():
+            attached.completion.set_result(s.PromptResponse(stop_reason=stop_reason))
 
     async def poll(self, session_id, attached):
         async with attached.lock:
             row = await self.hq.detail(session_id)
             await self.emit_messages(session_id, row, attached)
-            pending_control = bool(row.get("native_control") or row.get("menu"))
-            busy = (row.get("activity") or row.get("status")) in {"working", "running", "thinking", "busy", "starting"}
-            if pending_control:
-                await self.state(session_id, attached, "requires_action")
-                await self.handle_control(session_id, row, attached)
-                return
-            if attached.pending:
-                attached.settled = attached.settled + 1 if attached.answered and not busy else 0
-                if attached.settled >= 2 or (attached.cancelled and not busy):
-                    attached.pending = None
-                elif time.monotonic() - attached.prompt_started > self.turn_timeout:
-                    attached.pending = None
-                    await self.conn.session_update(session_id, s.SessionNotice(severity="error",
-                        title="Observation timed out", description="The existing session continues. Read it before sending again."))
-                    await self.state(session_id, attached, "idle", "refusal")
-                    return
-            await self.state(session_id, attached, "running" if busy or attached.pending else "idle",
-                             "cancelled" if attached.cancelled else "end_turn")
+            idle = (row.get("activity") or row.get("status")) == "idle"
+            control = bool(row.get("native_control") or row.get("menu"))
+            if attached.pending and not control:
+                attached.settled = attached.settled + 1 if attached.answered and idle else 0
+                if attached.cancelled and idle:
+                    self.finish(attached, "cancelled")
+                elif attached.settled >= 2:
+                    self.finish(attached, "end_turn")
+        if control:
+            await self.handle_control(session_id, row, attached)
+
+    def observation_failed(self, attached):
+        if attached.completion is not None and not attached.completion.done():
+            attached.completion.set_exception(failure(
+                "Session observation failed. The existing session continues; read it before sending again."))
 
     async def watch(self, session_id, attached):
         reported = False
-        while self.sessions.get(session_id) is attached:
-            await self.sleep(self.poll_interval if not reported else 5)
-            try:
-                await self.poll(session_id, attached)
-                reported = False
-            except (RequestError, httpx.TransportError):
-                if not reported:
-                    await self.conn.session_update(session_id, s.SessionNotice(severity="error",
-                        title="Session needs attention", description="Open HQ or the original terminal. No action was retried or permission granted."))
-                reported = True
+        try:
+            while self.sessions.get(session_id) is attached:
+                await self.sleep(self.poll_interval if not reported else 5)
+                try:
+                    await self.poll(session_id, attached)
+                    reported = False
+                except (RequestError, httpx.TransportError, ValueError):
+                    self.observation_failed(attached)
+                    if not reported:
+                        await self.conn.session_update(session_id, s.SessionUpdateNotice(severity="error",
+                            title="Session needs attention", description="Open HQ or the original terminal. No action was retried or permission granted."))
+                    reported = True
+        finally:
+            self.observation_failed(attached)
 
     async def form(self, session_id, message, properties):
         elicitation = self.client_capabilities.elicitation
@@ -319,11 +326,10 @@ class FleetAgent(Agent):
             else:
                 call = s.ToolCallUpdate(tool_call_id=control["request_id"], title=control.get("tool_name", "Permission"),
                                        kind="other", status="pending", raw_input=control.get("input", {}))
-                await self.conn.session_update(session_id, s.SessionToolCallUpdate.model_validate(call.model_dump()))
-                permission = await self.conn.request_permission(session_id, control.get("tool_name", "Permission"),
+                await self.conn.session_update(session_id, s.ToolCallProgress.model_validate(call.model_dump()))
+                permission = await self.conn.request_permission(session_id, call,
                     [s.PermissionOption(option_id="allow", name="Allow once", kind="allow_once"),
-                     s.PermissionOption(option_id="deny", name="Deny", kind="reject_once")],
-                    subject=s.ToolCallPermissionSubjectVariant(tool_call=call))
+                     s.PermissionOption(option_id="deny", name="Deny", kind="reject_once")])
                 allowed = permission.outcome.outcome == "selected" and permission.outcome.option_id == "allow"
                 response.update(behavior="allow" if allowed else "deny")
                 if allowed:
@@ -362,23 +368,36 @@ class FleetAgent(Agent):
             await self.emit_messages(session_id, row, attached)
             if row.get("native_control") or row.get("menu"):
                 raise failure("The existing session has an unanswered request. Answer it before sending another prompt.")
-            await self.hq.action(session_id, "send", text=text)
-            attached.pending, attached.prompt_id = text, uuid.uuid4().hex
-            client_id = kwargs.get("t3.codes/messageId")
-            attached.client_message_id = client_id if isinstance(client_id, str) and 0 < len(client_id) <= 256 else None
-            attached.echoed = attached.answered = attached.cancelled = False
+            attached.pending = text
+            attached.completion = asyncio.get_running_loop().create_future()
+            attached.own_user_key = None
+            attached.echoed = attached.answered = attached.cancelled = attached.cancel_attempted = False
             attached.settled = 0
             attached.prompt_started = time.monotonic()
-            await self.state(session_id, attached, "running")
-            return s.PromptResponse(message_id=attached.prompt_id)
+            completion = attached.completion
+            try:
+                await self.hq.action(session_id, "send", text=text)
+            except BaseException:
+                completion.cancel()
+                raise
+        try:
+            return await asyncio.wait_for(asyncio.shield(completion), timeout=self.turn_timeout)
+        except TimeoutError as exc:
+            completion.cancel()
+            raise failure("Observation timed out. The existing session continues; read it before sending again.") from exc
 
-    async def cancel_session(self, session_id, **kwargs):
+    async def cancel(self, session_id, **kwargs):
         attached = self.sessions.get(session_id)
-        if attached is not None:
+        if attached is None or attached.cancel_attempted:
+            return
+        async with attached.lock:
+            if attached.cancel_attempted:
+                return
+            attached.cancel_attempted = True
             try:
                 await self.hq.action(session_id, "interrupt")
             except (RequestError, httpx.TransportError):
-                await self.conn.session_update(session_id, s.SessionNotice(severity="error",
+                await self.conn.session_update(session_id, s.SessionUpdateNotice(severity="error",
                     title="Stop was not confirmed", description="Check HQ or the original terminal before trying again. No action was retried."))
                 return
             attached.cancelled = True
