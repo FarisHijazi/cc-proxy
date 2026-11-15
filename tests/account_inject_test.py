@@ -780,3 +780,46 @@ def test_claude_code_renews_the_live_login_without_the_proxy_env(monkeypatch):
     assert argv[:2] == ["claude", "-p"]
     assert not module.PROXY_ENV & set(kw["env"]), "Claude Code must reach Anthropic directly"
     assert kw["check"] and kw["timeout"]
+
+
+def test_a_hanging_login_fetch_never_stalls_the_event_loop(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slow(slot):
+        release.wait(10)
+        return "late", time.time() * 1000 + 3_600_000
+
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(module, "slot_token", slow)
+    monkeypatch.setattr(module, "FETCH_WAIT_S", 0.2)
+    with pytest.raises(ValueError, match="still being fetched"):
+        inject.token("personal")
+    started = time.monotonic()
+    for _ in range(20):
+        with pytest.raises(ValueError, match="still being fetched"):
+            inject.token("personal")
+    assert time.monotonic() - started < 0.1, "only the request that starts a fetch waits for it"
+    release.set()
+    inject.fetching["personal"].result(timeout=5)
+    assert inject.token("personal") == "late", "the background fetch fills the cache"
+
+
+def test_a_failed_login_fetch_fails_fast_until_the_retry_window(monkeypatch):
+    calls = []
+
+    def broken(slot):
+        calls.append(slot)
+        raise ValueError("refresh grant gone")
+
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(module, "slot_token", broken)
+    for _ in range(5):
+        with pytest.raises(ValueError):
+            inject.token("personal")
+    assert calls == ["1"], "a dead login is fetched once, not on every request"
+    inject.fetching["personal"].failed_at -= module.FETCH_RETRY_S
+    with pytest.raises(ValueError):
+        inject.token("personal")
+    assert calls == ["1", "1"], "and retried after the window"

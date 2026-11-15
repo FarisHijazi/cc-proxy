@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import ssl
+import time
 from dataclasses import dataclass, field
 from uuid import NAMESPACE_URL, uuid5
 
@@ -13,6 +14,9 @@ from tornado.websocket import websocket_connect
 HOST = "bridge.claudeusercontent.com"
 DEVICE = re.compile(r"[A-Za-z0-9-]{1,64}\Z")
 DISCOVERY_TIMEOUT = 2.5
+# An account whose bridge refused to connect (dead login) is skipped this long, so it costs
+# discovery nothing instead of a fresh connect attempt every time.
+CONNECT_RETRY_S = 60
 
 
 def public_id(alias, device):
@@ -35,6 +39,7 @@ class AccountChannel:
     rows: dict = field(default_factory=dict)
     available: bool = False
     error: bool = False
+    refused_at: float = float("-inf")
 
 
 class BridgeSession:
@@ -157,6 +162,8 @@ class BridgeSession:
             raise
         except Exception:  # noqa: BLE001 - native payloads and credentials must not reach logs
             channel.error = True
+            if not channel.available:
+                channel.refused_at = time.monotonic()
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -218,15 +225,20 @@ class BridgeSession:
         self.status()
 
     def unavailable(self, alias):
+        # The main account rides the client's own socket, which upstream pairs only once: marking
+        # it unavailable would hide its browsers for the rest of the session. Drop its roster only.
         channel = self.channels[alias]
-        channel.available = False
-        if alias != self.main and channel.socket is not None:
-            channel.socket.close()
+        if alias != self.main:
+            channel.available = False
+            if channel.socket is not None:
+                channel.socket.close()
         self.discard_roster(alias)
 
     async def discover(self):
         async def query(channel):
             if channel.alias != self.main:
+                if time.monotonic() - channel.refused_at < CONNECT_RETRY_S:
+                    return
                 if channel.error and not channel.available and channel.task is not None:
                     await channel.task
                 self.ensure_channel(channel.alias)
@@ -261,8 +273,6 @@ class BridgeSession:
                     # Discovery has no request ID. Close a timed-out channel so a
                     # late old roster cannot settle the next discovery request.
                     self.unavailable(alias)
-                    if alias == self.main and self.flow.killable:
-                        self.flow.kill()
                     failures.append(alias)
                 else:
                     rows.extend(channel.rows.values())
