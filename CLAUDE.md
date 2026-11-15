@@ -228,6 +228,11 @@ A client's `"pin_main": true` adds `+pin`, so its sessions start on their own al
 `"traffic_db"` in the `--serve` accounts file turns on `scripts/account_traffic.py` (every flow, sender
 metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` prunes). See
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
+⚠️ **Nothing in a mitmproxy hook may touch the disk, a subprocess or the network**: every hook of every addon
+runs on ONE event loop shared by every connection of every account. `account_traffic.py` hooks only copy
+plain data into a bounded queue; its writer thread owns SQLite and drops rows when behind. Writing inline
+stalled Remote Control for every machine once the DB reached 18 GB
+(`docs/devlog/claude_20261112-traffic-writer-off-event-loop.md`, plain path).
 Each model-call row also stores `input_tokens`/`cache_read_tokens`/`output_tokens` from the reply (parser:
 `account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
 fills older rows. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's

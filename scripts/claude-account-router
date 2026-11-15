@@ -589,14 +589,31 @@ def client_environment(state, port, secure_storage, proxy_url=None, extra=None, 
 
 
 def certificate_bundle(ca):
-    """Retain public/custom trust when Python tools inherit our HTTPS proxy."""
-    context = ssl.create_default_context()
-    for name in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"):
+    """Retain public/custom trust when Python tools inherit our HTTPS proxy.
+
+    A router launched from a routed session inherits SSL_CERT_FILE pointing at an earlier
+    bundle, so the default context would hold only the proxy CA. Read the system roots by
+    path instead, and skip any inherited bundle that is one of ours.
+    """
+    own = ca.read_bytes().strip()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    system = (
+        ssl.get_default_verify_paths().openssl_cafile,
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    )
+    for path in system:
+        if path and Path(path).is_file():
+            context.load_verify_locations(cafile=path)
+    for name in ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"):
         source = os.environ.get(name)
-        if source:
-            context.load_verify_locations(
-                **{"capath" if Path(source).is_dir() else "cafile": source}
-            )
+        if not source or not Path(source).exists():
+            continue
+        if Path(source).is_dir():
+            context.load_verify_locations(capath=source)
+        elif own not in Path(source).read_bytes():
+            context.load_verify_locations(cafile=source)
     public_roots = b"".join(
         ssl.DER_cert_to_PEM_cert(cert).encode()
         for cert in context.get_ca_certs(binary_form=True)
@@ -882,7 +899,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     alias, found[alias], config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
-                    chrome=getattr(args, "chrome_account", None) or main_account if main else None,
+                    chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
                     pin=main and getattr(args, "pin_main", False),
                 )
             except (OSError, ValueError, KeyError) as error:
