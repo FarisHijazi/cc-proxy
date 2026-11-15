@@ -2,8 +2,9 @@
 
 The existing T3 0.1.8 local ACP provider already lists and imports native sessions.
 Its `ws.acpRegistry.importSession` maps the native ID deterministically, binds the
-selected T3 project's root, and starts in `approval-required` mode. Reusing it avoids
-a T3 fork or a second session manager. Upstream transcript import for Claude itself
+selected T3 project's root, and starts in `approval-required` mode. The installed
+local patch extends those existing owners to activate the imported session and
+persist external output without sending a prompt. Upstream transcript import for Claude itself
 would start another provider process and cannot attach the live fleet worker.
 
 `scripts/cc-proxy-acp` uses the official Python ACP v2 SDK. The v2 full-message and
@@ -49,8 +50,9 @@ uvx ruff check scripts/cc-proxy-acp tests/account_acp_test.py
 Live read checks returned 26 fleet rows and the selected toy's native history.
 T3's native getConfig RPC reported the provider ready and native session list,
 load and resume enabled, with delete disabled. The UI listed all 26 rows and
-imported the existing toy tmux route without sending a prompt. The original T3
-service PID did not change.
+imported the existing toy tmux route without sending a prompt. Registering the ACP
+provider did not restart T3; the later local server upgrade used its supported
+update command.
 
 T3 must treat this provider as an attachment to external work: initialize metadata
 `t3.codes/externalSession` selects cancel-and-observe behavior for Stop. Closing
@@ -63,3 +65,30 @@ The T3 adapter and ingestor use existing persisted native item references to kee
 the app-owned user prompt and active replies aligned with replayed history.
 The focused bridge suite passes 19 tests, including reconnect binding and
 uncertain cancellation; Ruff passes.
+
+The local T3 patch is commit `c5e99725` in
+`/home/service/Projects/t3code/worktrees/acp-import-history`, branch
+`fix/acp-import-history`; it has not been submitted upstream. It extends native
+import/selection activation, the existing provider event ingestor, stable native
+message references, and Stop's existing outbox. Passive updates create no fake
+turns; ambiguous cancellation is terminal and does not fabricate idle state.
+The changed-file checks passed 436 tests, typechecks for 37 affected packages,
+format, both Knip checks and GraphQL. Two predicate-hoisting lint findings were
+corrected and the affected-file lint passed.
+
+The official Node SEA build produced `0.1.8-ccfleet.20261115.1`; original client and
+native assets came from the installed 0.1.8 runtime. Package and lock files were
+restored byte-for-byte after building. The official checksum installer and update
+command were exercised in an isolated home before updating the existing
+`t3code.service`. Its cgroup contained only its launcher, server and resource
+monitor, with no agent workers. The original 0.1.8 directory remains available;
+service/launcher/state/settings backups are under
+`/home/service/.local/state/cc-proxy/t3-upgrade-20261115`. To revert, the supported
+command is `t3 update 0.1.8 --allow-downgrade --yes`; it removes the attachment fixes.
+T3's update mode installs only on an explicit user request, so preferences were
+preserved. Future upgrades must retain or rebase this patch until upstream covers
+these behaviors.
+
+The existing SSH `dev` host now persists its loopback 3773 forward alongside the
+previous forwards. The UI remains private at `http://127.0.0.1:3773` while that
+existing connection is active; no public T3 listener or extra daemon was added.

@@ -208,7 +208,12 @@ be answered in HQ or the original terminal. Stale answers are rejected. A lost
 action response reports uncertain delivery and is never retried automatically.
 T3's explicit Stop targets the attached session; disconnecting does not stop it.
 
-This requires an ACP v2 capable T3 build; it is verified against T3 Code 0.1.8.
+This requires ACP v2 plus T3 support for activating imported sessions, persisting
+external history updates, and interrupting an attached worker. The installed local
+T3 build is `0.1.8-ccfleet.20261115.1`; upstream 0.1.8 lists/imports sessions but
+does not provide this complete attachment behavior. Preserve or rebase the local
+patch before replacing that build. Deployment details and the patch commit are in
+`docs/devlog/claude_20261115-t3-fleet-acp.md`.
 See T3's [local command and native session guide](https://github.com/pingdotgg/t3code/blob/v0.1.8/docs/user/providers-acp.md).
 
 ### Fleet MCP for Claude.ai

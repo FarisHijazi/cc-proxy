@@ -4,7 +4,8 @@
 provider. HQ remains the only session/action owner; MCP supplies compact discovery,
 and selected-session detail/actions use the private HQ origin. Never spawn/resume a
 replacement Claude process, map remote workdirs onto the local T3 workspace, retry
-an uncertain write, or guess native/tmux equivalence. Read README "Existing fleet
+an uncertain write, or guess native/tmux equivalence. The deployed T3 build carries
+the local imported-session/history/control patch; preserve it across T3 upgrades. Read README "Existing fleet
 sessions in T3 Code" and `docs/devlog/claude_20261115-t3-fleet-acp.md` on demand.
 
 `cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
