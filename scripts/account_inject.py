@@ -6,6 +6,7 @@ cswap owns every grant: the live default login is renewed by running Claude Code
 itself (`renew_live_login`), any other slot through cswap's `consume_backup_grant`.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -16,6 +17,8 @@ import runpy
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FetchTimeout
 from pathlib import Path
 from uuid import UUID
 
@@ -37,6 +40,12 @@ PROXY_ENV = {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROX
 SETUP_TOKEN_REREAD_MS = 60 * 1000
 # A rejected login is renewed at most this often, however many requests it fails.
 RENEW_EVERY_S = 60
+# mitmproxy serves every connection from one event loop, and reading an expired slot runs a
+# network refresh. Only the request that starts a fetch waits, this long; the fetch finishes in
+# the background, and a failed one is not retried for FETCH_RETRY_S.
+FETCH_WAIT_S = 0.25
+FETCH_RETRY_S = 60
+FETCHER = ThreadPoolExecutor(max_workers=4, thread_name_prefix="slot-token")
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
@@ -59,6 +68,7 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # Prompt caches last at most an hour, so an idle session may be reassigned.
 STICKY_IDLE_S = 3600
+AFFINITY_MAX_PENDING = 16
 
 
 def slot_token(slot):
@@ -151,6 +161,45 @@ def parse(placeholder):
     return alias, (owners or [None])[0], "private" in suffixes
 
 
+class AffinityUnavailable(Exception):
+    """Shared selection failed; never fall back to process-local assignment."""
+
+
+class PostgresAffinity:
+    def __init__(self, dsn, namespace):
+        self.dsn, self.namespace = dsn, namespace
+
+    def choose(self, inject, alias, session, pinned):
+        try:
+            import psycopg
+            from psycopg.types.json import Jsonb
+
+            with psycopg.connect(
+                self.dsn, connect_timeout=3,
+                options="-c statement_timeout=3000 -c lock_timeout=3000",
+            ) as conn:
+                conn.execute("SET LOCAL synchronous_commit = on")
+                conn.execute(
+                    "INSERT INTO ccp_affinity (namespace) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (self.namespace,),
+                )
+                state, = conn.execute(
+                    "SELECT state FROM ccp_affinity WHERE namespace = %s FOR UPDATE",
+                    (self.namespace,),
+                ).fetchone()
+                now, = conn.execute("SELECT extract(epoch FROM clock_timestamp())::float8").fetchone()
+                inject.sticky = {s: e for s, e in state["sessions"].items() if e[1] > now - STICKY_IDLE_S}
+                inject.turn = state["turn"]
+                chosen = inject._start(alias, session, pinned, now)
+                conn.execute(
+                    "UPDATE ccp_affinity SET state = %s WHERE namespace = %s",
+                    (Jsonb({"sessions": inject.sticky, "turn": inject.turn}), self.namespace),
+                )
+            return chosen
+        except Exception:  # noqa: BLE001 - fail closed, including malformed shared state; never expose a DSN
+            raise AffinityUnavailable("shared account affinity unavailable") from None
+
+
 class AccountInject:
     def __init__(self):
         self.accounts = {}
@@ -158,6 +207,7 @@ class AccountInject:
         self.cache = {}
         self.renewed = {}
         self.unusable = {}
+        self.fetching = {}
         self.strategy, self.prefer = "session", None
         self.sticky, self.turn = {}, -1
         self.chrome = None
@@ -171,6 +221,17 @@ class AccountInject:
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
+        dsn = os.environ.get("CCP_AFFINITY_DSN")
+        namespace = os.environ.get("CCP_AFFINITY_NAMESPACE")
+        self.affinity = None
+        self.affinity_worker = None
+        if dsn is not None or namespace is not None:
+            if not dsn or not namespace or not SESSION_ID.fullmatch(namespace):
+                raise exceptions.OptionsError("Shared affinity requires a DSN and valid namespace")
+            self.affinity = PostgresAffinity(dsn, namespace)
+            self.affinity_slots = threading.BoundedSemaphore(AFFINITY_MAX_PENDING)
+            self.affinity_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account-affinity")
+            self.requestheaders = self.shared_requestheaders
 
     def load(self, loader):
         loader.add_option(
@@ -239,23 +300,51 @@ class AccountInject:
         if cached and cached[1] - MARGIN_MS > time.time() * 1000:
             return cached[0]
         try:
-            self.cache[alias] = slot_token(self.accounts[alias])
+            self.cache[alias] = self.fetch(alias)
         finally:
             if self.cache.get(alias, (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
                 self.renew(alias, None)  # nothing on this host renews the live login before it dies
         return self.cache[alias][0]
 
+    def fetch(self, alias):
+        future = self.fetching.get(alias)
+        if future is not None and not future.done():
+            raise ValueError(f"login for {alias} is still being fetched")
+        if future is not None and future.exception() is not None and time.time() < future.failed_at + FETCH_RETRY_S:
+            raise ValueError(f"login for {alias} is unavailable")
+        future = self.fetching[alias] = FETCHER.submit(slot_token, self.accounts[alias])
+        future.failed_at = float("inf")
+
+        def settle(done):
+            if done.exception() is None:
+                self.cache[alias] = done.result()
+            else:
+                done.failed_at = time.time()
+
+        future.add_done_callback(settle)
+        try:
+            return future.result(timeout=FETCH_WAIT_S)
+        except FetchTimeout:
+            raise ValueError(f"login for {alias} is still being fetched") from None
+
     def name(self, alias):
         return self.renamed.get(alias, alias)
 
-    def start(self, alias, session):
-        """The account a session tries first. Sessions never round-robin per request:
-        a session keeps its account, because prompt caches are per account."""
+    def start(self, alias, session, pinned=False):
+        """The ONLY first-account selector, optionally serialized across proxy workers."""
+        if self.affinity is not None:
+            return self.affinity.choose(self, alias, session, pinned)
+        return self._start(alias, session, pinned)
+
+    def _start(self, alias, session, pinned=False, now=None):
+        """Sessions keep their account because prompt caches are per account."""
+        if pinned:
+            return alias
         if self.strategy == "prefer":
             return alias if self.prefer in self.disabled else self.prefer
         if self.strategy == "session" or not session:
             return alias
-        now = time.time()
+        now = time.time() if now is None else now
         self.sticky = {s: e for s, e in self.sticky.items() if e[1] > now - STICKY_IDLE_S}
         entry = self.sticky.get(session)
         if entry is None or entry[0] not in self.accounts:
@@ -275,7 +364,7 @@ class AccountInject:
     def pool(self, alias, session=None, pinned=False):
         """Every usable login, the session's starting account first, then file order.
         A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
-        alias = alias if pinned else self.start(alias, session)
+        alias = self.start(alias, session, pinned)
         names = [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]
         # Accounts at the usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
@@ -443,6 +532,8 @@ class AccountInject:
             self.chrome.end(flow)
 
     def done(self):
+        if self.affinity_worker is not None:
+            self.affinity_worker.shutdown(wait=False, cancel_futures=True)
         if self.chrome is not None:
             self.chrome.close()
 
@@ -468,7 +559,45 @@ class AccountInject:
         flow.metadata["api_key"] = name
         return True
 
+    @staticmethod
+    def affinity_failure(flow):
+        for name in ("authorization", "x-api-key", POOL_HEADER, POLICY_HEADER, SESSION_MODEL_HEADER):
+            flow.request.headers.pop(name, None)
+        flow.response = http.Response.make(
+            503,
+            json.dumps({"type": "error", "error": {
+                "type": "api_error", "message": "shared account affinity unavailable",
+            }}),
+            {"content-type": "application/json"},
+        )
+
+    async def shared_requestheaders(self, flow):
+        headers = flow.request.headers
+        supplied = headers.get("authorization", "")
+        key = headers.get("x-api-key", "") or supplied.removeprefix("Bearer ")
+        if not (
+            flow.request.method == "POST" and flow.request.path.split("?")[0] in MODEL_PATHS
+            and (supplied.startswith(PREFIX) or key.startswith(API_KEY_PREFIX))
+        ):
+            self.requestheaders_local(flow)
+            return
+        if not self.affinity_slots.acquire(blocking=False):
+            self.affinity_failure(flow)
+            return
+        try:
+            future = self.affinity_worker.submit(self.requestheaders_local, flow)
+        except RuntimeError:  # shutdown; no local selection after the worker is gone
+            self.affinity_slots.release()
+            self.affinity_failure(flow)
+            return
+        # Release only when the worker finishes, even if the waiting client disconnects.
+        future.add_done_callback(lambda _: self.affinity_slots.release())
+        await asyncio.wrap_future(future)
+
     def requestheaders(self, flow):
+        self.requestheaders_local(flow)
+
+    def requestheaders_local(self, flow):
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
         flow.request.headers.pop(POLICY_HEADER, None)
@@ -531,6 +660,8 @@ class AccountInject:
                 del flow.request.headers["authorization"]
                 return
             flow.request.headers["authorization"] = "Bearer " + token
+        except AffinityUnavailable:
+            self.affinity_failure(flow)
         except Exception as error:
             # Never forward a placeholder upstream.
             flow.response = http.Response.make(
