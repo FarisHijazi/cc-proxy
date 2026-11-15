@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Move one cswap slot's Claude login into the shared grants table (docs/postgres-grants.md).
+"""Move one login into the shared grants table (docs/postgres-grants.md).
 
-Reads CCP_GRANTS_DSN, CCP_GRANTS_NAMESPACE and CCP_GRANTS_KEY_FILE like the proxy. It never
-deletes the cswap copy: it prints the command that does, which must run before any proxy
-serves the account from PostgreSQL, or two holders spend the same refresh grant.
+A Claude login comes from a cswap slot; with --codex, a Codex CLI auth.json becomes the row
+`codex:<name>`. Reads CCP_GRANTS_DSN, CCP_GRANTS_NAMESPACE and CCP_GRANTS_KEY_FILE like the proxy.
+It never deletes the source: it prints what does, which must happen before any proxy serves the
+account from PostgreSQL, or two holders spend the same refresh grant.
 """
 
 import argparse
@@ -15,33 +16,48 @@ from pathlib import Path
 grants = runpy.run_path(str(Path(__file__).with_name("account_grants.py")))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("slot", help="cswap slot number")
-    parser.add_argument("alias", help="the proxy accounts file alias (an email)")
-    parser.add_argument("--replace", action="store_true", help="overwrite an existing shared login")
-    args = parser.parse_args()
+def claude_login(slot):
     from claude_swap.switcher import ClaudeAccountSwitcher
 
+    switcher = ClaudeAccountSwitcher()
+    if switcher.current_account_number() == slot:
+        raise grants["GrantsUnavailable"]("that slot is this host's live Claude login; Claude Code refreshes it")
+    email = switcher._get_sequence_data()["accounts"][slot]["email"]
+    credentials, _ = switcher._read_account_credentials_ex(slot, email)
+    return credentials
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("source", help="cswap slot number, or with --codex the Codex auth.json to move")
+    parser.add_argument("alias", help="the proxy accounts file alias (an email), or with --codex the Codex name")
+    parser.add_argument("--codex", action="store_true", help="seed a Codex CLI login as codex:<alias>")
+    parser.add_argument("--replace", action="store_true", help="overwrite an existing shared login")
+    args = parser.parse_args()
     names = ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")
     if not all(os.environ.get(n) for n in names):
         sys.exit("set " + ", ".join(names))
     dsn, namespace, key_file = (os.environ[n] for n in names)
+    if args.codex and not grants["CODEX_NAME"].fullmatch(args.alias):
+        sys.exit("a Codex name is letters, digits and . _ @ -")
+    account = grants["CODEX_PREFIX"] + args.alias if args.codex else args.alias
     try:
-        switcher = ClaudeAccountSwitcher()
-        if switcher.current_account_number() == args.slot:
-            raise grants["GrantsUnavailable"]("that slot is this host's live Claude login; Claude Code refreshes it")
-        email = switcher._get_sequence_data()["accounts"][args.slot]["email"]
-        credentials, _ = switcher._read_account_credentials_ex(args.slot, email)
-        store = grants["PostgresGrants"](dsn, namespace, grants["read_key"](key_file), Path(key_file).parent / "grants-journal")
-        generation = store.seed(args.alias, credentials, args.replace)
+        credentials = Path(args.source).read_text() if args.codex else claude_login(args.source)
+        parse = grants["codex_login"] if args.codex else grants["claude_login"]
+        store = grants["PostgresGrants"](
+            dsn, namespace, grants["read_key"](key_file), Path(key_file).parent / "grants-journal", parse=parse,
+        )
+        generation = store.seed(account, credentials, args.replace)
     except (KeyError, TypeError):
-        sys.exit(f"cswap has no slot {args.slot}")
+        sys.exit(f"cswap has no slot {args.source}")
     except (ValueError, OSError) as error:
         sys.exit(f"not seeded: {error if isinstance(error, grants['GrantsUnavailable']) else type(error).__name__}")
-    print(f"{args.alias} stored as generation {generation} in namespace {namespace}.")
-    print("Before any proxy serves it, remove every other holder of this grant, starting with cswap:")
-    print(f"  cswap remove {args.slot}")
+    print(f"{account} stored as generation {generation} in namespace {namespace}.")
+    print("Before any proxy serves it, remove every other holder of this grant, starting with the source:")
+    if args.codex:
+        print(f"  rm {args.source}   # a Codex CLI on that host must not keep this login")
+    else:
+        print(f"  cswap remove {args.source}")
 
 
 if __name__ == "__main__":

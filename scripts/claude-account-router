@@ -668,6 +668,11 @@ def serve(args, state):
     router_env = os.environ.copy()
     router_env["CCP_BIND_ADDRESS"] = "127.0.0.1"
     router_env["CCP_TRAFFIC_LOG"] = "0"
+    if os.environ.get("CCP_GRANTS_CODEX_ACCOUNT") is not None:
+        # account_inject owns the shared Codex grant; the router only re-reads the file it writes.
+        if not os.environ.get("CCP_CODEX_AUTH_FILE"):
+            raise ValueError("CCP_GRANTS_CODEX_ACCOUNT needs CCP_CODEX_AUTH_FILE")
+        router_env["CCP_CODEX_EXTERNAL_REFRESH"] = "1"
     if args.via:
         # Cascade: aliases not held here pass, still placeholders, to the next --serve proxy.
         if not args.via_ca:

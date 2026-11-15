@@ -286,8 +286,10 @@ renewing 30 minutes early is impossible. Outages: `docs/devlog/claude_20261109-r
 `docs/devlog/claude_20261110-renew-expiring-live-login.md` (plain paths).
 With `CCP_GRANTS_DSN` set (opt-in, for primary + standby proxies), PostgreSQL owns every Claude grant instead
 of cswap: a committed lease on generation G before any refresh POST, an encrypted local journal of G+1, and
-refusal to start when an alias is the host's live login. Codex is not covered. See `docs/postgres-grants.md`
-(plain path).
+refusal to start when an alias is the host's live login. `CCP_GRANTS_CODEX_ACCOUNT` + `CCP_CODEX_AUTH_FILE` put the
+Codex login in the same table (row `codex:<name>`): `account_inject` refreshes it and writes an access-only file,
+and `--serve` starts the router with `CCP_CODEX_EXTERNAL_REFRESH=1`, which never refreshes. See
+`docs/postgres-grants.md` (plain path).
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
 (appears only from a config dir's second launch) and the fact that 2.1.302 keeps
 computer-use approvals terminal-only are in

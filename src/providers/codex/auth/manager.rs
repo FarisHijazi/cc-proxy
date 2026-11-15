@@ -10,6 +10,14 @@ use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 
+/// Opt-in for a shared login (docs/postgres-grants.md): another process owns the refresh
+/// token and rewrites auth.json with a fresh access token, so this router never refreshes.
+pub const EXTERNAL_REFRESH_ENV: &str = "CCP_CODEX_EXTERNAL_REFRESH";
+
+fn external_refresh_enabled() -> bool {
+    std::env::var(EXTERNAL_REFRESH_ENV).is_ok_and(|value| value == "1" || value == "true")
+}
+
 static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
@@ -20,11 +28,18 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     refresh_lock: Arc<AsyncMutex<()>>,
     refresh_client: reqwest::Client,
     token_endpoint: String,
+    external_refresh: bool,
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     pub fn new(store: CodexTokenStore<S>) -> Self {
         Self::new_with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
+            .with_external_refresh(external_refresh_enabled())
+    }
+
+    fn with_external_refresh(mut self, external_refresh: bool) -> Self {
+        self.external_refresh = external_refresh;
+        self
     }
 
     fn new_with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
@@ -39,6 +54,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
                 .build()
                 .expect("failed to create Codex OAuth refresh client"),
             token_endpoint,
+            external_refresh: false,
         }
     }
 
@@ -50,21 +66,56 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 
     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
-        let stored = self.load_auth()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No Codex credentials. Log in with the Codex CLI (`codex login`) to create ~/.codex/auth.json"
-            )
-        })?;
+        let stored = self.load_auth()?.ok_or_else(|| self.missing())?;
 
         if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
             return Ok(stored);
+        }
+        if self.external_refresh {
+            return self.externally_refreshed(stored, None);
         }
 
         self.refresh(false, None).await
     }
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
+        if self.external_refresh {
+            let current = self.load_auth()?.ok_or_else(|| self.missing())?;
+            return self.externally_refreshed(current, Some(rejected_access));
+        }
         self.refresh(true, Some(rejected_access)).await
+    }
+
+    fn missing(&self) -> anyhow::Error {
+        if self.external_refresh {
+            return anyhow::anyhow!(
+                "No Codex access token in {}; with {EXTERNAL_REFRESH_ENV} set, the shared login owner writes it",
+                self.store.auth_path()
+            );
+        }
+        anyhow::anyhow!(
+            "No Codex credentials. Log in with the Codex CLI (`codex login`) to create ~/.codex/auth.json"
+        )
+    }
+
+    /// External mode: the file just re-read is the only source; a token is used until it expires.
+    fn externally_refreshed(
+        &self,
+        current: StoredAuth,
+        rejected_access: Option<&str>,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        let path = self.store.auth_path();
+        if rejected_access.is_some_and(|access| current.access == access) {
+            anyhow::bail!(
+                "Codex rejected the access token in {path}, which has not been replaced yet; with {EXTERNAL_REFRESH_ENV} set this router never refreshes it"
+            );
+        }
+        if current.expires <= Self::now_ms() {
+            anyhow::bail!(
+                "The Codex access token in {path} has expired and has not been replaced yet; with {EXTERNAL_REFRESH_ENV} set this router never refreshes it"
+            );
+        }
+        Ok(current)
     }
 
     fn load_auth(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
@@ -186,6 +237,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::token_store::CodexCliAuthStore;
     use super::*;
     use crate::auth::InMemoryAuthStore;
     use std::io::{Read, Write};
@@ -339,6 +391,103 @@ mod tests {
         assert_eq!(auth.access, "same-access");
         assert_eq!(auth.refresh, "replacement-refresh");
         assert_eq!(manager.store.load_auth().unwrap(), Some(auth));
+    }
+
+    fn access_jwt(exp_ms: u64) -> String {
+        use base64::Engine;
+        let payload = format!(r#"{{"exp":{}}}"#, exp_ms / 1000);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("eyJhbGciOiJub25lIn0.{encoded}.sig")
+    }
+
+    fn write_access_only(path: &std::path::Path, access: &str) {
+        let doc = serde_json::json!({"tokens": {"access_token": access, "account_id": "acct_1"}});
+        std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+
+    /// An external-refresh manager on a real auth.json, and a token endpoint that records any POST.
+    fn external_manager(
+        path: std::path::PathBuf,
+    ) -> (CodexAuthManager<CodexCliAuthStore>, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+        let store = CodexTokenStore::new(CodexCliAuthStore::new(path));
+        let manager =
+            CodexAuthManager::new_with_token_endpoint(store, endpoint).with_external_refresh(true);
+        (manager, listener)
+    }
+
+    fn assert_no_post(listener: &TcpListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "external refresh must never call the token endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_refresh_rereads_a_newer_file_and_never_posts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let now = CodexAuthManager::<InMemoryAuthStore<StoredAuth>>::now_ms();
+        let near_expiry = access_jwt(now + 60_000);
+        write_access_only(&path, &near_expiry);
+        let (manager, listener) = external_manager(path.clone());
+
+        let auth = manager.get_auth().await.unwrap();
+        assert_eq!(
+            auth.access, near_expiry,
+            "a valid token inside the margin is still used"
+        );
+        assert!(auth.refresh.is_empty());
+
+        let rejected = manager
+            .force_refresh(&near_expiry)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rejected.contains(EXTERNAL_REFRESH_ENV) && rejected.contains("rejected"),
+            "{rejected}"
+        );
+
+        let renewed = access_jwt(now + 3_600_000);
+        write_access_only(&path, &renewed);
+        assert_eq!(
+            manager.force_refresh(&near_expiry).await.unwrap().access,
+            renewed
+        );
+        assert_eq!(manager.get_auth().await.unwrap().access, renewed);
+        assert_no_post(&listener);
+    }
+
+    #[tokio::test]
+    async fn external_refresh_expired_or_missing_token_is_a_clear_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let (manager, listener) = external_manager(path.clone());
+
+        let missing = manager.get_auth().await.unwrap_err().to_string();
+        assert!(
+            missing.contains("No Codex access token") && missing.contains(EXTERNAL_REFRESH_ENV),
+            "{missing}"
+        );
+        let missing = manager.force_refresh("any").await.unwrap_err().to_string();
+        assert!(missing.contains("No Codex access token"), "{missing}");
+
+        let now = CodexAuthManager::<InMemoryAuthStore<StoredAuth>>::now_ms();
+        write_access_only(&path, &access_jwt(now - 1_000));
+        let expired = manager.get_auth().await.unwrap_err().to_string();
+        assert!(
+            expired.contains("expired") && expired.contains(EXTERNAL_REFRESH_ENV),
+            "{expired}"
+        );
+
+        let renewed = access_jwt(now + 3_600_000);
+        write_access_only(&path, &renewed);
+        assert_eq!(manager.get_auth().await.unwrap().access, renewed);
+        assert_no_post(&listener);
     }
 
     #[tokio::test]

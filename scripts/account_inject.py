@@ -72,6 +72,7 @@ STICKY_IDLE_S = 3600
 AFFINITY_MAX_PENDING = 16
 _grants = runpy.run_path(str(Path(__file__).with_name("account_grants.py")))
 GrantsUnavailable, PostgresGrants, read_key = (_grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key"))
+CodexKeeper, CODEX_NAME = _grants["CodexKeeper"], _grants["CODEX_NAME"]
 
 
 def slot_token(slot):
@@ -216,6 +217,27 @@ class PostgresAffinity:
             raise AffinityUnavailable("shared account affinity unavailable") from None
 
 
+def codex_cli_auth_file():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+
+
+def codex_keeper(grants, name, auth_file):
+    """The shared Codex login (opt-in): its row is `codex:<name>`, written for the router to `auth_file`."""
+    if grants is None or not CODEX_NAME.fullmatch(name) or not auth_file:
+        raise exceptions.OptionsError(
+            "A shared Codex login requires the CCP_GRANTS_* settings, a valid CCP_GRANTS_CODEX_ACCOUNT"
+            " and CCP_CODEX_AUTH_FILE"
+        )
+    path = Path(auth_file).expanduser().absolute()
+    if path.resolve() == codex_cli_auth_file().expanduser().resolve():
+        raise exceptions.OptionsError(
+            "CCP_CODEX_AUTH_FILE must not be the Codex CLI's own auth.json, which the CLI refreshes itself"
+        )
+    codex = PostgresGrants(grants.dsn, grants.namespace, grants.key, grants.journal_dir,
+                           refresh=_grants["codex_refresh"], parse=_grants["codex_login"])
+    return CodexKeeper(codex, name, path)
+
+
 class AccountInject:
     def __init__(self):
         self.accounts = {}
@@ -261,6 +283,11 @@ class AccountInject:
             except (OSError, ValueError):
                 raise exceptions.OptionsError("CCP_GRANTS_KEY_FILE must be a private file of 32 base64 bytes") from None
             self.grants = PostgresGrants(dsn, namespace, key, Path(key_file).parent / "grants-journal")
+        self.codex = None
+        codex = os.environ.get("CCP_GRANTS_CODEX_ACCOUNT")
+        if codex is not None:
+            self.codex = codex_keeper(self.grants, codex, os.environ.get("CCP_CODEX_AUTH_FILE"))
+            threading.Thread(target=self.codex.run, daemon=True, name="codex-grant").start()
 
     def load(self, loader):
         loader.add_option(

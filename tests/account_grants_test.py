@@ -18,7 +18,7 @@ HOUR_MS = 3_600_000
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     for name in ("CCP_AFFINITY_DSN", "CCP_AFFINITY_NAMESPACE", "CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE",
-                 "CCP_GRANTS_KEY_FILE"):
+                 "CCP_GRANTS_KEY_FILE", "CCP_GRANTS_CODEX_ACCOUNT", "CCP_CODEX_AUTH_FILE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(module, "renew_in_background", lambda *args: pytest.fail("cswap renewal forbidden"))
     monkeypatch.setattr(module, "slot_token", lambda slot: pytest.fail("cswap credentials forbidden"))
@@ -290,3 +290,228 @@ def test_live_default_login_cannot_be_a_shared_login(monkeypatch, tmp_path, live
     monkeypatch.setattr(module, "live_login", lambda: ("2", "b@example.com"))
     inject.read_accounts(accounts)
     assert inject.accounts == {"a@example.com": "1"}
+
+
+def jwt(exp_ms, label):
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": int(exp_ms // 1000), "jti": label}).encode()).decode()
+    return f"eyJhbGciOiJub25lIn0.{payload.rstrip('=')}.sig"
+
+
+def codex_auth(label, refresh, expires_ms):
+    return json.dumps({
+        "auth_mode": "chatgpt", "OPENAI_API_KEY": None, "last_refresh": "2026-01-01T00:00:00Z",
+        "tokens": {"id_token": "id.toy.sig", "access_token": jwt(expires_ms, label), "refresh_token": refresh,
+                   "account_id": "acct-toy"},
+    })
+
+
+def fake_codex_endpoint(delay=0.0):
+    """Stands in for the Codex token endpoint: each refresh token works once."""
+    lock = threading.Lock()
+
+    def post(form):
+        assert form["client_id"] == module._grants["CODEX_CLIENT_ID"] and form["grant_type"] == "refresh_token"
+        with lock:
+            post.posts.append(form["refresh_token"])
+            alive = form["refresh_token"] in post.live
+            post.live.discard(form["refresh_token"])
+            n = len(post.posts)
+        time.sleep(post.delay)
+        if not alive:
+            return 401, {"error": {"code": "refresh_token_reused"}}
+        post.live.add(f"codex-refresh-new{n}")
+        return 200, {"access_token": jwt(time.time() * 1000 + HOUR_MS, f"new{n}"),
+                     "refresh_token": f"codex-refresh-new{n}", "id_token": f"id.new{n}.sig", "expires_in": 3600}
+
+    def issue(n, expires_ms=None):
+        post.live.add(f"codex-refresh-{n}")
+        return codex_auth(f"old{n}", f"codex-refresh-{n}", time.time() * 1000 - 1 if expires_ms is None else expires_ms)
+
+    post.live, post.posts, post.delay, post.issue = set(), [], delay, issue
+    return post
+
+
+@pytest.fixture
+def codex(db, tmp_path):
+    _, _, namespace, dsn = db
+    endpoint = fake_codex_endpoint()
+
+    def refresh(credentials):
+        return module._grants["codex_refresh"](credentials, post=endpoint)
+
+    def keeper(name, auth_file=None):
+        grants = module.PostgresGrants(dsn, namespace, KEY, tmp_path / name, refresh=refresh,
+                                       parse=module._grants["codex_login"])
+        grants.lease_wait_s = 3
+        return module.CodexKeeper(grants, "work", auth_file or tmp_path / f"{name}-auth.json")
+
+    yield keeper, endpoint, namespace
+
+
+def access_of(path):
+    return json.loads(path.read_text())["tokens"]["access_token"]
+
+
+def test_codex_two_hosts_racing_post_once_and_write_access_only_files(codex):
+    keeper, endpoint, namespace = codex
+    endpoint.delay = 0.5
+    a, b = keeper("a"), keeper("b")
+    a.grants.seed("codex:work", endpoint.issue(1))
+    threads = [threading.Thread(target=k.keep) for k in (a, b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert endpoint.posts == ["codex-refresh-1"]
+    assert access_of(a.path) == access_of(b.path)
+    assert json.loads(base64.urlsafe_b64decode(access_of(a.path).split(".")[1] + "=="))["jti"] == "new1"
+    for path in (a.path, b.path):
+        doc = json.loads(path.read_text())
+        assert "refresh_token" not in doc["tokens"] and b"codex-refresh" not in path.read_bytes()
+        assert doc["tokens"]["id_token"] == "id.new1.sig" and doc["auth_mode"] == "chatgpt"
+        assert (path.stat().st_mode & 0o777) == 0o600
+    assert row(namespace, "codex:work")[1:] == (2, "ok", None)
+
+
+def test_codex_crash_after_post_is_recovered_from_the_journal(codex, monkeypatch):
+    keeper, endpoint, namespace = codex
+    a = keeper("a")
+    a.grants.seed("codex:work", endpoint.issue(1))
+    monkeypatch.setattr(a.grants, "commit", lambda *args: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError):
+        a.keep()
+    assert not a.path.exists()
+    assert row(namespace, "codex:work")[1] == 1
+    with pytest.raises(module.GrantsUnavailable, match="renewed elsewhere"):
+        keeper("b").keep()
+    restarted = keeper("a")
+    restarted.keep()
+    assert row(namespace, "codex:work")[1:] == (2, "ok", None)
+    b = keeper("b")
+    b.keep()
+    assert access_of(b.path) == access_of(restarted.path)
+    assert endpoint.posts == ["codex-refresh-1"]
+
+
+def test_codex_invalid_grant_marks_needs_reconcile_without_looping(codex):
+    keeper, endpoint, namespace = codex
+    a = keeper("a")
+    a.grants.seed("codex:work", codex_auth("old", "codex-revoked", time.time() * 1000 - 1))
+    for _ in range(3):
+        with pytest.raises(module.GrantsUnavailable, match="needs a new login"):
+            a.keep()
+    assert endpoint.posts == ["codex-revoked"]
+    assert row(namespace, "codex:work")[1:] == (1, "needs-reconcile", None)
+    assert not a.path.exists()
+
+
+def test_codex_valid_login_is_written_without_a_post_and_rewritten_after_renewal(codex):
+    keeper, endpoint, _ = codex
+    a = keeper("a")
+    a.grants.seed("codex:work", endpoint.issue(1, time.time() * 1000 + HOUR_MS))
+    a.keep()
+    first = access_of(a.path)
+    a.path.unlink()
+    a.keep()
+    assert access_of(a.path) == first and endpoint.posts == []
+
+
+def test_codex_refresh_maps_provider_answers_without_network():
+    refresh = module._grants["codex_refresh"]
+    login = codex_auth("old", "codex-refresh-1", 0)
+    sent = []
+    outcome = refresh(login, post=lambda form: sent.append(form) or (200, {
+        "access_token": "opaque-access", "refresh_token": "codex-refresh-2", "expires_in": 60}))
+    assert sent == [{"client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token",
+                     "refresh_token": "codex-refresh-1"}]
+    parsed = module._grants["codex_login"](outcome.credentials)
+    assert parsed.access == "opaque-access" and parsed.refresh == "codex-refresh-2"
+    assert abs(parsed.expires - (time.time() * 1000 + 60_000)) < 5_000, "no JWT exp: expiry from expires_in"
+    assert json.loads(outcome.credentials)["tokens"]["id_token"] == "id.toy.sig"
+    for status, body, error in (
+        (400, {"error": "invalid_grant"}, "invalid_grant"),
+        (401, None, "invalid_grant"),
+        (400, {"error": {"code": "refresh_token_expired"}}, "invalid_grant"),
+        (503, None, "http_503"),
+        (200, {"access_token": "only-access"}, "malformed_response"),
+    ):
+        assert refresh(login, post=lambda form: (status, body)) == (None, error)
+    assert refresh(login, post=lambda form: (_ for _ in ()).throw(OSError("down"))) == (None, "network")
+    assert refresh(codex_auth("old", "", 0), post=lambda form: pytest.fail("posted")) == (None, "no_refresh_token")
+
+
+def grants_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("CCP_GRANTS_DSN", "unused")
+    monkeypatch.setenv("CCP_GRANTS_NAMESPACE", "unit")
+    monkeypatch.setenv("CCP_GRANTS_KEY_FILE", str(key_file(tmp_path)))
+
+
+def test_codex_feature_off_starts_no_keeper(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(module.CodexKeeper, "run", lambda self: started.append(self))
+    monkeypatch.delenv("CCP_GRANTS_CODEX_ACCOUNT", raising=False)
+    assert module.AccountInject().codex is None
+    grants_env(monkeypatch, tmp_path)
+    assert module.AccountInject().codex is None
+    time.sleep(0.1)
+    assert started == []
+
+
+def test_codex_opt_in_needs_grants_and_a_dedicated_auth_file(monkeypatch, tmp_path):
+    started = threading.Event()
+    monkeypatch.setattr(module.CodexKeeper, "run", lambda self: started.set())
+    monkeypatch.setenv("CCP_GRANTS_CODEX_ACCOUNT", "work")
+    monkeypatch.setenv("CCP_CODEX_AUTH_FILE", str(tmp_path / "router-auth.json"))
+    with pytest.raises(module.exceptions.OptionsError, match="CCP_GRANTS_"):
+        module.AccountInject()
+    grants_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "cli"))
+    for bad in ("codex:work", "bad name"):
+        monkeypatch.setenv("CCP_GRANTS_CODEX_ACCOUNT", bad)
+        with pytest.raises(module.exceptions.OptionsError, match="CCP_GRANTS_CODEX_ACCOUNT"):
+            module.AccountInject()
+    monkeypatch.setenv("CCP_GRANTS_CODEX_ACCOUNT", "work")
+    monkeypatch.setenv("CCP_CODEX_AUTH_FILE", str(tmp_path / "cli" / "auth.json"))
+    with pytest.raises(module.exceptions.OptionsError, match="Codex CLI's own"):
+        module.AccountInject()
+    monkeypatch.setenv("CCP_CODEX_AUTH_FILE", str(tmp_path / "router-auth.json"))
+    inject = module.AccountInject()
+    assert inject.codex.account == "codex:work" and inject.codex.grants.parse is module._grants["codex_login"]
+    assert started.wait(5)
+
+
+def router_env_of(monkeypatch, tmp_path):
+    launcher = module.runpy.run_path(str(module.Path(module.__file__).with_name("claude-account-router")))
+    names = launcher["serve"].__globals__
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def popen(command, env=None, **kwargs):
+        seen.append(env)
+        raise Stop
+
+    monkeypatch.setattr(names["subprocess"], "Popen", popen)
+    args = names["argparse"].Namespace(
+        accounts_file=tmp_path / "accounts.json", port=1, listen_host="127.0.0.1", api_port=None,
+        remote_control_backend=None, via=None, via_ca=None, router_bin="claude-codex",
+    )
+    try:
+        launcher["serve"](args, tmp_path)
+    except Stop:
+        pass
+    return seen[0]
+
+
+def test_serve_turns_on_external_refresh_only_for_a_shared_codex_login(monkeypatch, tmp_path):
+    monkeypatch.delenv("CCP_GRANTS_CODEX_ACCOUNT", raising=False)
+    monkeypatch.delenv("CCP_CODEX_EXTERNAL_REFRESH", raising=False)
+    assert "CCP_CODEX_EXTERNAL_REFRESH" not in router_env_of(monkeypatch, tmp_path)
+    monkeypatch.setenv("CCP_GRANTS_CODEX_ACCOUNT", "work")
+    monkeypatch.delenv("CCP_CODEX_AUTH_FILE", raising=False)
+    with pytest.raises(ValueError, match="CCP_CODEX_AUTH_FILE"):
+        router_env_of(monkeypatch, tmp_path)
+    monkeypatch.setenv("CCP_CODEX_AUTH_FILE", str(tmp_path / "router-auth.json"))
+    env = router_env_of(monkeypatch, tmp_path)
+    assert env["CCP_CODEX_EXTERNAL_REFRESH"] == "1" and env["CCP_CODEX_AUTH_FILE"] == str(tmp_path / "router-auth.json")
