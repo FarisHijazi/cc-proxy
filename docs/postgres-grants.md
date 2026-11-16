@@ -48,8 +48,14 @@ and is never seeded or renewed; only rotating logins come from the table. A host
 seeded with `scripts/account_grants_seed.py --file ~/.claude/.credentials.json <alias>`; then move that
 file aside and drop `oauthAccount` from `~/.claude.json` before the proxy restarts.
 
-The proxy refuses to start when an alias is this host's live default Claude login (cswap's current
-slot, or the `~/.claude.json` email). Claude Code refreshes that login itself, outside any lease.
+When an alias is this host's live default Claude login (cswap's current slot, or the `~/.claude.json`
+email), the proxy adopts it instead of refusing to start (`adopt_live_login`). Claude Code refreshes that
+login itself, outside any lease. Adoption stores the `claudeAiOauth` login as a new generation only when
+it expires later than the stored one (`seed(..., newer_only=True)`). It removes that key from
+`~/.claude/.credentials.json` and keeps the MCP logins in the same file. It drops `oauthAccount` and keeps a
+0600 copy under `~/.local/state/ccp-adopted/`. If adoption fails, the proxy logs it and serves anyway.
+Why: on 2026-11-16 a real login reappeared on ftower exactly one token lifetime after the cutover.
+The old refusal then kept the proxy down after the failover drill.
 
 ## How a login is served
 
@@ -147,8 +153,9 @@ scripts/account_grants_export.py --codex work ~/.codex/auth.json   # full file, 
   stop the cswap usage collector and auto-switcher for that account, and log out any CLI copy at
   cutover. Removing the slot also drops the sequence entry the Chrome bridge reads for the
   account's UUID.
-- The live-login guard runs on start and on accounts file reload, not when someone runs `/login` on
-  the host later.
+- Adoption runs on start and on accounts file reload, not when someone runs `/login` on the host
+  later. A process that keeps refreshing the live login forks the refresh token each time, so find
+  and stop it. ftower logs every writer of the file through `ccp-cred-watch.service` (bpftrace).
 - One connection per statement group, no pooling; a refresh opens about four connections.
 - Export takes the row's generation. If another host crashed after POSTing it (G+1 only in that
   host's journal), the exported login is already spent, and that journal no longer writes back.
@@ -165,7 +172,7 @@ scripts/account_grants_export.py --codex work ~/.codex/auth.json   # full file, 
 `tests/account_grants_test.py` with a fake provider and toy tokens: two hosts racing post once, a
 crash before commit and a lost commit recover from the journal, `invalid_grant` never loops,
 tampered ciphertext or wrong associated data fails closed, proxy 401 renewal posts once, the
-unreachable store answers a sanitized 503, the live-login guard, and feature off keeps
+unreachable store answers a sanitized 503, live-login adoption (newer copy wins, MCP logins kept), and feature off keeps
 `slot_token` and `renew`. The Codex half runs the same file with a fake token endpoint: two
 keepers racing post once and write access-only 0600 files, a crash after the POST recovers from
 the journal, `invalid_grant` never loops, the refresh's request and error mapping, the opt-in

@@ -71,7 +71,9 @@ MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 STICKY_IDLE_S = 3600
 AFFINITY_MAX_PENDING = 16
 _grants = runpy.run_path(str(Path(__file__).with_name("account_grants.py")))
-GrantsUnavailable, PostgresGrants, read_key = (_grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key"))
+GrantsUnavailable, PostgresGrants, read_key, write_private_json = (
+    _grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key", "write_private_json")
+)
 CodexKeeper, CODEX_NAME = _grants["CodexKeeper"], _grants["CODEX_NAME"]
 
 
@@ -159,8 +161,32 @@ def copyable(slot):
         return False
 
 
-class LiveLoginShared(ValueError):
-    """Claude Code refreshes the live login outside any lease, so it can never be a shared login."""
+def adopt_live_login(grants, alias, home=None):
+    """Take a shared alias's live login on this host away from Claude Code, which refreshes it outside any lease.
+
+    A Claude Code process that held the login before the cutover writes it back when it refreshes. The newer
+    of that copy and the stored generation is kept; the copy then leaves Claude Code's files (a private
+    backup stays under ~/.local/state/ccp-adopted), keeping the MCP logins beside it.
+    """
+    home = home or Path.home()
+    credentials = home / ".claude" / ".credentials.json"
+    doc = json.loads(credentials.read_text()) if credentials.exists() else {}
+    live = doc.get("claudeAiOauth")
+    if live:
+        generation = None
+        if live.get("refreshToken"):
+            generation = grants.seed(alias, json.dumps({"claudeAiOauth": live}), replace=True, newer_only=True)
+        aside = home / ".local" / "state" / "ccp-adopted"
+        aside.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_private_json(aside / f"{alias}-{time.strftime('%Y%m%dT%H%M%S')}.json", {"claudeAiOauth": live})
+        del doc["claudeAiOauth"]
+        write_private_json(credentials, doc)
+        logging.warning(f"{alias}: took the live Claude login off this host"
+                        + (f", stored as generation {generation}" if generation else ", the shared one was newer"))
+    config = home / ".claude.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    if data.pop("oauthAccount", None) is not None:
+        write_private_json(config, data)
 
 
 def renew_in_background(slot, stale):
@@ -323,8 +349,6 @@ class AccountInject:
             return
         try:
             self.read_accounts(Path(ctx.options.proxy_accounts_file))
-        except LiveLoginShared as error:
-            raise exceptions.OptionsError(str(error)) from None
         except (OSError, ValueError, KeyError, AttributeError):
             raise exceptions.OptionsError("Invalid proxy accounts file") from None
         if self.grants is not None:
@@ -346,10 +370,10 @@ class AccountInject:
                 if alias in self.copyable:
                     continue
                 if account_slot == slot or email and alias.lower() == email.lower():
-                    raise LiveLoginShared(
-                        f"{alias} is this host's live Claude login, which Claude Code refreshes outside the "
-                        "shared lease; log this host's Claude Code into another account or drop the alias"
-                    )
+                    try:
+                        adopt_live_login(self.grants, alias)
+                    except Exception as error:  # noqa: BLE001 - serving beats refusing; the next reload adopts again
+                        logging.error(f"{alias} is still this host's live Claude login: {type(error).__name__}")
         self.accounts = accounts
         # Old alias -> current alias, so sessions launched before a rename keep working.
         self.renamed = dict(data.get("renamed", {}))

@@ -283,33 +283,78 @@ def test_opt_in_is_complete_and_key_file_private(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("live", [("1", None), ("9", "A@example.com")])
-def test_live_default_login_cannot_be_a_shared_login(monkeypatch, tmp_path, live):
+def test_live_login_of_a_shared_alias_is_adopted_not_refused(monkeypatch, tmp_path, live):
     inject = opted_in(monkeypatch, tmp_path, "unused", "unit")
+    adopted = []
+    monkeypatch.setattr(module, "adopt_live_login", lambda grants, alias: adopted.append(alias))
     monkeypatch.setattr(module, "live_login", lambda: live)
     accounts = tmp_path / "accounts.json"
     accounts.write_text(json.dumps({"accounts": {"a@example.com": "1"}}))
-    with pytest.raises(module.LiveLoginShared, match="live Claude login"):
-        inject.read_accounts(accounts)
+    inject.read_accounts(accounts)
+    assert adopted == ["a@example.com"] and inject.accounts == {"a@example.com": "1"}
     monkeypatch.setattr(module, "live_login", lambda: ("2", "b@example.com"))
     inject.read_accounts(accounts)
-    assert inject.accounts == {"a@example.com": "1"}
+    assert adopted == ["a@example.com"]
 
 
-def test_setup_token_aliases_stay_on_cswap_and_skip_the_live_guard(monkeypatch, tmp_path):
+def test_a_failed_adoption_still_serves(monkeypatch, tmp_path):
     inject = opted_in(monkeypatch, tmp_path, "unused", "unit")
+    monkeypatch.setattr(module, "adopt_live_login", lambda grants, alias: (_ for _ in ()).throw(OSError("db down")))
     monkeypatch.setattr(module, "live_login", lambda: ("1", None))
-    monkeypatch.setattr(module, "setup_token_slot", lambda slot: slot == "1")
-    monkeypatch.setattr(module, "slot_token", lambda slot: ("setup-1", time.time() * 1000 + HOUR_MS))
     accounts = tmp_path / "accounts.json"
     accounts.write_text(json.dumps({"accounts": {"a": "1"}}))
     inject.read_accounts(accounts)
-    assert inject.copyable == {"a"}
-    assert served(inject).request.headers["authorization"] == "Bearer setup-1"
-    inject.rejected("a", "setup-1")
-    assert not inject.stale
-    monkeypatch.setattr(module, "setup_token_slot", lambda slot: (_ for _ in ()).throw(OSError("unreadable")))
-    with pytest.raises(module.LiveLoginShared):
-        inject.read_accounts(accounts)
+    assert inject.accounts == {"a": "1"}
+
+
+class SeedRecorder:
+    def __init__(self, generation):
+        self.generation, self.seeded = generation, []
+
+    def seed(self, account, credentials, replace=False, newer_only=False):
+        self.seeded.append((account, json.loads(credentials), replace, newer_only))
+        return self.generation
+
+
+def claude_home(tmp_path, credentials, config):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / ".credentials.json").write_text(json.dumps(credentials))
+    (home / ".claude.json").write_text(json.dumps(config))
+    return home
+
+
+@pytest.mark.parametrize("generation", [3, None])
+def test_adoption_moves_only_the_claude_login_off_the_host(tmp_path, generation):
+    live = {"accessToken": "access-9", "refreshToken": "refresh-9", "expiresAt": 1}
+    home = claude_home(tmp_path, {"claudeAiOauth": live, "mcpOAuth": {"server": "kept"}},
+                       {"oauthAccount": {"emailAddress": "a@example.com"}, "theme": "dark"})
+    grants = SeedRecorder(generation)
+    module.adopt_live_login(grants, "a@example.com", home)
+    assert grants.seeded == [("a@example.com", {"claudeAiOauth": live}, True, True)]
+    assert json.loads((home / ".claude" / ".credentials.json").read_text()) == {"mcpOAuth": {"server": "kept"}}
+    assert json.loads((home / ".claude.json").read_text()) == {"theme": "dark"}
+    backup, = (home / ".local" / "state" / "ccp-adopted").iterdir()
+    assert json.loads(backup.read_text()) == {"claudeAiOauth": live} and backup.stat().st_mode & 0o777 == 0o600
+
+
+def test_adoption_of_an_identity_without_a_login_only_drops_the_identity(tmp_path):
+    home = claude_home(tmp_path, {"mcpOAuth": {}}, {"oauthAccount": {"emailAddress": "a@example.com"}})
+    grants = SeedRecorder(1)
+    module.adopt_live_login(grants, "a@example.com", home)
+    assert grants.seeded == [] and json.loads((home / ".claude.json").read_text()) == {}
+    assert not (home / ".local").exists()
+
+
+def test_seed_newer_only_keeps_the_stored_login_unless_the_copy_expires_later(db):
+    host, _, namespace, _ = db
+    a = host("a")
+    now = time.time() * 1000
+    a.seed("a", login("access-1", "refresh-1", now + 2 * HOUR_MS))
+    assert a.seed("a", login("access-old", "refresh-old", now + HOUR_MS), replace=True, newer_only=True) is None
+    assert row(namespace)[1] == 1
+    assert a.seed("a", login("access-new", "refresh-new", now + 3 * HOUR_MS), replace=True, newer_only=True) == 2
+    assert a.token("a") == ("access-new", now + 3 * HOUR_MS)
 
 
 def jwt(exp_ms, label):
