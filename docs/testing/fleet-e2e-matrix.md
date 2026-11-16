@@ -9,12 +9,13 @@ never replace a worker or retry an uncertain write.
 
 The prior 40-route audit checked T3's import picker, not its sidebar. Only five
 fleet threads had actually been imported. The third maintained T3 patch adds
-explicitly configured automatic discovery to the existing server every 30 seconds,
-with deterministic lazy imports and no extra service. The existing provider now
+explicitly configured automatic discovery to the existing server, with a
+30-second delay after each pass, deterministic lazy imports and no extra service. The existing provider now
 has a destination project configured; manual import is no longer required.
 
-Fresh production verification matched all 44 current catalog routes to sidebar
-threads. All 21 interactive Claude workers across three VMs (9, 9, 3) were opened
+An initial manual bulk import restored the existing sidebar entries. Subsequent
+production verification matched all 44 then-current catalog routes to sidebar
+threads; that initial batch alone does not prove automatic discovery. All 21 interactive Claude workers across three VMs (9, 9, 3) were opened
 through the actual thread-subscription path. Every current HQ message ID, role
 and text matched the T3 projection; original route bindings, run IDs and process
 PID/birth identities were preserved. No prompt, approval, interrupt or worker
@@ -39,8 +40,16 @@ Private evidence: `t3-sidebar-live-proof-20261117.json`,
 `vm-readiness-after-094-20261117.json`, and `t3-auth-audit-after-20261117.json`.
 Automatic discovery/lazy history has failing-before regressions, 39 focused
 WS/discovery checks, and a passing `check:changed` (62 related tests and 27 package
-typechecks). No new native worker was created solely to test automatic discovery;
-that transition is covered by the deterministic server-lifecycle tests.
+typechecks). A separate new Claude fixture was then launched through the existing
+wrapper after a read-only baseline confirmed its absence. The background reconcile
+created its sidebar record about 109 seconds after startup, without an import RPC.
+Opening it loaded the exact native UUID and both source messages, including the
+exact assistant marker. It had zero synthetic runs before and after opening;
+server traces link creation to `AcpRegistrySessions.reconcile`. All original
+workers still present at the fixture baseline retained their PID/birth identity.
+Evidence: `t3-auto-discovery-real-new-session-20261117.json`. The test also exposed
+a separate Remote Control alias for the same conversation and slow fleet listing;
+those observations are distinct from the passing automatic-discovery assertion.
 
 ## Current candidate checks
 

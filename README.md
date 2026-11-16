@@ -185,7 +185,7 @@ Use a stable installed copy of the script. In T3 Code's provider settings choose
 per row. Choose an existing local project for the fleet conversation views and
 set the provider configuration's `autoImportProjectId` to its project ID through
 T3's settings API. The patched server adds discovered sessions to that project's
-sidebar every 30 seconds, even with no browser open. It loads history when a
+sidebar automatically, with a 30-second delay between discovery passes, even with no browser open. It loads history when a
 conversation is selected and preserves archived/deleted views. **List sessions**
 and **Import** remain available for manual selection.
 

@@ -15,8 +15,8 @@ Only providers explicitly advertising the versioned external-session capability
 are observed when opened. Ordinary ACP providers retain their existing lifecycle.
 
 The third patch fixes the gap between the import picker and the sidebar. An
-explicit provider `autoImportProjectId` enables discovery every 30 seconds inside
-the existing server. It creates deterministic thread records without loading
+explicit provider `autoImportProjectId` enables discovery inside the existing
+server, with a 30-second delay after each completed pass. It creates deterministic thread records without loading
 agents; selection imports history through the existing owner. Archived/deleted
 views and temporarily offline sessions are preserved. The destination is local
 view storage, not a mapping of remote workdirs onto local files.

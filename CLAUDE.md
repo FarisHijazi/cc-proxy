@@ -6,7 +6,7 @@ and selected-session detail/actions use the private HQ origin. Never spawn/resum
 replacement Claude process, map remote workdirs onto the local T3 workspace, retry
 an uncertain write, or guess native/tmux equivalence. T3's explicit external-session capability gates passive attachment and native controls.
 T3's `autoImportProjectId` opts an observable provider into the existing server's
-30-second discovery loop. Discovery creates only sidebar records; the history
+discovery loop (30-second delay between passes). Discovery creates only sidebar records; the history
 owner loads on selection. Preserve archived/deleted views and native workers.
 The necessary patches against a pinned official nightly are maintained in `patches/t3/`
 and installed through the existing service updater; never create a second T3 deployment.
