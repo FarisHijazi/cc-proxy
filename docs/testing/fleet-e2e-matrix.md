@@ -5,6 +5,43 @@ fixture does not establish that a particular Claude/Codex version or T3 UI handl
 the same interaction. The latest candidate must retain source identities and must
 never replace a worker or retry an uncertain write.
 
+## Sidebar and runtime identity recovery (2026-11-17)
+
+The prior 40-route audit checked T3's import picker, not its sidebar. Only five
+fleet threads had actually been imported. The third maintained T3 patch adds
+explicitly configured automatic discovery to the existing server every 30 seconds,
+with deterministic lazy imports and no extra service. The existing provider now
+has a destination project configured; manual import is no longer required.
+
+Fresh production verification matched all 44 current catalog routes to sidebar
+threads. All 21 interactive Claude workers across three VMs (9, 9, 3) were opened
+through the actual thread-subscription path. Every current HQ message ID, role
+and text matched the T3 projection; original route bindings, run IDs and process
+PID/birth identities were preserved. No prompt, approval, interrupt or worker
+restart was used. Existing T3 history is retained, so this verifies current
+source membership rather than destructive history replacement.
+
+HQ 0.9.4 fixes stale launch UUIDs after an in-process resume. The existing Claude
+publisher's current UUID is accepted only after process birth/domain and tmux
+window/pane validation. Six live workers had changed UUIDs; five had appeared
+empty and one had returned a stale nonempty history. All 21 now return current,
+nonempty history. The reader change passed 510 tests and Ruff; seven regressions
+failed before the fix. The ACP title follow-up passed 91 tests and includes exact
+tmux names to distinguish sessions sharing a project title.
+
+The packaged T3 runtime passed an isolated startup/authentication smoke check.
+The actual public browser completed Authentik Google sign-in and opened existing
+Claude histories from each of the three VMs without sending input. Anonymous
+root/API/WebSocket probes redirect to Authentik. A Cloudflare cache bypass scoped
+to the T3 hostname also gates static assets that had previously been cached.
+
+Private evidence: `t3-sidebar-live-proof-20261117.json`,
+`vm-readiness-after-094-20261117.json`, and `t3-auth-audit-after-20261117.json`.
+Automatic discovery/lazy history has failing-before regressions, 39 focused
+WS/discovery checks, and a passing `check:changed` (62 related tests and 27 package
+typechecks). No new native worker was created solely to test automatic discovery;
+that transition is covered by the deterministic server-lifecycle tests.
+
 ## Current candidate checks
 
 `tests/account_acp_test.py`, `tests/account_acp_transport_test.py`, and

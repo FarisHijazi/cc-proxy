@@ -182,11 +182,18 @@ uv run --script /path/to/cc-proxy/scripts/cc-proxy-acp \
 
 Use a stable installed copy of the script. In T3 Code's provider settings choose
 **Local ACP command**, set the executable to `uv`, and add the arguments above one
-per row. Select a local project for the fleet conversation views, choose **List
-sessions**, then **Import** the desired row. T3's import binds its native session
-ID; the bridge does not start or resume another Claude or Codex process. New blank threads
-cannot launch fleet agents. Rows show their host and native/tmux transport; two
-provenance paths are kept separate instead of guessing that they are identical.
+per row. Choose an existing local project for the fleet conversation views and
+set the provider configuration's `autoImportProjectId` to its project ID through
+T3's settings API. The patched server adds discovered sessions to that project's
+sidebar every 30 seconds, even with no browser open. It loads history when a
+conversation is selected and preserves archived/deleted views. **List sessions**
+and **Import** remain available for manual selection.
+
+Import binds the existing native session ID; the bridge does not start or resume
+another Claude or Codex process. New blank threads cannot launch fleet agents.
+Rows include the host, transport and exact tmux session name so sessions sharing a
+project title remain distinguishable. Separate provenance paths are not guessed
+to be identical.
 
 The selected worker keeps its real workdir, account and tools on its own node.
 T3's local project file browser and git controls still belong to the selected T3

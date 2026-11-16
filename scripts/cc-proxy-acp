@@ -230,8 +230,11 @@ class FleetAgent(Agent):
         sessions = []
         for row in selected:
             host = row.get("host_label") or row.get("host") or "Fleet"
-            title = row.get("title") or row.get("session") or row["id"]
             transport = row.get("transport", "tmux")
+            tmux_session = row.get("tmux_session") if transport == "tmux" else None
+            title = row.get("title") or tmux_session or row.get("session") or row["id"]
+            if tmux_session and tmux_session != title:
+                title = f"{tmux_session} — {title}"
             sessions.append(s.SessionInfo(session_id=row["id"], cwd=row.get("workdir") or cwd or "/",
                                            title=f"[{host} · {transport}] {title}"))
         return s.ListSessionsResponse(sessions=sessions,

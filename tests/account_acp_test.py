@@ -84,6 +84,38 @@ def test_discovery_preserves_opaque_identity_and_skips_unreachable_sessions():
     asyncio.run(check())
 
 
+
+def test_discovery_distinguishes_tmux_sessions_with_the_same_project_title():
+    async def check():
+        hq = mock_hq(listing=[
+            row(id="one", transport="tmux", tmux_session="build", title="Shared project"),
+            row(id="two", transport="tmux", tmux_session="review", title="Shared project"),
+        ])
+        response = await FleetAgent(hq, observe=False).list_sessions("/local/fleet")
+        assert [(entry.session_id, entry.title) for entry in response.sessions] == [
+            ("one", "[node-one · tmux] build — Shared project"),
+            ("two", "[node-one · tmux] review — Shared project"),
+        ]
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(("changes", "expected"), [
+    ({"transport": "tmux", "tmux_session": "build", "title": "build"}, "[node-one · tmux] build"),
+    ({"transport": "tmux", "tmux_session": "build", "title": None}, "[node-one · tmux] build"),
+    ({"transport": "tmux", "session": "legacy", "title": None}, "[node-one · tmux] legacy"),
+    ({"transport": "native", "tmux_session": "build"}, "[node-one · native] Existing work"),
+    ({"transport": "native", "provider": "codex", "tmux_session": "build"}, "[node-one · native] Existing work"),
+])
+def test_discovery_keeps_tmux_names_unambiguous_without_changing_native_titles(changes, expected):
+    async def check():
+        hq = mock_hq(listing=[row(**changes)])
+        response = await FleetAgent(hq, observe=False).list_sessions("/local/fleet")
+        assert response.sessions[0].title == expected
+        assert response.sessions[0].session_id == SID
+        assert hq.actions == []
+    asyncio.run(check())
+
 def test_provider_probe_and_history_load_never_write_to_original_process():
     async def check():
         hq = mock_hq(row())

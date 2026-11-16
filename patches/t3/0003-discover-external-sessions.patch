@@ -1,0 +1,771 @@
+From d4b098aac07af7059484752f9dd23d3360a3491a Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Mon, 16 Nov 2026 22:06:25 +0000
+Subject: [PATCH] fix(server): discover external sessions in the sidebar
+
+---
+ .../src/provider/AcpRegistrySessions.test.ts  | 360 ++++++++++++++++++
+ .../src/provider/AcpRegistrySessions.ts       | 190 ++++++++-
+ apps/server/src/server.ts                     |   3 +
+ apps/server/src/ws.ts                         |  30 +-
+ .../src/server/driver.ts                      |   3 +
+ .../provider-acp-registry/src/settings.ts     |  15 +-
+ packages/provider-core/src/server/driver.ts   |   2 +
+ 7 files changed, 590 insertions(+), 13 deletions(-)
+ create mode 100644 apps/server/src/provider/AcpRegistrySessions.test.ts
+
+diff --git a/apps/server/src/provider/AcpRegistrySessions.test.ts b/apps/server/src/provider/AcpRegistrySessions.test.ts
+new file mode 100644
+index 00000000..e5fb1026
+--- /dev/null
++++ b/apps/server/src/provider/AcpRegistrySessions.test.ts
+@@ -0,0 +1,360 @@
++import { assert, it } from "@effect/vitest";
++import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
++import {
++  AcpRegistryOperationError,
++  ProjectId,
++  ProviderDriverKind,
++  ProviderInstanceId,
++  type AcpRegistryListSessionsResult,
++  type OrchestrationV2ThreadProjection,
++  type OrchestrationV2ThreadShell,
++  ProviderThreadId,
++} from "@t3tools/contracts";
++import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/server/AcpRegistryRuntimeCoordinator";
++import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
++import * as Context from "effect/Context";
++import * as Deferred from "effect/Deferred";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as SqlClient from "effect/sql/SqlClient";
++import * as TestClock from "effect/testing/TestClock";
++
++import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
++import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
++import * as SqlitePersistence from "../persistence/Sqlite.ts";
++import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
++import * as ProjectService from "../project/ProjectService.ts";
++import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
++import * as AcpRegistrySessions from "./AcpRegistrySessions.ts";
++import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
++import * as ProviderRegistry from "./ProviderRegistry.ts";
++
++const projectId = ProjectId.make("fleet-project");
++const instanceId = ProviderInstanceId.make("fleet-provider");
++const driver = ProviderDriverKind.make("acpRegistry");
++const timestamp = "2026-11-17T00:00:00.000Z";
++const threadId = (sessionId: string) =>
++  AcpRegistrySessions.importedThreadId({ driver, instanceId, sessionId });
++const page = (ids: ReadonlyArray<string>, nextCursor: string | null = null) => ({
++  sessions: ids.map((sessionId) => ({
++    sessionId,
++    cwd: "/remote/work",
++    additionalDirectories: [],
++    title: sessionId,
++    updatedAt: null,
++    importedThreadId: null,
++  })),
++  nextCursor,
++  canLoad: true,
++  canResume: true,
++  canDelete: false,
++});
++
++const fixture = Effect.fn(function* () {
++  const sql = yield* SqlClient.SqlClient;
++  const launched: Array<ThreadLaunchService.ThreadLaunchInput> = [];
++  const listed: Array<string | undefined> = [];
++  const historyLoads: Array<
++    Parameters<AgentSessionImporter.AgentSessionImporter["Service"]["importNativeHistory"]>[0]
++  > = [];
++  let shell: OrchestrationV2ThreadShell | null = null;
++  let enabled = true;
++  let optedIn = true;
++  let observable = true;
++  let archivedProject = false;
++  let result = (
++    _cursor?: string,
++  ): Effect.Effect<AcpRegistryListSessionsResult, AcpRegistryOperationError> =>
++    Effect.succeed(page(["first"]));
++  const seed = (id: string, lifecycle: "active" | "archived" | "deleted" = "active") => sql`
++    INSERT INTO orchestration_v2_projection_threads (
++      thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
++      created_at, updated_at, archived_at, deleted_at, payload_json
++    ) VALUES (
++      ${id}, ${projectId}, 'existing', ${instanceId}, 'approval-required', 'default',
++      ${timestamp}, ${timestamp}, ${lifecycle === "archived" ? timestamp : null},
++      ${lifecycle === "deleted" ? timestamp : null}, '{}'
++    )
++  `;
++  const instance = {
++    instanceId,
++    driverKind: driver,
++    get enabled() {
++      return enabled;
++    },
++    snapshot: {
++      getSnapshot: Effect.sync(() => ({
++        nativeSessions: {
++          canList: true,
++          canLoad: true,
++          canObserve: observable,
++        },
++      })),
++    },
++    acpSessionManagement: {
++      get autoImportProjectId() {
++        return optedIn ? projectId : undefined;
++      },
++      listSessions: ({ cursor }: { readonly cursor?: string }) =>
++        Effect.suspend(() => {
++          listed.push(cursor);
++          return result(cursor);
++        }),
++    },
++  } as unknown as ProviderInstance;
++  const instances = [instance];
++  const services = AcpRegistrySessions.layer.pipe(
++    Layer.provide(
++      Layer.mergeAll(
++        Layer.mock(ProjectService.ProjectService)({
++          getById: () =>
++            Effect.sync(() =>
++              Option.some({
++                id: projectId,
++                title: "Fleet",
++                workspaceRoot: "/local/fleet",
++                scripts: [],
++                defaultModelSelection: null,
++                createdAt: timestamp,
++                updatedAt: timestamp,
++                archivedAt: archivedProject ? timestamp : null,
++                deletedAt: null,
++              }),
++            ),
++        }),
++        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
++          getInstance: () => Effect.succeed(instance),
++          listInstances: Effect.succeed(instances),
++        }),
++        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
++        Layer.mock(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator)({
++          withSessionMutation: (effect) => effect,
++        }),
++        Layer.mock(ThreadManagementService.ThreadManagementService)({
++          getThreadShell: () => Effect.sync(() => shell),
++        }),
++        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
++          launch: (input) =>
++            Effect.gen(function* () {
++              assert.isDefined(input.threadId);
++              const id = input.threadId!;
++              launched.push(input);
++              yield* seed(id);
++              return {
++                threadId: id,
++                projection: {} as OrchestrationV2ThreadProjection,
++                resumed: false,
++              };
++            }).pipe(Effect.orDie),
++        }),
++        Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
++          enqueueCommand: (effect) => effect,
++        }),
++        // Discovery must not load history, open observers, send prompts, or own native lifecycle.
++        Layer.mock(AgentSessionImporter.AgentSessionImporter)({
++          importNativeHistory: (input) =>
++            Effect.sync(() => {
++              assert.isNotNull(shell);
++              historyLoads.push(input);
++              shell = { ...shell!, historyOrigin: "v1_import" };
++              return 1;
++            }),
++        }),
++        Layer.succeed(SqlClient.SqlClient, sql),
++        NodeCrypto.layer,
++      ),
++    ),
++  );
++  const context = yield* Layer.build(services);
++  const sessions = Context.get(context, AcpRegistrySessions.AcpRegistrySessions);
++  return {
++    sessions,
++    historyLoads,
++    setPendingShell: (id: OrchestrationV2ThreadShell["id"]) => {
++      shell = {
++        id,
++        projectId,
++        providerInstanceId: instanceId,
++        latestRunId: null,
++        activeProviderThreadId: ProviderThreadId.make(id + ":provider"),
++      } as OrchestrationV2ThreadShell;
++    },
++    launched,
++    listed,
++    seed,
++    bind: (owner: string, nativeId: string) => sql`
++      INSERT INTO orchestration_v2_projection_provider_threads (
++        provider_thread_id, thread_id, provider, status, updated_at, payload_json, driver, provider_instance_id
++      ) VALUES (
++        ${owner + ":provider"}, ${owner}, ${instanceId}, 'idle', ${timestamp},
++        ${JSON.stringify({ nativeThreadRef: { nativeId } })}, ${driver}, ${instanceId}
++      )
++    `,
++    addUnavailableInstance: () =>
++      instances.unshift({
++        ...instance,
++        instanceId: ProviderInstanceId.make("unavailable"),
++        acpSessionManagement: {
++          ...instance.acpSessionManagement!,
++          listSessions: () =>
++            Effect.fail(
++              new AcpRegistryOperationError({
++                reason: "session_list_unsupported",
++                message: "offline",
++              }),
++            ),
++        },
++      }),
++    setResult: (next: typeof result) => {
++      result = next;
++    },
++    setEnabled: (value: boolean) => {
++      enabled = value;
++    },
++    setOptedIn: (value: boolean) => {
++      optedIn = value;
++    },
++    setObservable: (value: boolean) => {
++      observable = value;
++    },
++    setArchivedProject: (value: boolean) => {
++      archivedProject = value;
++    },
++  };
++});
++
++it.effect(
++  "discovers new external threads lazily and never recreates active, archived or deleted threads",
++  () =>
++    Effect.gen(function* () {
++      const f = yield* fixture();
++      for (const state of ["active", "archived", "deleted"] as const)
++        yield* f.seed(threadId(state), state);
++      yield* f.seed("older-owner", "deleted");
++      yield* f.bind("older-owner", "owned");
++      f.setResult((cursor) =>
++        Effect.succeed(
++          cursor === undefined
++            ? page(["active", "archived", "deleted", "owned", "first"], "second")
++            : page(["first", "second"]),
++        ),
++      );
++      yield* f.sessions.reconcile;
++      yield* f.sessions.reconcile;
++      assert.deepEqual(
++        f.launched.map((item) => item.threadId),
++        [threadId("first"), threadId("second")],
++      );
++      assert.deepEqual(f.listed, [undefined, "second", undefined, "second"]);
++      assert.deepEqual(f.historyLoads, []);
++      for (const input of f.launched) {
++        assert.equal(input.projectId, projectId);
++        assert.deepEqual(input.workspaceStrategy, { type: "root" });
++        assert.isUndefined(input.initialMessage);
++        assert.isDefined(input.importedNativeThread);
++      }
++    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
++
++it.effect(
++  "requires both explicit destination and observable sessions and preserves offline history",
++  () =>
++    Effect.gen(function* () {
++      const f = yield* fixture();
++      f.setOptedIn(false);
++      yield* f.sessions.reconcile;
++      f.setOptedIn(true);
++      f.setObservable(false);
++      yield* f.sessions.reconcile;
++      f.setObservable(true);
++      f.setEnabled(false);
++      yield* f.sessions.reconcile;
++      f.setEnabled(true);
++      f.setArchivedProject(true);
++      yield* f.sessions.reconcile;
++      assert.deepEqual(f.listed, []);
++      f.setArchivedProject(false);
++      f.addUnavailableInstance();
++      f.setResult(() =>
++        Effect.fail(
++          new AcpRegistryOperationError({ reason: "session_list_unsupported", message: "offline" }),
++        ),
++      );
++      yield* f.sessions.reconcile;
++      f.setResult(() => Effect.succeed(page(["first"])));
++      yield* f.sessions.reconcile;
++      f.setResult(() => Effect.succeed(page([])));
++      yield* f.sessions.reconcile;
++      f.setResult(() => Effect.succeed(page(["first", "new-later"])));
++      yield* f.sessions.reconcile;
++      assert.deepEqual(
++        f.launched.map((item) => item.threadId),
++        [threadId("first"), threadId("new-later")],
++      );
++    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
++
++it.effect("terminates broken cursor cycles without losing already discovered sessions", () =>
++  Effect.gen(function* () {
++    const f = yield* fixture();
++    f.setResult(() => Effect.succeed(page(["first"], "same")));
++    yield* f.sessions.reconcile;
++    assert.deepEqual(f.listed, [undefined, "same"]);
++    assert.equal(f.launched.length, 1);
++  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
++
++it.effect("runs discovery after readiness and continues without an open client", () =>
++  Effect.gen(function* () {
++    const ready = yield* Deferred.make<void>();
++    const first = yield* Deferred.make<void>();
++    const second = yield* Deferred.make<void>();
++    let scans = 0;
++    yield* Layer.build(
++      AcpRegistrySessions.layerAutoImport.pipe(
++        Layer.provide(
++          Layer.mergeAll(
++            Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
++              awaitCommandReady: Deferred.await(ready),
++            }),
++            Layer.mock(AcpRegistrySessions.AcpRegistrySessions)({
++              reconcile: Effect.sync(() => ++scans).pipe(
++                Effect.flatMap((count) =>
++                  Deferred.succeed(count === 1 ? first : second, undefined),
++                ),
++                Effect.asVoid,
++              ),
++            }),
++          ),
++        ),
++      ),
++    );
++    assert.equal(scans, 0);
++    yield* Deferred.succeed(ready, undefined);
++    yield* Deferred.await(first);
++    yield* TestClock.adjust("30 seconds");
++    yield* Deferred.await(second);
++    assert.equal(scans, 2);
++  }).pipe(Effect.scoped),
++);
++
++it.effect("loads a selected deferred thread through the history owner only once", () =>
++  Effect.gen(function* () {
++    const f = yield* fixture();
++    const id = threadId("deferred");
++    yield* f.seed(id);
++    yield* f.bind(id, "deferred");
++    f.setPendingShell(id);
++    f.setObservable(false);
++    assert.isFalse(yield* f.sessions.importPendingHistory(id));
++    assert.deepEqual(f.historyLoads, []);
++    f.setObservable(true);
++    assert.isTrue(yield* f.sessions.importPendingHistory(id));
++    assert.isFalse(yield* f.sessions.importPendingHistory(id));
++    assert.deepEqual(f.historyLoads, [
++      { threadId: id, workspaceRoot: "/local/fleet", observe: true },
++    ]);
++    assert.deepEqual(f.launched, []);
++  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
+diff --git a/apps/server/src/provider/AcpRegistrySessions.ts b/apps/server/src/provider/AcpRegistrySessions.ts
+index 69c1b207..4a688c86 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.ts
+@@ -17,6 +17,7 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Result from "effect/Result";
++import * as Schedule from "effect/Schedule";
+ import * as SqlClient from "effect/sql/SqlClient";
+ 
+ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+@@ -60,7 +61,12 @@ export class AcpRegistrySessions extends Context.Service<
+      */
+     readonly importSession: (
+       input: AcpRegistryImportSessionInput,
++      options?: { readonly deferHistory: boolean },
+     ) => Effect.Effect<AcpRegistryImportSessionResult, AcpRegistryOperationError>;
++    readonly reconcile: Effect.Effect<void>;
++    readonly importPendingHistory: (
++      threadId: ThreadId,
++    ) => Effect.Effect<boolean, AcpRegistryOperationError>;
+   }
+ >()("t3/provider/AcpRegistrySessions") {}
+ 
+@@ -146,6 +152,7 @@ const make = Effect.gen(function* () {
+ 
+   const importSession = Effect.fn("AcpRegistrySessions.importSession")(function* (
+     input: AcpRegistryImportSessionInput,
++    options?: { readonly deferHistory: boolean },
+   ) {
+     const { workspaceRoot } = yield* project(input.projectId);
+     const { instance } = yield* sessionManager(input.instanceId);
+@@ -164,6 +171,29 @@ const make = Effect.gen(function* () {
+       instanceId: input.instanceId,
+       sessionId: input.sessionId,
+     });
++    if (options?.deferHistory === true) {
++      const persisted = yield* sql<{ readonly thread_id: string }>`
++        SELECT thread_id FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}
++        UNION
++        SELECT provider.thread_id FROM orchestration_v2_projection_provider_threads AS provider
++        JOIN orchestration_v2_projection_threads AS thread ON thread.thread_id = provider.thread_id
++        WHERE provider.driver = ${instance.driverKind}
++          AND provider.provider_instance_id = ${input.instanceId}
++          AND json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') = ${input.sessionId}
++        LIMIT 1
++      `.pipe(
++        Effect.mapError(
++          (cause) =>
++            new AcpRegistryOperationError({
++              reason: "session_import_failed",
++              message: "Could not inspect external session ownership.",
++              cause,
++            }),
++        ),
++      );
++      if (persisted[0])
++        return { threadId: ThreadId.make(persisted[0].thread_id), imported: false } as const;
++    }
+     const owner = yield* findOwner({
+       driver: instance.driverKind,
+       instanceId: input.instanceId,
+@@ -258,6 +288,7 @@ const make = Effect.gen(function* () {
+         cause: launched.failure,
+       });
+     }
++    if (options?.deferHistory === true) return { threadId, imported: true } as const;
+     // The thread is usable without its history, so a failed read only logs.
+     yield* agentSessionImporter
+       .importNativeHistory({
+@@ -277,7 +308,164 @@ const make = Effect.gen(function* () {
+     return { threadId, imported: true } as const;
+   }, coordinator.withSessionMutation);
+ 
+-  return AcpRegistrySessions.of({ project, sessionManager, findOwner, importSession });
++  const importPendingHistory = Effect.fn("AcpRegistrySessions.importPendingHistory")(function* (
++    threadId: ThreadId,
++  ) {
++    const existing = yield* threadManagement.getThreadShell(threadId).pipe(
++      Effect.mapError(
++        (cause) =>
++          new AcpRegistryOperationError({
++            reason: "session_import_failed",
++            message: "Could not inspect external session history.",
++            cause,
++          }),
++      ),
++    );
++    if (
++      existing === null ||
++      !AgentSessionImporter.isNativeHistoryPending({
++        historyOrigin: existing.historyOrigin,
++        hasRun: existing.latestRunId !== null,
++      })
++    )
++      return false;
++    const instance = yield* providerInstances.getInstance(existing.providerInstanceId);
++    if (instance?.acpSessionManagement === undefined) return false;
++    const snapshot = yield* instance.snapshot.getSnapshot;
++    if (snapshot.nativeSessions?.canObserve !== true) return false;
++    const rows = yield* sql<{ readonly native_id: string | null }>`
++      SELECT json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
++      FROM orchestration_v2_projection_provider_threads
++      WHERE thread_id = ${threadId} AND provider_thread_id = ${existing.activeProviderThreadId}
++    `.pipe(
++      Effect.mapError(
++        (cause) =>
++          new AcpRegistryOperationError({
++            reason: "session_import_failed",
++            message: "Could not inspect external session identity.",
++            cause,
++          }),
++      ),
++    );
++    const nativeId = rows[0]?.native_id;
++    if (
++      nativeId == null ||
++      importedThreadId({
++        driver: instance.driverKind,
++        instanceId: instance.instanceId,
++        sessionId: nativeId,
++      }) !== threadId
++    )
++      return false;
++    const destination = yield* project(existing.projectId);
++    yield* agentSessionImporter
++      .importNativeHistory({
++        threadId,
++        workspaceRoot: destination.workspaceRoot,
++        observe: true,
++      })
++      .pipe(
++        Effect.mapError(
++          (cause) =>
++            new AcpRegistryOperationError({
++              reason: "session_import_failed",
++              message: "Could not import external session history.",
++              cause,
++            }),
++        ),
++      );
++    return true;
++  });
++
++  const reconcile = Effect.gen(function* () {
++    const instances = yield* providerInstances.listInstances;
++    yield* Effect.forEach(
++      instances,
++      (instance) =>
++        Effect.gen(function* () {
++          const manager = instance.acpSessionManagement;
++          if (!instance.enabled || manager?.autoImportProjectId === undefined) return;
++          const snapshot = yield* instance.snapshot.getSnapshot;
++          if (
++            snapshot.nativeSessions?.canObserve !== true ||
++            snapshot.nativeSessions.canList !== true
++          )
++            return;
++          const destination = yield* project(manager.autoImportProjectId);
++          if (destination.deletedAt !== null || destination.archivedAt != null) return;
++          const cursors = new Set<string>();
++          let cursor: string | undefined;
++          do {
++            const page = yield* manager.listSessions({
++              cwd: destination.workspaceRoot,
++              ...(cursor === undefined ? {} : { cursor }),
++            });
++            yield* Effect.forEach(
++              page.sessions,
++              (session) =>
++                importSession(
++                  {
++                    instanceId: instance.instanceId,
++                    projectId: destination.id,
++                    sessionId: session.sessionId,
++                    ...(session.title === null ? {} : { title: session.title }),
++                    ...(session.updatedAt === null ? {} : { updatedAt: session.updatedAt }),
++                  },
++                  { deferHistory: true },
++                ).pipe(
++                  Effect.catch((cause) =>
++                    Effect.logWarning("Could not discover external session", {
++                      instanceId: instance.instanceId,
++                      cause,
++                    }),
++                  ),
++                ),
++              { discard: true },
++            );
++            if (page.nextCursor === null) return;
++            if (cursors.has(page.nextCursor)) {
++              yield* Effect.logWarning("External session discovery repeated a page cursor", {
++                instanceId: instance.instanceId,
++              });
++              return;
++            }
++            cursors.add(page.nextCursor);
++            cursor = page.nextCursor;
++          } while (cursor !== undefined);
++        }).pipe(
++          Effect.catchCause((cause) =>
++            Effect.logWarning("External session discovery failed; preserving existing threads", {
++              instanceId: instance.instanceId,
++              cause,
++            }),
++          ),
++        ),
++      { concurrency: 4, discard: true },
++    );
++  }).pipe(Effect.withSpan("AcpRegistrySessions.reconcile"));
++
++  return AcpRegistrySessions.of({
++    project,
++    sessionManager,
++    findOwner,
++    importSession,
++    reconcile,
++    importPendingHistory,
++  });
+ });
+ 
+ export const layer = Layer.effect(AcpRegistrySessions, make);
++
++export const layerAutoImport = Layer.effectDiscard(
++  Effect.gen(function* () {
++    const sessions = yield* AcpRegistrySessions;
++    const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
++    yield* startup.awaitCommandReady.pipe(
++      Effect.andThen(sessions.reconcile.pipe(Effect.repeat(Schedule.spaced("30 seconds")))),
++      Effect.catchCause((cause) =>
++        Effect.logWarning("External session discovery stopped", { cause }),
++      ),
++      Effect.forkScoped,
++    );
++  }),
++);
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 47c4a4c9..b4ab2613 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -106,6 +106,7 @@ import * as GitManager from "./git/GitManager.ts";
+ import * as EnvironmentTheme from "./environmentTheme.ts";
+ import * as Keybindings from "./keybindings.ts";
+ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
++import * as AcpRegistrySessions from "./provider/AcpRegistrySessions.ts";
+ import * as ServerOwnership from "./serverOwnership.ts";
+ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
+ import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
+@@ -824,6 +825,7 @@ const layerCommandReadiness = HttpRouter.middleware(
+ );
+ 
+ const layerMakeRoutes = Layer.mergeAll(
++  AcpRegistrySessions.layerAutoImport,
+   Layer.mergeAll(
+     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
+       Layer.provide(AuthHttp.layer),
+@@ -856,6 +858,7 @@ const layerMakeRoutes = Layer.mergeAll(
+     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),
+   ),
+ ).pipe(
++  Layer.provide(AcpRegistrySessions.layer),
+   Layer.provide(
+     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
+   ),
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 77652402..4f361c3c 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -2283,18 +2283,23 @@ export const layerWsRpc = (
+           Stream.unwrap(
+             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+               Effect.andThen(
+-                providerSessionManager
+-                  .loadImportedThread(input.threadId, { onlyIfImported: true })
+-                  .pipe(
+-                    Effect.mapError(
+-                      (cause) =>
+-                        new OrchestrationV2GetThreadProjectionError({
+-                          threadId: input.threadId,
+-                          message: "Failed to load the existing conversation history",
+-                          cause,
++                acpRegistrySessions.importPendingHistory(input.threadId).pipe(
++                  Effect.flatMap((imported) =>
++                    imported
++                      ? Effect.void
++                      : providerSessionManager.loadImportedThread(input.threadId, {
++                          onlyIfImported: true,
+                         }),
+-                    ),
+                   ),
++                  Effect.mapError(
++                    (cause) =>
++                      new OrchestrationV2GetThreadProjectionError({
++                        threadId: input.threadId,
++                        message: "Failed to load the existing conversation history",
++                        cause,
++                      }),
++                  ),
++                ),
+               ),
+               Effect.andThen(subscribeOrchestrationV2Thread(input)),
+             ),
+@@ -3579,6 +3584,7 @@ export const WS_RPC_SERVER_OPTIONS = {
+ export const layer = Layer.unwrap(
+   Effect.gen(function* () {
+     const serverBrowser = yield* ServerBrowser.ServerBrowser;
++    const acpRegistrySessions = yield* AcpRegistrySessions.AcpRegistrySessions;
+     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
+     const npmRelease = yield* NpmRelease.NpmRelease;
+     const pullRequests = yield* PullRequestService.PullRequestService;
+@@ -3664,7 +3670,9 @@ export const layer = Layer.unwrap(
+               Layer.provideMerge(RpcSerialization.layerJson),
+               // Handler-context reporters see only request defects, not server-wide defects.
+               Layer.provide(DefectReporter.layer),
+-              Layer.provide(AcpRegistrySessions.layer),
++              Layer.provide(
++                Layer.succeed(AcpRegistrySessions.AcpRegistrySessions, acpRegistrySessions),
++              ),
+               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+               Layer.provide(ProviderMaintenanceRunner.layer),
+               Layer.provide(Layer.succeed(NpmRelease.NpmRelease, npmRelease)),
+diff --git a/packages/provider-acp-registry/src/server/driver.ts b/packages/provider-acp-registry/src/server/driver.ts
+index c2c21761..99cda923 100644
+--- a/packages/provider-acp-registry/src/server/driver.ts
++++ b/packages/provider-acp-registry/src/server/driver.ts
+@@ -1009,6 +1009,9 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
+       orchestrationAdapter,
+       textGeneration: makeUnsupportedTextGeneration(),
+       acpSessionManagement: {
++        ...(effectiveConfig.autoImportProjectId === undefined
++          ? {}
++          : { autoImportProjectId: effectiveConfig.autoImportProjectId }),
+         listSessions: ({ cwd, cursor }) =>
+           provideAcpManagementServices(
+             listAcpRegistrySessions({
+diff --git a/packages/provider-acp-registry/src/settings.ts b/packages/provider-acp-registry/src/settings.ts
+index aba9f5f9..de839fdd 100644
+--- a/packages/provider-acp-registry/src/settings.ts
++++ b/packages/provider-acp-registry/src/settings.ts
+@@ -1,4 +1,9 @@
+-import { CustomModelSetting, TrimmedString, makeProviderSettingsSchema } from "@t3tools/contracts";
++import {
++  CustomModelSetting,
++  ProjectId,
++  TrimmedString,
++  makeProviderSettingsSchema,
++} from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
+ import * as Schema from "effect/Schema";
+ 
+@@ -45,6 +50,14 @@ export const AcpRegistrySettings = makeProviderSettingsSchema(
+       Schema.withDecodingDefault(Effect.succeed([])),
+       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+     ),
++    autoImportProjectId: Schema.optionalKey(ProjectId).pipe(
++      Schema.annotateKey({
++        title: "Automatic session destination",
++        description:
++          "Project ID for automatically showing existing external sessions. History loads when a conversation is opened.",
++        providerSettingsForm: { hidden: true },
++      }),
++    ),
+     authMethodId: TrimmedString.pipe(
+       Schema.withDecodingDefault(Effect.succeed("")),
+       Schema.annotateKey({
+diff --git a/packages/provider-core/src/server/driver.ts b/packages/provider-core/src/server/driver.ts
+index c0474da3..9003c01d 100644
+--- a/packages/provider-core/src/server/driver.ts
++++ b/packages/provider-core/src/server/driver.ts
+@@ -6,6 +6,7 @@ import type {
+   AcpRegistryOperationError,
+   AcpRegistrySetProviderInput,
+   ProviderDriverKind,
++  ProjectId,
+   ResolvedProviderInstanceEnvironment,
+   ProviderInstanceId,
+   ServerProvider,
+@@ -65,6 +66,7 @@ export interface ProviderInstance {
+   readonly textGeneration: ProviderTextGeneration;
+   readonly auth?: ProviderAuthController;
+   readonly acpSessionManagement?: {
++    readonly autoImportProjectId?: ProjectId;
+     readonly listSessions: (input: {
+       readonly cwd: string;
+       readonly cursor?: string;
+-- 
+2.47.3
+
