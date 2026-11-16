@@ -265,7 +265,8 @@ def test_native_questions_use_user_elicitation_not_permission_autoapproval():
         conn = client()
 
         async def create_elicitation(message, mode, **kwargs):
-            assert kwargs["session_id"] == SID
+            assert isinstance(mode, s.ElicitationFormSessionMode)
+            assert mode.session_id == SID
             return s.AcceptElicitationResponse(content={"answer_0": "Option A"})
 
         conn.create_elicitation = create_elicitation
@@ -792,8 +793,269 @@ def test_selected_external_session_control_requires_the_owners_explicit_decision
         poll = asyncio.create_task(agent.poll(SID, agent.sessions[SID]))
         await offered.wait()
         assert hq.actions == []
+        assert poll.done()
         decision.set()
         await poll
+        await asyncio.wait_for(hq.sent.wait(), 1)
         assert hq.actions == [(SID, "respond", {"revision": "r1", "response": {
             "request_id": "external-permission", "behavior": "allow", "updated_input": {"command": "example"}}})]
+    asyncio.run(check())
+
+
+def test_external_session_v1_metadata_is_explicit_and_observed_state_is_not_a_local_turn():
+    async def check():
+        hq = mock_hq(row(status="running"), row(status="running"), row(status="idle"),
+                     row(status="waiting"), row(native_control={"request_id": "permission"}))
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        initialized = await agent.initialize(2, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        assert initialized.protocol_version == 1
+        assert initialized.field_meta == {"t3.codes/externalSession": {"version": 1}}
+        await agent.load_session("/local/fleet", SID)
+        attached = agent.sessions[SID]
+        await agent.poll(SID, attached)
+        await agent.poll(SID, attached)
+        await agent.poll(SID, attached)
+        # Test state independently of the user's permission dialog.
+        await agent.emit_state(SID, await hq.detail(SID), attached)
+        states = [update["_meta"]["t3.codes/externalSessionState"] for _, update in conn.updates
+                  if update["sessionUpdate"] == "session_info_update"]
+        assert states == [{"version": 1, "state": state} for state in
+                          ["running", "idle", "unavailable", "requires_action"]]
+        assert attached.pending is None
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+def test_old_clients_receive_no_external_state_extension():
+    async def check():
+        agent = FleetAgent(mock_hq(row(status="running")), observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1)
+        await agent.load_session("/local/fleet", SID)
+        assert all(update["sessionUpdate"] != "session_info_update" for _, update in conn.updates)
+    asyncio.run(check())
+
+
+def test_observation_failure_emits_unavailable_then_actual_recovery_state():
+    async def check():
+        hq = mock_hq(row(status="running"))
+        agent = FleetAgent(hq, observe=False, sleep=no_wait)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        await agent.load_session("/local/fleet", SID)
+        attached = agent.sessions[SID]
+        count = 0
+        async def detail(_):
+            nonlocal count
+            count += 1
+            if count == 1:
+                raise RequestError(-32000, "offline")
+            agent.sessions.pop(SID)
+            return row(status="idle")
+        hq.detail = detail
+        await agent.watch(SID, attached)
+        states = [update["_meta"]["t3.codes/externalSessionState"]["state"]
+                  for _, update in conn.updates if update["sessionUpdate"] == "session_info_update"]
+        assert states == ["running", "unavailable", "idle"]
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+def test_codex_user_echo_correlates_only_by_owner_request_id_not_matching_text():
+    async def check():
+        unrelated = row(provider="codex", status="running", messages=[*row()["messages"],
+            {"id": "other-user", "role": "user", "text": "new task", "client_id": "another-request"},
+            {"id": "other-answer", "role": "assistant", "text": "Unrelated answer"}])
+        complete = row(provider="codex", messages=[*unrelated["messages"],
+            {"id": "native-user", "role": "user", "text": "normalized new task", "client_id": "exact-request"},
+            {"id": "native-answer", "role": "assistant", "text": "Task complete"}])
+        hq = mock_hq(row(provider="codex"), row(provider="codex"), unrelated, complete, complete)
+        original_action = hq.action
+        async def action(*args, **kwargs):
+            await original_action(*args, **kwargs)
+            return {"accepted": True, "request_id": "exact-request"}
+        hq.action = action
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        await agent.load_session("/local/fleet", SID)
+        task = asyncio.create_task(agent.prompt(SID, [s.TextContentBlock(text="new task")],
+                                               **{"t3.codes/messageId": "app-user"}))
+        await hq.sent.wait()
+        attached = agent.sessions[SID]
+        await agent.poll(SID, attached)
+        assert attached.own_user_key is None and not task.done()
+        await agent.poll(SID, attached)
+        await agent.poll(SID, attached)
+        assert (await task).stop_reason == "end_turn"
+        echoes = [update for _, update in conn.updates if update["sessionUpdate"] == "user_message_chunk"]
+        assert [update["messageId"] for update in echoes] == ["other-user", "native-user"]
+        assert "_meta" not in echoes[0]
+        assert echoes[1]["_meta"] == {"t3.codes/messageId": "app-user"}
+    asyncio.run(check())
+
+
+def test_new_external_work_can_be_stopped_after_prior_stop_was_confirmed_idle():
+    async def check():
+        hq = mock_hq(row(status="running"))
+        agent = FleetAgent(hq, observe=False)
+        agent.on_connect(client())
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        await agent.load_session("/local/fleet", SID)
+        attached = agent.sessions[SID]
+        await agent.cancel(SID)
+        await agent.cancel(SID)
+        assert len(hq.actions) == 1
+        await agent.emit_state(SID, row(status="idle"), attached)
+        await agent.cancel(SID)
+        assert len(hq.actions) == 1
+        await agent.emit_state(SID, row(status="running"), attached)
+        await agent.cancel(SID)
+        assert len(hq.actions) == 2
+        assert all(action == "interrupt" for _, action, __ in hq.actions)
+    asyncio.run(check())
+
+
+def test_native_claude_receipt_source_id_correlates_without_rewriting_native_identity():
+    async def check():
+        complete = row(messages=[*row()["messages"],
+            {"id": "native-user", "role": "user", "text": "owner-normalized input"},
+            {"id": "native-answer", "role": "assistant", "text": "Task complete"}])
+        hq = mock_hq(row(), row(), complete, complete)
+        original_action = hq.action
+        async def action(*args, **kwargs):
+            await original_action(*args, **kwargs)
+            return {"accepted": True, "source_message_id": "native-user"}
+        hq.action = action
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        await agent.load_session("/local/fleet", SID)
+        task = asyncio.create_task(agent.prompt(SID, [s.TextContentBlock(text="new task")],
+                                               **{"t3.codes/messageId": "app-user"}))
+        await hq.sent.wait()
+        await agent.poll(SID, agent.sessions[SID])
+        await agent.poll(SID, agent.sessions[SID])
+        assert (await task).stop_reason == "end_turn"
+        echo = next(update for _, update in conn.updates if update.get("messageId") == "native-user")
+        assert echo["_meta"] == {"t3.codes/messageId": "app-user"}
+        assert echo["content"]["text"] == "owner-normalized input"
+    asyncio.run(check())
+
+
+def test_bounded_source_history_is_explicit_and_warned_once_per_attachment():
+    async def check():
+        limited = row(history_truncated=True)
+        hq = mock_hq(limited, limited)
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.load_session("/local/fleet", SID)
+        await agent.poll(SID, agent.sessions[SID])
+        notices = [update for _, update in conn.updates if update["sessionUpdate"] == "notice"]
+        assert len(notices) == 1
+        assert notices[0]["title"] == "Recent history only"
+        assert "Earlier messages are not included" in notices[0]["description"]
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('answers,expected', [
+    ({'answer_0': 'Option A'}, 'Option A'),
+    ({'answer_0__other': 'Custom answer'}, 'Custom answer'),
+    ({'answer_0': ['Option A', 'Option B'], 'answer_0__other': 'Custom answer'}, 'Option A, Option B, Custom answer'),
+])
+def test_native_question_choices_and_other_use_supported_form_schema(answers, expected):
+    async def check():
+        hq = mock_hq()
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        multi = isinstance(answers.get('answer_0'), list)
+        async def choose(message, mode, **kwargs):
+            schema = mode.requested_schema.model_dump(by_alias=True, exclude_none=True)
+            assert schema['required'] == []
+            value = schema['properties']['answer_0']
+            options = value['items']['anyOf'] if multi else value['oneOf']
+            assert [option['const'] for option in options] == ['Option A', 'Option B'] + (
+                ['__cc_fleet_other__'] if multi else [])
+            assert options[0]['description'] == 'First choice'
+            assert schema['properties']['answer_0__other']['type'] == 'string'
+            return s.AcceptElicitationResponse(content=answers)
+        conn.create_elicitation = choose
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({'elicitation': {'form': {}}}))
+        control = {'request_id': 'question', 'tool_name': 'AskUserQuestion', 'input': {'questions': [
+            {'question': 'Pick a value', 'multiSelect': multi,
+             'options': [{'label': 'Option A', 'description': 'First choice'}, {'label': 'Option B'}]}]}}
+        await agent.handle_control(SID, row(native_control=control), bridge['Attached']())
+        assert hq.actions[0][2]['response']['updated_input']['answers'] == {'Pick a value': expected}
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('answers', [{'answer_0': 'not-offered'}, {'answer_0': True},
+                                      {'answer_0': 'A', 'answer_0__other': 'ambiguous'}, {}])
+def test_invalid_native_choice_is_rejected_without_answering_the_owner(answers):
+    async def check():
+        hq = mock_hq()
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        async def choose(*args, **kwargs):
+            return s.AcceptElicitationResponse(content=answers)
+        conn.create_elicitation = choose
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({'elicitation': {'form': {}}}))
+        control = {'request_id': 'question', 'tool_name': 'AskUserQuestion', 'input': {'questions': [
+            {'question': 'Pick', 'options': [{'label': 'A'}]}]}}
+        attached = bridge['Attached']()
+        await agent.handle_control(SID, row(native_control=control), attached)
+        assert hq.actions == []
+        assert not attached.controls
+        assert conn.updates[-1][1]['title'] == 'Answer needs correction'
+        async def correct(*args, **kwargs):
+            return s.AcceptElicitationResponse(content={'answer_0': 'A'})
+        conn.create_elicitation = correct
+        await agent.handle_control(SID, row(native_control=control), attached)
+        assert len(hq.actions) == 1
+        assert hq.actions[0][2]['response']['updated_input']['answers'] == {'Pick': 'A'}
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('labels,selected,other,expected', [
+    (['A'], ['__cc_fleet_other__'], 'custom', 'custom'),
+    (['__cc_fleet_other__'], ['__cc_fleet_other__', '__cc_fleet_other___'], 'custom', '__cc_fleet_other__, custom'),
+    (['A'], ['__cc_fleet_other__'], '', None),
+])
+def test_multi_select_other_is_explicit_and_cannot_collide_with_native_options(labels, selected, other, expected):
+    async def check():
+        hq = mock_hq()
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        async def choose(message, mode, **kwargs):
+            form = mode.requested_schema.model_dump(by_alias=True, exclude_none=True)
+            options = form['properties']['answer_0']['items']['anyOf']
+            assert len({option['const'] for option in options}) == len(labels) + 1
+            assert options[-1]['const'] not in labels
+            return s.AcceptElicitationResponse(content={'answer_0': selected, 'answer_0__other': other})
+        conn.create_elicitation = choose
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({'elicitation': {'form': {}}}))
+        control = {'request_id': 'question', 'tool_name': 'AskUserQuestion', 'input': {'questions': [
+            {'question': 'Pick', 'multiSelect': True, 'options': [{'label': label} for label in labels]}]}}
+        attached = bridge['Attached']()
+        await agent.handle_control(SID, row(native_control=control), attached)
+        if expected is None:
+            assert hq.actions == [] and not attached.controls
+        else:
+            assert hq.actions[0][2]['response']['updated_input']['answers'] == {'Pick': expected}
     asyncio.run(check())

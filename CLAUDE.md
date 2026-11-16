@@ -4,9 +4,11 @@
 provider. HQ remains the only session/action owner; MCP supplies compact discovery,
 and selected-session detail/actions use the private HQ origin. Never spawn/resume a
 replacement Claude process, map remote workdirs onto the local T3 workspace, retry
-an uncertain write, or guess native/tmux equivalence. Keep T3 on its official
-release; do not add a T3 fork to work around its import/history limitations. Read README "Existing fleet
-sessions in T3 Code" and `docs/devlog/claude_20261115-t3-fleet-acp.md` on demand.
+an uncertain write, or guess native/tmux equivalence. T3's explicit external-session capability gates passive attachment and native controls.
+The necessary patch against a pinned official nightly is maintained in `patches/t3/`
+and installed through the existing service updater; never create a second T3 deployment.
+Read README "Existing fleet sessions in T3 Code", `patches/t3/README.md`, and
+`docs/testing/fleet-e2e-matrix.md` on demand.
 
 `cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
 dashboard listener. `scripts/account_mcp_relay.py` owns transport forwarding only;

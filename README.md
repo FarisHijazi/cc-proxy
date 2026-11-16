@@ -184,7 +184,7 @@ Use a stable installed copy of the script. In T3 Code's provider settings choose
 **Local ACP command**, set the executable to `uv`, and add the arguments above one
 per row. Select a local project for the fleet conversation views, choose **List
 sessions**, then **Import** the desired row. T3's import binds its native session
-ID; the bridge does not start or resume another Claude process. New blank threads
+ID; the bridge does not start or resume another Claude or Codex process. New blank threads
 cannot launch fleet agents. Rows show their host and native/tmux transport; two
 provenance paths are kept separate instead of guessing that they are identical.
 
@@ -193,7 +193,7 @@ T3's local project file browser and git controls still belong to the selected T3
 project; they do not browse or modify that remote workdir. The bridge supplies
 updates from the selected session's existing HQ history. Unidentified token
 previews are excluded; large or older history remains bounded by the existing HQ
-reader. Display and persistence depend on the T3 client's ACP support.
+reader. A recent-history notice appears when the owner reports truncation.
 
 Discovery uses the compact, authenticated MCP list. History and actions use only
 the configured private HQ origin. An existing HQ token is sent when configured;
@@ -206,19 +206,22 @@ and questions retain their original request IDs and revisions. Supported termina
 choices use a question form; complex terminal menus and computer-use dialogs must
 be answered in HQ or the original terminal. Stale answers are rejected. A lost
 action response reports uncertain delivery and is never retried automatically.
-During a T3-initiated turn, explicit Stop targets the attached session;
-disconnecting does not stop it.
+Explicit Stop targets the attached original session, including work started outside
+T3. It waits for observed idle; disconnecting only detaches the observer. Native
+controls require an explicit decision even when T3 uses a permissive local mode.
 
-This uses official T3 Code 0.1.8, with no T3 patch to maintain. Its native import
-selects the existing session; the first T3 prompt activates it. Prior history and
-updates from work started outside T3 are not displayed or persisted by that
-client, and Stop requires a T3 turn. Use Claude.ai's fleet MCP or the existing HQ
-view for those operations. Deployment details are in
-`docs/devlog/claude_20261115-t3-fleet-acp.md`.
-Newer official builds containing the [upstream native-history import fix](https://github.com/pingdotgg/t3code/pull/22155)
-can address initial history without a fork; that change does not cover output
-produced outside a T3 turn. The deployed stable version is unchanged.
-See T3's [local command and native session guide](https://github.com/pingdotgg/t3code/blob/v0.1.8/docs/user/providers-acp.md).
+The deployed T3 build uses an official nightly with the narrow, versioned
+external-session patch in [`patches/t3/`](patches/t3/README.md). Upstream supplies
+initial history import; the patch adds passive observation, stable native message
+identity, external Stop, and native requests already pending before attachment.
+The bridge keeps standard ACPv1 synchronous prompt completion. These additions
+require explicit client/provider opt-in; older T3 clients can continue a session
+but do not provide the full external-session experience.
+
+The patch's pinned base, build/update procedure and upgrade considerations are in
+its README. Actual live evidence and remaining limits are kept separately in the
+[fleet acceptance matrix](docs/testing/fleet-e2e-matrix.md). Text prompts are
+supported; image/file input and provider/model changes are not fleet operations.
 
 ### Fleet MCP for Claude.ai
 

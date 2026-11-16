@@ -1,0 +1,288 @@
+From bbcfa1652bf4edcf68d2c72cb1c4e2e521d97456 Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Mon, 16 Nov 2026 14:34:24 +0000
+Subject: [PATCH] fix(acp): wait for persisted history before first snapshot
+
+---
+ .../ProviderSessionManager.test.ts            | 60 ++++++++++++++++---
+ .../ProviderSessionManager.ts                 | 58 ++++++++++++++----
+ apps/server/src/ws.ts                         | 12 ++--
+ packages/provider-acp/src/server/adapter.ts   | 20 +++++++
+ .../src/server/ProviderAdapter.ts             |  1 +
+ 5 files changed, 127 insertions(+), 24 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+index 4bdef8a6..617548c8 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+@@ -4,6 +4,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { assert, it } from "@effect/vitest";
+ import { AgentScope } from "@t3tools/shared/AgentScope";
+ import {
++  MessageId,
+   EnvironmentId,
+   type ModelSelection,
+   type OrchestrationV2AppThread,
+@@ -446,6 +447,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
+   state: Ref.Ref<TestProviderRuntimeState>,
+   options: {
+     readonly failEventStream?: boolean;
++    readonly canObserve?: boolean;
+     readonly normalizeThreadLoadModelSelection?: (selection: ModelSelection) => ModelSelection;
+     readonly capabilities?: OrchestrationV2ProviderCapabilities;
+     readonly extensionStatuses?: OrchestrationV2ProviderSession["extensionStatuses"];
+@@ -573,10 +575,42 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
+               }),
+           ensureThread: () => unimplemented("ensureThread unused in test"),
+           resumeThread: (threadInput) =>
+-            Ref.update(state, (current) => ({
+-              ...current,
+-              resumeCount: current.resumeCount + 1,
+-            })).pipe(Effect.as(threadInput.providerThread)),
++            Effect.gen(function* () {
++              yield* Ref.update(state, (current) => ({
++                ...current,
++                resumeCount: current.resumeCount + 1,
++              }));
++              if (options.canObserve === true) {
++                const threadId = threadInput.providerThread.appThreadId!;
++                yield* Queue.offerAll(events, [
++                  ...Array.from({ length: 32 }, (_, index) => ({
++                    type: "message.updated" as const,
++                    driver: CODEX_DRIVER,
++                    message: {
++                      createdBy: "agent" as const,
++                      creationSource: "provider" as const,
++                      id: MessageId.make(`native-history-${index}`),
++                      threadId,
++                      runId: null,
++                      nodeId: null,
++                      role: "assistant" as const,
++                      text: `Existing message ${index}`,
++                      attachments: [],
++                      streaming: false,
++                      createdAt: now,
++                      updatedAt: now,
++                    },
++                  })),
++                  {
++                    type: "provider_thread.updated",
++                    driver: CODEX_DRIVER,
++                    providerThread: threadInput.providerThread,
++                    historyLoaded: true,
++                  },
++                ]);
++              }
++              return threadInput.providerThread;
++            }),
+           startTurn: () => options.startTurn ?? Effect.void,
+           steerTurn: () => Effect.void,
+           interruptTurn: () =>
+@@ -670,6 +704,7 @@ function layerTest(input: {
+   const layerRegistry = Layer.unwrap(
+     makeProviderAdapter(input.state, {
+       failEventStream: input.failEventStream ?? false,
++      ...(input.canObserve === undefined ? {} : { canObserve: input.canObserve }),
+       ...(input.normalizeThreadLoadModelSelection === undefined
+         ? {}
+         : { normalizeThreadLoadModelSelection: input.normalizeThreadLoadModelSelection }),
+@@ -4311,10 +4346,11 @@ it.effect.each(["manual_shutdown", "server_shutdown"] as const)(
+     }),
+ );
+ 
+-it.effect.each([true, false, undefined])(
++it.effect.each([true, false, undefined, "failed"] as const)(
+   "ProviderSessionManagerV2 loads imported history and gates passive reopen on capability %s",
+-  (canObserve) =>
++  (mode) =>
+     Effect.gen(function* () {
++      const canObserve = mode === "failed" ? true : mode;
+       const state = yield* Ref.make(emptyState);
+       const openedIdentityVersions = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
+       yield* Effect.gen(function* () {
+@@ -4354,6 +4390,15 @@ it.effect.each([true, false, undefined])(
+           ],
+         });
+ 
++        if (mode === "failed") {
++          const loaded = yield* manager.loadImportedThread(threadId).pipe(Effect.exit);
++          assert.isTrue(Exit.isFailure(loaded));
++          const projection = yield* projections.getThreadProjection(threadId);
++          assert.equal(projection.messages.length, 0);
++          assert.equal(projection.runs.length, 0);
++          return;
++        }
++
+         yield* Effect.all(
+           [manager.loadImportedThread(threadId), manager.loadImportedThread(threadId)],
+           { concurrency: 2 },
+@@ -4366,7 +4411,7 @@ it.effect.each([true, false, undefined])(
+         assert.deepEqual(yield* Ref.get(openedIdentityVersions), [2]);
+         assert.isNotNull(projection.providerThreads[0]?.providerSessionId);
+         assert.equal(projection.runs.length, 0);
+-        assert.equal(projection.messages.length, 0);
++        assert.equal(projection.messages.length, canObserve === true ? 32 : 0);
+         const loadedSessionId = projection.providerThreads[0]?.providerSessionId;
+         assert.isDefined(loadedSessionId);
+         assert.isNotNull(loadedSessionId);
+@@ -4390,6 +4435,7 @@ it.effect.each([true, false, undefined])(
+           layerTest({
+             state,
+             idleTimeoutMs: 60_000,
++            failEventStream: mode === "failed",
+             ...(canObserve === undefined ? {} : { canObserve }),
+             startTurn: Effect.die("Import must never start a turn"),
+             beforeOpen: (input) =>
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index 259da171..b68e2c25 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -3018,12 +3018,10 @@ export const layerWithOptions = (
+                   return yield* new ProviderThreadLoadError({ threadId });
+                 }
+                 const modelSelection = thread.modelSelection;
+-                if (options?.onlyIfImported === true) {
+-                  const metadata = yield* (
+-                    registry.getMetadata?.(modelSelection.instanceId) ?? Effect.undefined
+-                  );
+-                  if (metadata?.canObserve !== true) return;
+-                }
++                const metadata = yield* (
++                  registry.getMetadata?.(modelSelection.instanceId) ?? Effect.undefined
++                );
++                if (options?.onlyIfImported === true && metadata?.canObserve !== true) return;
+                 const adapter = yield* registry.get(modelSelection.instanceId);
+                 const capabilities = yield* adapter.getCapabilities();
+                 const providerSessionId =
+@@ -3054,12 +3052,48 @@ export const layerWithOptions = (
+                       }),
+                   ...(existingSession === undefined ? {} : { resumeFromSession: existingSession }),
+                 });
+-                const loaded = yield* runtime.resumeThread({
+-                  threadId,
+-                  providerThread: { ...providerThread, providerSessionId },
+-                  modelSelection,
+-                  runtimePolicy: resolvedPolicy,
+-                });
++                const entry = (yield* Ref.get(sessions)).get(sessionKey(providerSessionId));
++                const historySubscription =
++                  metadata?.canObserve === true &&
++                  !entry?.loadedProviderThreadKeyByThread.has(threadId)
++                    ? yield* (
++                        runtime.subscribeEvents ??
++                          Effect.fail(new ProviderThreadLoadError({ threadId }))
++                      )
++                    : undefined;
++                const loaded = yield* runtime
++                  .resumeThread({
++                    threadId,
++                    providerThread: { ...providerThread, providerSessionId },
++                    modelSelection,
++                    runtimePolicy: resolvedPolicy,
++                  })
++                  .pipe(
++                    Effect.tap((loaded) =>
++                      historySubscription === undefined
++                        ? Effect.void
++                        : historySubscription.events.pipe(
++                            Stream.filter(
++                              (event) =>
++                                event.type === "provider_thread.updated" &&
++                                event.historyLoaded === true &&
++                                event.providerThread.id === loaded.id &&
++                                event.providerThread.appThreadId === threadId,
++                            ),
++                            Stream.runHead,
++                            Effect.flatMap(
++                              Option.match({
++                                onNone: () =>
++                                  Effect.fail(new ProviderThreadLoadError({ threadId })),
++                                onSome: () => Effect.void,
++                              }),
++                            ),
++                            Effect.timeout("30 seconds"),
++                          ),
++                    ),
++                    Effect.ensuring(historySubscription?.close ?? Effect.void),
++                  );
++                if (metadata?.canObserve === true) return;
+                 yield* providerEventIngestor.ingestNormalized({
+                   providerSessionId,
+                   providerInstanceId: runtime.instanceId,
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 91527f4a..77652402 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -2286,12 +2286,14 @@ export const layerWsRpc = (
+                 providerSessionManager
+                   .loadImportedThread(input.threadId, { onlyIfImported: true })
+                   .pipe(
+-                    Effect.catchCause(() =>
+-                      Effect.logWarning("orchestration-v2.imported-thread.activation-failed", {
+-                        threadId: input.threadId,
+-                      }),
++                    Effect.mapError(
++                      (cause) =>
++                        new OrchestrationV2GetThreadProjectionError({
++                          threadId: input.threadId,
++                          message: "Failed to load the existing conversation history",
++                          cause,
++                        }),
+                     ),
+-                    Effect.forkScoped,
+                   ),
+               ),
+               Effect.andThen(subscribeOrchestrationV2Thread(input)),
+diff --git a/packages/provider-acp/src/server/adapter.ts b/packages/provider-acp/src/server/adapter.ts
+index 1c983154..7d70e89d 100644
+--- a/packages/provider-acp/src/server/adapter.ts
++++ b/packages/provider-acp/src/server/adapter.ts
+@@ -9598,6 +9598,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                       cause,
+                     }),
+                 ),
++                Effect.tap((providerThread) =>
++                  externallyManagedSession
++                    ? emitProviderEvent({
++                        type: "provider_thread.updated",
++                        driver,
++                        providerThread,
++                        historyLoaded: true,
++                      })
++                    : Effect.void,
++                ),
+               ),
+           ),
+           resumeThread: Effect.fn("AcpAdapterV2.resumeThread")(
+@@ -9673,6 +9683,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                       cause,
+                     }),
+                 ),
++                Effect.tap((providerThread) =>
++                  externallyManagedSession
++                    ? emitProviderEvent({
++                        type: "provider_thread.updated",
++                        driver,
++                        providerThread,
++                        historyLoaded: true,
++                      })
++                    : Effect.void,
++                ),
+               ),
+           ),
+           startTurn,
+diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
+index 6e9fd2ea..a726529c 100644
+--- a/packages/provider-core/src/server/ProviderAdapter.ts
++++ b/packages/provider-core/src/server/ProviderAdapter.ts
+@@ -102,6 +102,7 @@ export const ProviderAdapterV2Event = Schema.Union([
+     /** Persist idle background snapshots before a run subscriber exists. */
+     sessionScoped: Schema.optional(Schema.Boolean),
+     retainedNativeTurnIds: Schema.optional(Schema.Array(Schema.String)),
++    historyLoaded: Schema.optional(Schema.Literal(true)),
+   }),
+   Schema.Struct({
+     type: Schema.Literal("provider_turn.updated"),
+-- 
+2.47.3
+
