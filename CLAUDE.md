@@ -260,7 +260,7 @@ Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `pytho
 router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
 `Dockerfile` and `compose.yaml` run `--serve`. See `docs/devlog/claude_20261027-cc-proxy-packaging.md` (plain path).
 Run tests as CI does with an empty `HOME`: tests that read the machine's Codex login pass locally and fail in CI.
-Use atomic `try_update` (available since Rust 1.95); current stable CI rejects its deprecated `fetch_update` alias.
+The Nix-pinned compiler still needs atomic `fetch_update`; keep its deprecation allowance scoped to `next_monotonic_nonzero` so both Nix and current stable CI compile.
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
