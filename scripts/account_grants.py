@@ -397,8 +397,11 @@ class PostgresGrants:
                 raise GrantsUnavailable(f"shared login for {account} is being renewed elsewhere; try again")
             self.sleep(LEASE_POLL_S)
 
-    def seed(self, account, credentials, replace=False):
-        """Store a login as the account's newest generation; returns that generation."""
+    def seed(self, account, credentials, replace=False, newer_only=False):
+        """Store a login as the account's newest generation; returns that generation.
+
+        With newer_only, a login that expires no later than the stored one is not stored (returns None).
+        """
         login = self.parse(credentials)
         if not login.refresh:
             raise GrantsUnavailable("a shared login needs a refresh token")
@@ -416,10 +419,12 @@ class PostgresGrants:
             " ON CONFLICT (namespace, account) DO UPDATE SET ciphertext = excluded.ciphertext,"
             " generation = excluded.generation, expires_at = excluded.expires_at,"
             " lease_holder = NULL, lease_until = NULL, state = 'ok'"
-            " WHERE ccp_grants.generation = %s",
-            (self.namespace, account, sealed, generation, login.expires / 1000, generation - 1),
+            " WHERE ccp_grants.generation = %s AND (NOT %s OR ccp_grants.expires_at < excluded.expires_at)",
+            (self.namespace, account, sealed, generation, login.expires / 1000, generation - 1, newer_only),
         )])
         if not written:
+            if newer_only:
+                return None
             raise GrantsUnavailable(f"{account} changed while seeding; run it again")
         return generation
 
