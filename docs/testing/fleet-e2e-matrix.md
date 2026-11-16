@@ -144,9 +144,26 @@ it was not delivered or silently retried. Only that exact owned test draft was
 cleared before the separately identified successful marker. The later Stop left
 the canonical prompt empty. Real user drafts remain protected.
 
-The native command/subscription tests above are distinct from browser-composer
-testing. Public browser authentication, history loading and passive updates have
-passed; the final browser-composer send/reply check is still pending.
+The final **actual public Chrome composer** check also passed: one prompt produced
+`T3_BROWSER_OK_20261116_A`. Reload retained exactly one visible user message and
+one exact assistant reply. The session ended idle, with the original Dev Claude
+PID 3528213/birth 18791571. Evidence: `t3-browser-proof-20261116.json` on Dev and
+`t3-browser-reply-20261116.ax.txt` in the Mac evidence directory. The screenshot
+capture for this final reply was blank, so it is not counted as visual proof;
+the live UI accessibility state and independent native/T3 projections were checked.
+The earlier public history screenshots remain valid.
+
+The public browser test exposed an existing ingress failure: the shared tunnel's
+second connector in CT 108 stayed connected to Cloudflare while its LAN forwarding
+path to ftower timed out. ftower selected Tailscale for return traffic to that CT.
+Only the unusable connector was stopped and placed in an opt-in Compose `standby`
+profile in the ingress source repository. The existing ftower connector continues
+serving the same tunnel; public Authentik gates remain intact. No host network,
+firewall, DNS, or other service was changed to work around it.
+
+The implementation at cc-proxy commit `5fe1ace` passed both Full checks and Fleet
+MCP/ACP jobs and the Nix flake build. The Nix-pinned compiler requires `fetch_update`,
+so its deprecation allowance is scoped to the existing atomic sequence helper.
 
 ## Existing real evidence
 
