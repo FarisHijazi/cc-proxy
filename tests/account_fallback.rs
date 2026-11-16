@@ -809,6 +809,24 @@ async fn counts_neither_cool_down_messages_nor_move_thread_deltas() {
 
 #[tokio::test]
 async fn custom_tier_discovers_a_cold_codex_destination_before_routing() {
+    if std::env::var_os("CCP_TEST_COLD_CATALOG_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "custom_tier_discovers_a_cold_codex_destination_before_routing",
+                "--nocapture",
+            ])
+            .env("CCP_TEST_COLD_CATALOG_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated catalog test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("auth.json"),
