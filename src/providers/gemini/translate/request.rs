@@ -116,7 +116,12 @@ pub fn translate_request_with(
     }
 
     for message in &req.messages {
-        push_message(&mut messages, &message.role, &message.content, native_reasoning);
+        push_message(
+            &mut messages,
+            &message.role,
+            &message.content,
+            native_reasoning,
+        );
     }
 
     Ok(GeminiChatRequest {
@@ -480,7 +485,12 @@ mod tests {
         }];
         let out = translate_request_with(&request(messages, serde_json::Map::new()), "local", true)
             .expect("translate");
-        let GeminiMessage::Assistant { content, reasoning_content, .. } = &out.messages[0] else {
+        let GeminiMessage::Assistant {
+            content,
+            reasoning_content,
+            ..
+        } = &out.messages[0]
+        else {
             panic!("expected assistant message");
         };
         assert_eq!(content.as_deref(), Some("answer"));
