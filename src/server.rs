@@ -1,5 +1,5 @@
 use crate::{
-    anthropic::json_error,
+    anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     inbound_auth::{InboundAuth, require_auth},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
 /// A dashboard-forced model for this session, set only by `scripts/account_inject.py`
 /// (which strips any client copy) and removed here before logging or relaying.
 const SESSION_MODEL_HEADER: &str = "x-claude-codex-session-model";
@@ -207,9 +207,12 @@ pub async fn serve_listener(
     );
     warn_if_exposed_without_auth(&local_addr.ip().to_string());
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -298,6 +301,7 @@ pub fn app_with_features(
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/monitor", get(handler_monitor))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -368,6 +372,40 @@ struct AppState {
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
 }
 
+async fn handler_monitor(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> Response {
+    let Some(axum::Extension(axum::extract::ConnectInfo(peer))) = peer else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    };
+    if !peer.ip().to_canonical().is_loopback() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    }
+    match &state.monitor {
+        Some(monitor) => (
+            [(http::header::CACHE_CONTROL, "no-store")],
+            Json(crate::monitor::snapshot::MonitorResponse::from(
+                monitor.snapshot(),
+            )),
+        )
+            .into_response(),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Monitor collection is disabled",
+        ),
+    }
+}
+
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
@@ -397,7 +435,12 @@ async fn refresh_live_claude_models(registry: &Registry, headers: &axum::http::H
     let mut request = axum::http::Request::new(Body::empty());
     *request.uri_mut() = axum::http::Uri::from_static("/v1/models?limit=1000");
     let outgoing = request.headers_mut();
-    for name in ["authorization", "anthropic-version", "anthropic-beta", "user-agent"] {
+    for name in [
+        "authorization",
+        "anthropic-version",
+        "anthropic-beta",
+        "user-agent",
+    ] {
         if let Some(value) = headers.get(name) {
             outgoing.insert(name, value.clone());
         }
@@ -1548,13 +1591,14 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await
+    {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(_) => {
             let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Invalid JSON: {err}"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "Request body exceeded the size limit",
             );
             log_request_completed(
                 &log,
@@ -1588,7 +1632,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1628,7 +1672,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1700,7 +1744,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Missing model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1795,14 +1839,52 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Unknown model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
 
-    if !count_tokens && !provider.supports_message_threads() && is_thread_continue(&body) {
-        return thread_unsupported_response();
+    if !provider.supports_message_threads()
+        && let Some(thread) = body.extra.remove("thread")
+        && !thread.is_null()
+        && !count_tokens
+        && thread.get("type").and_then(Value::as_str) != Some("create")
+    {
+        let response = thread_unsupported_response();
+        log_request_completed(
+            &log,
+            RequestLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                status: response.status(),
+                started_at,
+            },
+        );
+        let (response, details) = record_failed_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                started_at,
+            },
+            response,
+        )
+        .await;
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            details
+                .as_ref()
+                .map(|details| details.message.as_str())
+                .unwrap_or(THREAD_REJECTED),
+        );
+        return with_request_id(response, &req_id);
     }
 
     if let Some(route) = auto_review_route.as_ref() {
@@ -1979,12 +2061,39 @@ async fn dispatch_request(
             format!("HTTP {}", status.as_u16()),
         );
     }
+    with_request_id(response, &req_id)
+}
+
+/// Header Claude Code reads to populate the `requestId` field it writes into
+/// every transcript record.
+const REQUEST_ID_HEADER: &str = "request-id";
+
+/// Publish the per-request id this proxy mints. Anthropic returns `request-id`,
+/// and Claude Code records it as `requestId`; without it every downstream
+/// consumer that de-duplicates transcript records by request id (its own
+/// parser, usage dashboards) counts each request twice, because a transcript
+/// legitimately repeats a record and the id is what resolves it.
+///
+/// An upstream-supplied id is preserved: relabelling a real provider id with a
+/// local uuid would lose the more useful value.
+fn stamp_request_id(headers: &mut http::HeaderMap, req_id: &str) {
+    if !headers.contains_key(REQUEST_ID_HEADER)
+        && let Ok(value) = http::HeaderValue::from_str(req_id)
+    {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+}
+
+fn with_request_id(mut response: Response, req_id: &str) -> Response {
+    stamp_request_id(response.headers_mut(), req_id);
     response
 }
 
 /// Claude Code recognizes this capability refusal and resends the entire
 /// conversation, then stops threading this model for the session. Accepting
 /// the delta would lose the task and produce orphan function outputs.
+const THREAD_REJECTED: &str = "capability_rejected: beta_header:message-threads-2026-08-12";
+
 fn thread_unsupported_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1993,7 +2102,7 @@ fn thread_unsupported_response() -> Response {
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
-                "message": "thread: this upstream does not keep thread state; resend the conversation",
+                "message": THREAD_REJECTED,
                 "details": {"error_code": "thread_unsupported_request"}
             }
         })),
@@ -2007,7 +2116,10 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
         .extensions()
         .get::<NativeResponseOutcome>()
         .cloned();
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // Stamped on the parts before the body is streamed, so a streaming SSE
+    // response carries the header too.
+    stamp_request_id(&mut parts.headers, &guard.req_id);
     let stream = futures_util::stream::unfold(
         (body, guard, outcome),
         move |(mut body, mut guard, outcome)| async move {
@@ -2389,6 +2501,71 @@ fn _unused(session_state: Option<&SessionState>) {
 }
 
 #[cfg(test)]
+mod request_id_header_tests {
+    use super::{REQUEST_ID_HEADER, RequestMonitorGuard, monitor_response_body};
+    use axum::body::Body;
+    use axum::response::Response;
+    use http::{HeaderValue, StatusCode};
+
+    fn guard(req_id: &str) -> RequestMonitorGuard {
+        RequestMonitorGuard::new(None, req_id.to_string())
+    }
+
+    // Claude Code populates its transcript `requestId` from this header.
+    // Without it, consumers that de-duplicate transcript records by request id
+    // count every request twice, because a transcript legitimately repeats a
+    // record and the id is what resolves the repeat.
+    #[test]
+    fn stamps_the_request_id_on_a_response() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("{}"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("req-abc-123"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-abc-123"
+        );
+    }
+
+    // Streaming responses carry it too: the header is applied to the parts
+    // before the body is streamed, which is why the body-level message id is
+    // not a substitute for SSE.
+    #[test]
+    fn stamps_a_streaming_response_before_the_body() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from("event: message_start\n"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("req-stream-1"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-stream-1"
+        );
+    }
+
+    // An upstream that already supplied one owns it; overwriting would relabel
+    // a real provider id with a local uuid.
+    #[test]
+    fn does_not_clobber_an_upstream_supplied_id() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                REQUEST_ID_HEADER,
+                HeaderValue::from_static("upstream-owned"),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("local-uuid"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "upstream-owned"
+        );
+    }
+}
+
+#[cfg(test)]
 mod auto_review_tests {
     use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
     use crate::anthropic::schema::MessagesRequest;
@@ -2447,8 +2624,8 @@ mod auto_review_tests {
         let route = apply_auto_review_model(&mut classifier, false, None, "codex")
             .expect("classifier should be routed");
         assert_eq!(route.requested_model, "gpt-5.6-sol");
-        assert_eq!(route.override_model, "gpt-5.6-luna");
-        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(route.override_model, "gpt-6-luna");
+        assert_eq!(classifier.model.as_deref(), Some("gpt-6-luna"));
     }
 
     #[test]
@@ -2474,6 +2651,57 @@ mod auto_review_tests {
             .expect("configured classifier should be routed");
         assert_eq!(route.override_model, "grok-4.5");
         assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn grok_session_classifier_routes_by_requested_model_or_explicit_override() {
+        use crate::config::AliasProvider;
+        use crate::registry::Registry;
+        use crate::session::{record_session_request, record_session_request_with_affinity_update};
+
+        let registry = Registry::new(AliasProvider::Codex);
+        let session_id = "grok-session-classifier-routing";
+        let initial = record_session_request(Some(session_id), None, "grok", "grok-4.6", 1)
+            .expect("Grok session");
+        assert_eq!(initial.affinity_provider, None);
+
+        for (requested, configured, expected_provider, expected_model) in [
+            ("claude-sonnet-4-6", None, "codex", "gpt-6-luna"),
+            ("grok-4.6", None, "grok", "grok-4.6"),
+            ("claude-sonnet-4-6", Some("grok-4.6"), "grok", "grok-4.6"),
+            ("gpt-6-luna", Some("grok-4.6"), "grok", "grok-4.6"),
+        ] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            classifier.model = Some(requested.to_string());
+            let original = registry
+                .provider_for_model(requested, initial.affinity_provider.as_ref())
+                .expect("original provider");
+            let route =
+                apply_auto_review_model(&mut classifier, false, configured, original.name());
+            let model = classifier.model.as_deref().expect("classifier model");
+            let provider = if route.is_some() {
+                registry.provider_for_model(model, None).expect("override")
+            } else {
+                original
+            };
+            assert_eq!(provider.name(), expected_provider);
+            assert_eq!(model, expected_model);
+
+            let after_review = record_session_request_with_affinity_update(
+                Some(session_id),
+                Some(&initial),
+                provider.name(),
+                model,
+                route.is_none(),
+                2,
+            )
+            .expect("session after review");
+            assert_eq!(after_review.affinity_provider, None);
+        }
     }
 
     #[test]

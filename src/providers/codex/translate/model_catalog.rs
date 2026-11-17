@@ -8,9 +8,9 @@ use std::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{
-    model_allowlist::{ALLOWED_MODELS, FAMILY_ALIASES, MODEL_ALIASES, ResolvedModel},
-    request::ServiceTier,
+use super::model_allowlist::{
+    ALLOWED_MODELS, FAMILY_ALIASES, MODEL_ALIASES, ResolvedModel, offers_tier, split_tier_name,
+    tier_suffixes,
 };
 use crate::providers::codex::auth::{
     constants::CODEX_API_ENDPOINT,
@@ -48,10 +48,7 @@ impl ModelCatalog {
 
     pub(super) fn resolve(&self, model: &str) -> ResolvedModel {
         let normalized = crate::registry::normalize_incoming_model(model);
-        let (base, fast) = normalized
-            .strip_suffix("-fast")
-            .map(|base| (base, true))
-            .unwrap_or((&normalized, false));
+        let (base, tier) = split_tier_name(&normalized);
         let alias = MODEL_ALIASES
             .iter()
             .find(|(alias, _)| *alias == base)
@@ -71,14 +68,15 @@ impl ModelCatalog {
             })
             .flatten();
         let target = latest.unwrap_or(alias);
-        let recognized = self.contains(target);
+        let recognized =
+            self.contains(target) && tier.as_ref().is_none_or(|tier| offers_tier(target, tier));
         ResolvedModel {
             model: if recognized {
                 target.to_string()
             } else {
                 normalized
             },
-            service_tier: (fast && recognized).then_some(ServiceTier::Priority),
+            service_tier: tier.filter(|_| recognized),
         }
     }
 
@@ -90,7 +88,15 @@ impl ModelCatalog {
                 .filter(|family| self.contains(&self.resolve(family).model))
                 .map(|s| (*s).to_string()),
         );
-        models.extend(models.clone().iter().map(|m| format!("{m}-fast")));
+        let tiers: Vec<String> = models
+            .iter()
+            .flat_map(|m| {
+                tier_suffixes(&self.resolve(m).model)
+                    .iter()
+                    .map(move |suffix| format!("{m}{suffix}"))
+            })
+            .collect();
+        models.extend(tiers);
         models.sort_unstable();
         models
     }
@@ -592,7 +598,7 @@ mod tests {
         }
         let catalog = ModelCatalog::default();
         assert_eq!(catalog.resolve("astra[1m]").model, "gpt-6-astra");
-        assert_eq!(catalog.resolve("terra").model, "gpt-5.6-terra");
+        assert_eq!(catalog.resolve("terra").model, "gpt-6.1-terra");
         assert_eq!(
             catalog.resolve("gpt-7-astra-fast").model,
             "gpt-7-astra-fast"

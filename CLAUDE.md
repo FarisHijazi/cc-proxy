@@ -297,6 +297,13 @@ arguments default to `[1m]`, a client context hint rather than an upstream capac
 verification: `docs/devlog/claude_20261029-model-family-aliases.md` (plain path).
 The new catalog and live context verification are in
 `docs/devlog/claude_20261024-codex-6-models.md` (plain path).
+Since the 2026-11-17 upstream merge, that same catalog also owns upstream's tier and lane rules: `-ultrafast` only on
+`ULTRAFAST_MODELS`, every other tier narrowed by `service_tier_for_model`, and GPT-5.6/GPT-6 sol/terra/astra/luna on
+Responses Lite unless `CCP_CODEX_FULL_LANE=1` (luna always Lite, so hosted web search moves it to sol). Upstream's
+`models_cache.json` reader was dropped in favour of this catalog. A backend that does not keep thread state
+(`supports_message_threads`) gets `thread.type=create` stripped. Every other thread type is refused with
+`thread_unsupported_request` plus upstream's `capability_rejected: beta_header:message-threads-…` message. The opencode
+backend, upstream's Codex browser login and the docs site stay deleted in this fork.
 Folder trust
 accepted in any account profile carries to every sibling profile. Record: HQ repo
 `docs/devlog/claude_20261023-native-ui-and-rc-protocol.md`. The account

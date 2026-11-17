@@ -53,6 +53,8 @@ impl Availability {
     }
 }
 
+// async_trait adds #[must_use] to methods returning already-must-use futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;

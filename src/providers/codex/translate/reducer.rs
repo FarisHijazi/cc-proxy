@@ -1,6 +1,10 @@
 use crate::anthropic::sse::parse_sse_events;
-use crate::providers::codex::events::is_terminal_rate_limit_event;
+use crate::providers::codex::events::{
+    CodexFailureKind, classify_event_failure, is_standard_max_output_tokens_incomplete,
+    response_is_incomplete_terminal,
+};
 
+use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
@@ -50,6 +54,58 @@ pub struct CodexUsage {
     pub output_tokens: Option<u64>,
     pub input_tokens_details_cached: Option<u64>,
     pub output_tokens_details_reasoning: Option<u64>,
+    /// Latest `codex.rate_limits` snapshot seen on the stream that produced
+    /// this usage. Codex sends it as its own event before any usage exists,
+    /// so the translator carries it here for the mapper.
+    pub rate_limits: Option<Box<CodexRateLimits>>,
+}
+
+/// Subscription meter summary from a `codex.rate_limits` stream event.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CodexRateLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_reached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<CodexRateLimitWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<CodexRateLimitWindow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CodexRateLimitWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<u64>,
+}
+
+/// Parse a `codex.rate_limits` event payload. Returns `None` when the event
+/// carries no `rate_limits` object or no recognized, well-typed fields.
+pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<CodexRateLimits> {
+    let limits = payload.get("rate_limits")?.as_object()?;
+    let window = |name: &str| -> Option<CodexRateLimitWindow> {
+        let w = limits.get(name)?.as_object()?;
+        let window = CodexRateLimitWindow {
+            used_percent: w.get("used_percent").and_then(|v| v.as_f64()),
+            window_minutes: w.get("window_minutes").and_then(|v| v.as_u64()),
+            reset_at: w.get("reset_at").and_then(|v| v.as_u64()),
+        };
+        (window != CodexRateLimitWindow::default()).then_some(window)
+    };
+    let snapshot = CodexRateLimits {
+        plan_type: payload
+            .get("plan_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        limit_reached: limits.get("limit_reached").and_then(|v| v.as_bool()),
+        primary: window("primary"),
+        secondary: window("secondary"),
+    };
+    (snapshot != CodexRateLimits::default()).then_some(snapshot)
 }
 
 pub type StopReason = &'static str;
@@ -245,6 +301,13 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_with_policy(input, IncompleteResponsePolicy::Error)
+}
+
+pub(crate) fn reduce_upstream_bytes_with_policy(
+    input: &[u8],
+    incomplete_response_policy: IncompleteResponsePolicy,
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = parse_sse_events(input);
     let mut out = Vec::new();
 
@@ -260,6 +323,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut active_thinking: Option<ActiveThinking> = None;
     let mut saw_tool_use = false;
     let mut final_usage: Option<CodexUsage> = None;
+    let mut latest_rate_limits: Option<CodexRateLimits> = None;
     let mut response_id: Option<String> = None;
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
@@ -329,20 +393,61 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         event_count += 1;
         last_event_type = Some(t.clone());
 
+        // OpenCode Go's Responses endpoint may append a billing/keepalive ping
+        // after response.completed. It carries no model output and is safe to
+        // ignore, while all other JSON events after a terminal remain invalid.
+        if _saw_terminal && t == "ping" {
+            continue;
+        }
+
+        if _saw_terminal {
+            let message = if t == "response.completed"
+                || t == "response.incomplete"
+                || t == "response.done"
+            {
+                "upstream stream contained multiple terminal Codex response events"
+            } else {
+                "upstream stream contained a JSON event after the terminal Codex response event"
+            };
+            return Err(UpstreamStreamError {
+                kind: UpstreamErrorKind::Transient,
+                message: message.to_string(),
+                retry_after_seconds: None,
+                diagnostics: Some(UpstreamStreamDiagnostics {
+                    event_count,
+                    last_event_type,
+                    saw_terminal_event: true,
+                    open_blocks: describe_open_blocks(&blocks_by_output_index),
+                }),
+            });
+        }
+
+        let allowed_incomplete = incomplete_response_policy
+            == IncompleteResponsePolicy::AllowMaxOutputTokens
+            && is_standard_max_output_tokens_incomplete(&p);
+        if !allowed_incomplete && let Some(failure) = classify_event_failure(&p) {
+            let kind = match failure.kind {
+                CodexFailureKind::RateLimit => UpstreamErrorKind::RateLimit,
+                CodexFailureKind::Overloaded => UpstreamErrorKind::Overloaded,
+                CodexFailureKind::Transient => UpstreamErrorKind::Transient,
+                CodexFailureKind::Permanent => UpstreamErrorKind::Failed,
+            };
+            let retry_after_seconds = failure
+                .retry_after
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value.ceil() as u64);
+            return Err(UpstreamStreamError {
+                kind,
+                message: failure.message,
+                retry_after_seconds,
+                diagnostics: None,
+            });
+        }
+
         if t == "codex.rate_limits" {
-            if is_terminal_rate_limit_event(&p) {
-                let retry_after = p
-                    .get("rate_limits")
-                    .and_then(|r| r.get("primary"))
-                    .and_then(|r| r.get("reset_after_seconds"))
-                    .and_then(|v| v.as_f64());
-                return Err(UpstreamStreamError {
-                    kind: UpstreamErrorKind::RateLimit,
-                    message: "rate limit reached".to_string(),
-                    retry_after_seconds: retry_after.map(|f| f as u64),
-                    diagnostics: None,
-                });
-            }
+            latest_rate_limits = parse_codex_rate_limits(&p).or(latest_rate_limits);
             out.push(ReducerEvent::Progress);
             continue;
         }
@@ -358,28 +463,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         {
             out.push(ReducerEvent::Progress);
             continue;
-        }
-
-        if t == "response.failed" || t == "response.error" || t == "error" {
-            let msg = p
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    p.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("Upstream error");
-            let kind = upstream_failure_kind(&p, msg);
-            let retry_after = retry_after_from_payload(&p);
-            return Err(UpstreamStreamError {
-                kind,
-                message: msg.to_string(),
-                retry_after_seconds: retry_after,
-                diagnostics: None,
-            });
         }
 
         if t == "response.output_item.added" {
@@ -775,9 +858,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             final_usage = p.get("response").map(parse_codex_usage);
-            if response_is_incomplete(&p, &t) {
-                incomplete = true;
+            if let Some(usage) = final_usage.as_mut() {
+                usage.rate_limits = latest_rate_limits.clone().map(Box::new);
             }
+            incomplete = response_is_incomplete_terminal(&p);
             continuation_eligible =
                 (t == "response.completed" || t == "response.done") && !incomplete;
             continue;
@@ -886,22 +970,8 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64()),
+        rate_limits: None,
     }
-}
-
-fn response_is_incomplete(payload: &serde_json::Value, event_type: &str) -> bool {
-    event_type == "response.incomplete"
-        || payload
-            .get("response")
-            .and_then(|r| r.get("status"))
-            .and_then(|v| v.as_str())
-            == Some("incomplete")
-        || payload
-            .get("response")
-            .and_then(|r| r.get("incomplete_details"))
-            .and_then(|d| d.get("reason"))
-            .and_then(|v| v.as_str())
-            .is_some()
 }
 
 fn should_buffer_tool_args(name: &str) -> bool {
@@ -1008,82 +1078,6 @@ fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
     format!("srvtoolu_{suffix}")
 }
 
-fn upstream_failure_kind(payload: &serde_json::Value, message: &str) -> UpstreamErrorKind {
-    let status = payload
-        .get("status")
-        .or_else(|| payload.get("status_code"))
-        .and_then(|v| v.as_u64());
-    let code = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("code"))
-        .or_else(|| payload.get("error").and_then(|e| e.get("code")))
-        .and_then(|v| v.as_str());
-    let err_type = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("type"))
-        .or_else(|| payload.get("error").and_then(|e| e.get("type")))
-        .and_then(|v| v.as_str());
-    let lower_msg = message.to_lowercase();
-
-    if status == Some(529)
-        || code == Some("overloaded_error")
-        || err_type == Some("overloaded_error")
-        || lower_msg.contains("overloaded")
-    {
-        return UpstreamErrorKind::Overloaded;
-    }
-
-    if (status.is_some_and(|s| (500..600).contains(&s)))
-        || code == Some("server_error")
-        || code == Some("internal_server_error")
-        || code == Some("internal_error")
-        || err_type == Some("server_error")
-        || err_type == Some("internal_server_error")
-        || err_type == Some("internal_error")
-        || is_retryable_transport_message(&lower_msg)
-    {
-        return UpstreamErrorKind::Transient;
-    }
-
-    UpstreamErrorKind::Failed
-}
-
-fn retry_after_from_payload(payload: &serde_json::Value) -> Option<u64> {
-    let raw = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("retry_after_seconds"))
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("retry_after_seconds"))
-        })
-        .or_else(|| payload.get("retry_after_seconds"))
-        .or_else(|| payload.get("headers").and_then(|h| h.get("retry-after")))
-        .or_else(|| payload.get("headers").and_then(|h| h.get("Retry-After")));
-    let value = match raw {
-        Some(v) if v.is_number() => v.as_f64(),
-        Some(v) if v.is_string() => v.as_str().and_then(|s| s.parse::<f64>().ok()),
-        _ => None,
-    };
-    value.map(|f| f as u64)
-}
-
-fn is_retryable_transport_message(msg: &str) -> bool {
-    msg.contains("you can retry your request")
-        || msg.contains("socket connection was closed unexpectedly")
-        || msg.contains("connection closed unexpectedly")
-        || msg.contains("connection reset")
-        || msg.contains("operation timed out")
-        || msg.contains("econnreset")
-        || msg.contains("epipe")
-        || msg.contains("etimedout")
-        || msg.contains("und_err_socket")
-        || msg.contains("fetch failed")
-}
-
 pub fn map_codex_usage_to_anthropic(
     u: &Option<CodexUsage>,
     web_search_requests: Option<usize>,
@@ -1102,6 +1096,13 @@ pub fn map_codex_usage_to_anthropic(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cached,
         server_tool_use: None,
+        output_tokens_details: usage
+            .output_tokens_details_reasoning
+            .map(|reasoning_tokens| OutputTokensDetails {
+                reasoning_tokens,
+                thinking_tokens: reasoning_tokens,
+            }),
+        codex_rate_limits: usage.rate_limits.as_deref().cloned(),
     };
 
     if let Some(requests) = web_search_requests
@@ -1123,6 +1124,21 @@ pub struct AnthropicUsage {
     pub cache_read_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<WebSearchUsage>,
+    /// Reasoning tokens as reported by Codex. `thinking_tokens` mirrors the
+    /// field name Claude Code records for Anthropic models so per-turn
+    /// accounting in transcripts stays comparable across providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+    /// Subscription meter as of this response, from the `codex.rate_limits`
+    /// event. This optional proxy extension is not part of Anthropic's schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_rate_limits: Option<CodexRateLimits>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u64,
+    pub thinking_tokens: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1239,14 +1255,33 @@ mod tests {
     }
 
     #[test]
-    fn reduce_rate_limit_throws() {
-        let upstream = sse(
-            "codex.rate_limits",
-            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+    fn reduce_rate_limit_snapshot_is_progress_telemetry() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "codex.rate_limits",
+                json!({"plan_type":"prolite","rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30,"used_percent":42}}}),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            )
         );
-        let result = reduce_upstream_bytes(upstream.as_bytes());
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::RateLimit);
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(matches!(out.first(), Some(ReducerEvent::Progress)));
+        let Some(ReducerEvent::Finish { usage, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        let limits = usage
+            .as_ref()
+            .and_then(|usage| usage.rate_limits.as_ref())
+            .expect("rate limits carried into finish usage");
+        assert_eq!(limits.plan_type.as_deref(), Some("prolite"));
+        assert_eq!(limits.limit_reached, Some(true));
+        assert_eq!(
+            limits.primary.as_ref().and_then(|w| w.used_percent),
+            Some(42.0)
+        );
     }
 
     #[test]
@@ -1392,24 +1427,179 @@ mod tests {
     }
 
     #[test]
-    fn reduce_incomplete_is_max_tokens() {
+    fn reduce_incomplete_is_upstream_error() {
         let upstream = sse(
             "response.incomplete",
             json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
         );
-        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
-        let last = out.last().unwrap();
-        if let ReducerEvent::Finish {
+        let err = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(err.kind, UpstreamErrorKind::Transient);
+        assert!(err.message.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn standard_responses_policy_maps_max_output_tokens_to_finish() {
+        let upstream = sse(
+            "response.incomplete",
+            json!({"response":{"id":"resp_1","status":"incomplete","error":null,"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":8}}}),
+        );
+        let out = reduce_upstream_bytes_with_policy(
+            upstream.as_bytes(),
+            IncompleteResponsePolicy::AllowMaxOutputTokens,
+        )
+        .unwrap();
+        let Some(ReducerEvent::Finish {
             stop_reason,
+            terminal_type,
             continuation_eligible,
+            usage,
             ..
-        } = last
-        {
-            assert_eq!(*stop_reason, "max_tokens");
-            assert!(!continuation_eligible);
-        } else {
+        }) = out.last()
+        else {
             panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_MAX_TOKENS);
+        assert_eq!(terminal_type, TERM_INCOMPLETE);
+        assert!(!continuation_eligible);
+        assert_eq!(
+            usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn standard_responses_policy_rejects_a_second_terminal_event() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "response.incomplete",
+                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            ),
+        );
+        let err = reduce_upstream_bytes_with_policy(
+            upstream.as_bytes(),
+            IncompleteResponsePolicy::AllowMaxOutputTokens,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, UpstreamErrorKind::Transient);
+        assert!(err.message.contains("multiple terminal"));
+    }
+
+    #[test]
+    fn standard_responses_policy_rejects_content_after_terminal() {
+        let trailing_events = [
+            (
+                "response.output_text.delta",
+                json!({"output_index":0,"delta":"late"}),
+            ),
+            (
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_late"}
+                }),
+            ),
+        ];
+
+        for (event_type, payload) in trailing_events {
+            let upstream = format!(
+                "{}{}",
+                sse(
+                    "response.incomplete",
+                    json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
+                ),
+                sse(event_type, payload),
+            );
+            let err = reduce_upstream_bytes_with_policy(
+                upstream.as_bytes(),
+                IncompleteResponsePolicy::AllowMaxOutputTokens,
+            )
+            .unwrap_err();
+
+            assert_eq!(err.kind, UpstreamErrorKind::Transient);
+            assert!(err.message.contains("after the terminal"));
+            let diagnostics = err.diagnostics.expect("expected diagnostics");
+            assert_eq!(diagnostics.event_count, 2);
+            assert_eq!(diagnostics.last_event_type.as_deref(), Some(event_type));
+            assert!(diagnostics.saw_terminal_event);
         }
+    }
+
+    #[test]
+    fn completed_terminal_followed_by_done_marker_remains_valid() {
+        let upstream = format!(
+            "{}data: [DONE]\n\n",
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            ),
+        );
+
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_END_TURN);
+    }
+
+    #[test]
+    fn completed_terminal_followed_by_ping_remains_valid() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            ),
+            sse("ping", json!({"cost":"0"})),
+        );
+
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_END_TURN);
+    }
+
+    #[test]
+    fn standard_responses_max_tokens_takes_priority_over_tool_use() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"output_index":0,"delta":"{}"}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}
+                }),
+            ),
+            sse(
+                "response.incomplete",
+                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
+            ),
+        );
+        let out = reduce_upstream_bytes_with_policy(
+            upstream.as_bytes(),
+            IncompleteResponsePolicy::AllowMaxOutputTokens,
+        )
+        .unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_MAX_TOKENS);
     }
 
     #[test]
@@ -1509,11 +1699,45 @@ mod tests {
             output_tokens: Some(50),
             input_tokens_details_cached: Some(20),
             output_tokens_details_reasoning: None,
+            rate_limits: None,
         };
         let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
         assert_eq!(mapped.input_tokens, 80);
         assert_eq!(mapped.output_tokens, 50);
         assert_eq!(mapped.cache_read_input_tokens, 20);
+        assert!(mapped.output_tokens_details.is_none());
+        assert!(mapped.codex_rate_limits.is_none());
+    }
+
+    #[test]
+    fn map_usage_reports_reasoning_and_rate_limits() {
+        let usage = CodexUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            input_tokens_details_cached: None,
+            output_tokens_details_reasoning: Some(30),
+            rate_limits: Some(Box::new(CodexRateLimits {
+                plan_type: Some("prolite".into()),
+                limit_reached: Some(false),
+                primary: Some(CodexRateLimitWindow {
+                    used_percent: Some(8.0),
+                    window_minutes: Some(10080),
+                    reset_at: Some(1_789_765_755),
+                }),
+                secondary: None,
+            })),
+        };
+        let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
+        let details = mapped
+            .output_tokens_details
+            .as_ref()
+            .expect("reasoning details");
+        assert_eq!(details.reasoning_tokens, 30);
+        assert_eq!(details.thinking_tokens, 30);
+        let json = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(json["codex_rate_limits"]["primary"]["used_percent"], 8.0);
+        assert_eq!(json["codex_rate_limits"]["plan_type"], "prolite");
+        assert!(json["codex_rate_limits"].get("secondary").is_none());
     }
 
     #[test]

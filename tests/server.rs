@@ -1,9 +1,13 @@
+#[path = "support/isolated_codex.rs"]
+mod isolated_codex;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use claude_codex::{
     MessagesRequest,
+    anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
@@ -195,6 +199,42 @@ struct IdentityCaptureProvider {
     captured: Arc<Mutex<Vec<CapturedIdentity>>>,
 }
 
+struct RequestCaptureProvider {
+    captured: Arc<Mutex<Vec<MessagesRequest>>>,
+}
+
+#[async_trait]
+impl Provider for RequestCaptureProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.captured.lock().unwrap().push(body);
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.handle_messages(body, ctx).await
+    }
+}
+
 #[async_trait]
 impl Provider for IdentityCaptureProvider {
     fn name(&self) -> &'static str {
@@ -202,7 +242,7 @@ impl Provider for IdentityCaptureProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+        vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -537,6 +577,184 @@ async fn invalid_json_request_is_json_error() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
+async fn message_thread_response(
+    body: Value,
+) -> (
+    axum::response::Response,
+    Vec<MessagesRequest>,
+    MonitorHandle,
+) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [Arc::new(RequestCaptureProvider {
+            captured: captured.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let monitor = MonitorHandle::new(10);
+    let response = app_with_monitor(registry, Some(monitor.clone()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-beta", "message-threads-2026-08-12")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests = captured.lock().unwrap().clone();
+    (response, requests, monitor)
+}
+
+async fn assert_message_thread_rejected(body: Value) {
+    let (response, captured, monitor) = message_thread_response(body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
+    assert_eq!(captured.len(), 0);
+    let state = monitor.snapshot();
+    assert!(state.active.is_empty());
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert_eq!(state.recent[0].http_status, Some(400));
+    assert!(
+        state.recent[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("capability_rejected: beta_header:message-threads-2026-08-12")
+    );
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("capability_rejected: beta_header:message-threads-2026-08-12")
+    );
+}
+
+async fn assert_message_thread_dispatched(mut body: Value) {
+    let (response, captured, _) = message_thread_response(body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(captured.len(), 1);
+    assert!(!captured[0].extra.contains_key("thread"));
+    body.as_object_mut().unwrap().remove("thread");
+    let expected: MessagesRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        serde_json::to_value(&captured[0]).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn message_thread_continue_tool_result_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+        }]}],
+        "thread": {"type": "continue", "previous_message_id": "msg_test"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_continue_text_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "next question"}],
+        "thread": {"type": "continue", "previous_message_id": "msg_test"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_unknown_type_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thread": {"type": "fork"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_missing_type_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thread": {}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_create_tool_result_dispatches_without_thread() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [
+            {"role": "user", "content": "run the tool"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call_test", "name": "test", "input": {}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+            }]}
+        ],
+        "thread": {"type": "create"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_create_text_dispatches_without_thread() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "next question"}
+        ],
+        "thread": {"type": "create"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_absent_text_dispatches_unchanged() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_absent_tool_result_dispatches_unchanged() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+        }]}]
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn empty_body_is_invalid_json() {
     let app = app(Arc::new(Registry::with_default_alias()));
@@ -581,6 +799,73 @@ async fn unknown_model_returns_400_with_summary() {
     assert!(message.contains("Supported:"));
 }
 
+fn request_id(response: &axum::response::Response) -> &str {
+    response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+async fn messages_response(app: axum::Router, model: &str) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(body_string(
+                &json!({"model": model, "messages": [{"role": "user", "content": "hello"}]})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+// Claude Code populates the `requestId` field of every transcript record from
+// the `request-id` response header. Consumers that de-duplicate those records
+// by request id count each request twice without it, because a transcript
+// legitimately repeats a record and the id is what resolves the repeat.
+#[tokio::test]
+async fn successful_response_carries_a_request_id() {
+    let registry = || {
+        Arc::new(Registry::from_providers(
+            AliasProvider::Codex,
+            [Arc::new(IdentityCaptureProvider {
+                captured: Arc::new(Mutex::new(Vec::new())),
+            }) as Arc<dyn Provider>],
+        ))
+    };
+    let first = messages_response(app(registry()), "gpt-5.5").await;
+    let second = messages_response(app(registry()), "gpt-5.5").await;
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(!request_id(&first).is_empty());
+    assert_ne!(request_id(&first), request_id(&second));
+}
+
+// Errors are de-duplicated by the same key as successes, and a failed turn is
+// the record most worth correlating with a proxy log.
+#[tokio::test]
+async fn rejected_request_carries_a_request_id() {
+    let response =
+        messages_response(app(Arc::new(Registry::with_default_alias())), "not-a-model").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
+}
+
+// A provider that answers with a failure status leaves through a different
+// return path than a success.
+#[tokio::test]
+async fn provider_failure_response_carries_a_request_id() {
+    let response = messages_response(app(routed_registry()), "kimi-k2.6").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(!request_id(&response).is_empty());
+}
+
 #[tokio::test]
 async fn missing_model_returns_400() {
     let app = app(Arc::new(Registry::with_default_alias()));
@@ -608,8 +893,112 @@ async fn missing_model_returns_400() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
+async fn error_body(response: axum::response::Response) -> Value {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap()
+}
+
+// Builds a valid JSON /v1/messages body of exactly `total_len` bytes that has
+// no "model", so the handler parses it and then fails on the missing model.
+// That failure proves the body cleared the size gate without touching a
+// provider.
+fn padded_messages_body_without_model(total_len: usize) -> String {
+    let prefix = r#"{"messages":[{"role":"user","content":"hello"}],"padding":""#;
+    let suffix = r#""}"#;
+    let padding = total_len - prefix.len() - suffix.len();
+    let mut body = String::with_capacity(total_len);
+    body.push_str(prefix);
+    body.extend(std::iter::repeat_n('a', padding));
+    body.push_str(suffix);
+    assert_eq!(body.len(), total_len);
+    body
+}
+
+#[tokio::test]
+async fn messages_body_over_16mib_clears_size_gate() {
+    const OLD_LIMIT: usize = 16 * 1024 * 1024;
+    const { assert!(MAX_ANTHROPIC_REQUEST_BYTES > OLD_LIMIT) };
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    OLD_LIMIT + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body over 16 MiB should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn messages_body_at_limit_clears_size_gate() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    MAX_ANTHROPIC_REQUEST_BYTES,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body at the limit should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_bodies_over_limit_return_request_too_large() {
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = app(Arc::new(Registry::with_default_alias()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(padded_messages_body_without_model(
+                        MAX_ANTHROPIC_REQUEST_BYTES + 1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "request_too_large");
+    }
+}
+
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
+    if isolated_codex::rerun_without_credentials("known_model_reaches_codex_provider") {
+        return;
+    }
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -625,11 +1014,14 @@ async fn known_model_reaches_codex_provider() {
         .await
         .unwrap();
 
-    // Codex provider is now concrete, so it should attempt auth before returning 501
-    let status = response.status();
+    // A known model reaches the concrete provider's authentication boundary.
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = error_body(response).await;
     assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "codex should no longer be a placeholder provider"
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("No Codex credentials")
     );
 }
 
@@ -1444,6 +1836,13 @@ async fn models_endpoint_lists_supported_models() {
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"gpt-6.1-sol"));
+    assert!(ids.contains(&"gpt-6.1-sol-fast"));
+    assert!(ids.contains(&"gpt-6.1-terra"));
+    assert!(ids.contains(&"gpt-6.1-terra-fast"));
+    assert!(ids.contains(&"gpt-6-astra-ultrafast"));
+    assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
+    assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());

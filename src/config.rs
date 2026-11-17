@@ -63,10 +63,14 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "requestCompression")]
+    pub request_compression: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "imagesApi")]
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
@@ -82,6 +86,8 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "headerTimeoutMs")]
+    pub header_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -376,6 +382,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_IMAGES_API") {
         out.push("codex.imagesApi (env)".to_string());
     }
@@ -414,6 +423,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_REQUEST_COMPRESSION") {
+        out.push("CCP_CODEX_REQUEST_COMPRESSION (env)".to_string());
     }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
@@ -455,8 +467,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
             }
+            if let Some(enabled) = codex.request_compression {
+                out.push(format!("codex.requestCompression: {enabled}"));
+            }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if codex.full_lane == Some(true) {
+                out.push("codex.fullLane: true".to_string());
             }
             if codex.images_api == Some(true) {
                 out.push("codex.imagesApi: true".to_string());
@@ -466,6 +484,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.transcriptions_api == Some(true) {
                 out.push("codex.transcriptionsApi: true".to_string());
+            }
+            if let Some(ms) = codex.header_timeout_ms {
+                out.push(format!("codex.headerTimeoutMs: {ms}"));
             }
         }
     }
@@ -495,7 +516,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    "1.0.13".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +573,59 @@ pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Grok hosted-search policy (CCP_GROK_HOSTED_SEARCH)
+// ---------------------------------------------------------------------------
+
+/// Whether the Grok translator replaces caller search tools with xAI-hosted
+/// search and requires hosted tool use on explicit search turns.
+///
+/// The disabled policy preserves caller tools, instructions, and tool choice.
+/// It adds `x_search` only to X-specific turns because the caller has no
+/// equivalent access to xAI's X index.
+///
+/// The enabled policy favors xAI-hosted search and citations. Hosted tools
+/// replace caller search implementations, matching turns receive search
+/// guidance, and explicit search turns use `tool_choice: required`.
+///
+/// Set `CCP_GROK_HOSTED_SEARCH` to `1`, `on`, or `true` to enable this policy.
+pub fn parse_grok_hosted_search(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on" | "true"))
+}
+
+pub fn grok_hosted_search() -> bool {
+    parse_grok_hosted_search(std::env::var("CCP_GROK_HOSTED_SEARCH").ok().as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Grok hosted-search block shape (CCP_GROK_SEARCH_BLOCKS)
+// ---------------------------------------------------------------------------
+
+/// How a hosted search that xAI ran is reported to the client.
+///
+/// `Text` projects the search query into a standard `text` block.
+///
+/// `Native` preserves the Anthropic server-tool shape: `server_tool_use`
+/// followed by `web_search_tool_result` or `x_search_tool_result`. Select this
+/// shape for clients that consume hosted-tool blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokSearchBlocks {
+    Text,
+    Native,
+}
+
+pub fn parse_grok_search_blocks(raw: Option<&str>) -> GrokSearchBlocks {
+    match raw.map(str::trim) {
+        Some("native") => GrokSearchBlocks::Native,
+        // Text is the compatibility-safe fallback for empty or unknown values.
+        _ => GrokSearchBlocks::Text,
+    }
+}
+
+pub fn grok_search_blocks() -> GrokSearchBlocks {
+    parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
 }
 
 pub fn is_verbose() -> bool {
@@ -692,6 +766,25 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+pub fn codex_request_compression() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_REQUEST_COMPRESSION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.request_compression
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
@@ -720,6 +813,21 @@ pub fn codex_responses_api() -> bool {
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.responses_api
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
     {
         return enabled;
     }
@@ -888,7 +996,44 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::WebSocket
+    if codex_request_compression() {
+        return CodexTransport::Http;
+    }
+    CodexTransport::Auto
+}
+
+/// How long an HTTP-transport request waits for the Codex response headers.
+///
+/// Codex withholds the response head until the model produces its first
+/// output, so the wait tracks how much reasoning the request asks for rather
+/// than the health of the connection. A large request to a high-effort model
+/// can hold the head for minutes, and the timeout firing fails the request
+/// outright, so the default is generous. Lower it only where a request that
+/// slow is better failed than waited out. Values below
+/// `CODEX_MIN_HEADER_TIMEOUT_MS` are ignored rather than clamped, so a typo
+/// does not hide behind a working default.
+pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
+pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
+
+pub fn codex_header_timeout_ms() -> u64 {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(ms) = env
+        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(ms) = codex
+            .header_timeout_ms
+            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    CODEX_DEFAULT_HEADER_TIMEOUT_MS
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,21 +1283,33 @@ mod tests {
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn clear_env() {
-        unsafe {
-            std::env::remove_var("CCP_BIND_ADDRESS");
-            std::env::remove_var("CCP_CODEX_TRANSPORT");
-            std::env::remove_var("CCP_CONFIG_DIR");
-            std::env::remove_var("CCP_LOG_VERBOSE");
-            std::env::remove_var("CCP_LOG_STDERR");
-            std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
-            std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
-            std::env::remove_var("CCP_CODEX_RESPONSES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
-            std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
-            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
-        }
+    /// Clears the environment knobs the config accessors read and points the
+    /// config dir at `config`, so neither the developer's shell nor their real
+    /// config.json can leak into the test. Every change is restored when the
+    /// guards drop, including `CCP_CONFIG_DIR`: a plain `remove_var` here would
+    /// strip a `CCP_CONFIG_DIR` the developer exported to isolate the whole
+    /// run, and every later test in the process that reads config through
+    /// `paths::config_dir()` would fall back to the real config file.
+    fn isolated_env(config: &tempfile::TempDir) -> Vec<EnvGuard> {
+        let mut guards = vec![
+            EnvGuard::unset("CCP_BIND_ADDRESS"),
+            EnvGuard::unset("CCP_CODEX_TRANSPORT"),
+            EnvGuard::unset("CCP_LOG_VERBOSE"),
+            EnvGuard::unset("CCP_LOG_STDERR"),
+            EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
+            EnvGuard::unset("CCP_CODEX_REQUEST_COMPRESSION"),
+            EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
+            EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
+            EnvGuard::unset("CCP_CODEX_FULL_LANE"),
+            EnvGuard::unset("CCP_CODEX_IMAGES_API"),
+            EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
+            EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
+            EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
+            EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
+        ];
+        guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
+        guards
     }
 
     fn config_env(config: &tempfile::TempDir) -> HashMap<String, String> {
@@ -1160,6 +1317,24 @@ mod tests {
             "CCP_CONFIG_DIR".to_string(),
             config.path().to_string_lossy().into_owned(),
         )])
+    }
+
+    #[test]
+    fn grok_client_version_defaults_and_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        assert_eq!(grok_client_version(), "1.0.13");
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"clientVersion":"1.0.14"}}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_client_version(), "1.0.14");
+
+        let _version = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.0.15");
+        assert_eq!(grok_client_version(), "1.0.15");
     }
 
     #[test]
@@ -1198,6 +1373,14 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -1212,51 +1395,135 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_websocket() {
+    fn isolated_env_restores_an_exported_config_dir() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        let result = codex_transport();
-        assert_eq!(result, CodexTransport::WebSocket);
+        let exported = tempfile::TempDir::new().unwrap();
+        let _exported_env = EnvGuard::set("CCP_CONFIG_DIR", exported.path());
+        {
+            let config = tempfile::TempDir::new().unwrap();
+            let _env = isolated_env(&config);
+            assert_eq!(paths::config_dir(), config.path());
+        }
+        assert_eq!(paths::config_dir(), exported.path());
+    }
+
+    #[test]
+    fn codex_transport_defaults_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
-        }
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
         assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
-        }
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_websocket() {
+    fn codex_transport_invalid_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
-        }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "invalid");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_websocket() {
+    fn codex_transport_empty_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "");
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_transport_file_and_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for (file_value, expected) in [
+            ("http", CodexTransport::Http),
+            ("websocket", CodexTransport::WebSocket),
+            ("auto", CodexTransport::Auto),
+        ] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": file_value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), expected);
+            for env_value in ["", "invalid"] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
+            for (env_value, expected) in [
+                ("http", CodexTransport::Http),
+                ("websocket", CodexTransport::WebSocket),
+                ("auto", CodexTransport::Auto),
+            ] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
         }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_invalid_or_empty_file_falls_back_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["", "invalid"] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
+    }
+
+    #[test]
+    fn codex_header_timeout_defaults_overrides_and_floors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":600000}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), 600_000);
+        {
+            let _timeout_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "120000");
+            assert_eq!(codex_header_timeout_ms(), 120_000);
+        }
+        // Below the floor is ignored, not clamped: a value that small is a typo,
+        // and clamping it would hide the typo behind a working default.
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        let _timeout_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "0");
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
     }
 
     #[test]
@@ -1309,9 +1576,8 @@ mod tests {
     #[test]
     fn codex_responses_api_defaults_to_disabled() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(!codex_responses_api());
     }
@@ -1319,14 +1585,13 @@ mod tests {
     #[test]
     fn codex_responses_api_reads_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"responsesApi":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_responses_api());
         let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
@@ -1334,11 +1599,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_full_lane_defaults_off_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        assert!(!codex_full_lane());
+    }
+
+    #[test]
+    fn codex_full_lane_accepts_boolean_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["1", "true", "TRUE", "yes"] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
+        for value in ["0", "false", "no", "invalid", ""] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(!codex_full_lane(), "{value}");
+        }
+    }
+
+    #[test]
     fn codex_responses_api_accepts_enabled_env_values() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         for value in ["1", "true", "TRUE", "yes"] {
             let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", value);
@@ -1349,14 +1645,13 @@ mod tests {
     #[test]
     fn codex_images_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"imagesApi":true,"imagesBaseUrl":"https://chatgpt.com/backend-api/codex-custom"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_images_api());
         assert_eq!(
@@ -1378,14 +1673,13 @@ mod tests {
     #[test]
     fn codex_transcriptions_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"transcriptionsApi":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_transcriptions_api());
         let _enabled_env = EnvGuard::set("CCP_CODEX_TRANSCRIPTIONS_API", "false");
@@ -1395,14 +1689,13 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"reasoningSummary":"off"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
     }
@@ -1410,14 +1703,13 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"reasoningSummary":"off"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "auto");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
@@ -1431,14 +1723,13 @@ mod tests {
     #[test]
     fn auto_review_model_reads_top_level_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"autoReviewModel":"grok-4.5"}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         {
@@ -1454,9 +1745,8 @@ mod tests {
     #[test]
     fn codex_server_compaction_defaults_and_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(!codex_server_compaction());
         {
@@ -1471,5 +1761,32 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_request_compression_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert!(!codex_request_compression());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "on");
+            assert!(codex_request_compression());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"requestCompression":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Http);
+        {
+            let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
+        let _disabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "false");
+        assert!(!codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 }
