@@ -25,6 +25,7 @@ bindings remain unchanged. The adapter does not launch replacement native driver
 | Automatic enrichment | The existing discovery owner populated identities into existing sidebar records; no manual import or database write was used. Historical records absent from the live catalog remain preserved without guessed identities. |
 | Binding/history preservation | All 96 original conversation/provider-thread bindings and message IDs survived; the later 98-record baseline also survived activation. The same source UUIDs and existing run IDs remained. |
 | Ended Codex history | The exact selected archive retained its native message ID and text hash, original binding and zero new runs. All six native action capabilities were false. Its runtime reader is ready with no lastError; external unavailable maps to provider-thread error because the native worker is ended. |
+| Desktop .6 installation | Matching ARM64 build installed with a reversible app/profile backup; ad-hoc signature and packaged payload checks passed. Final UI acceptance remains pending: startup blocked inside macOS Keychain decryption before saved-login renewal. The native grant remained unrevoked at 21:23 UTC; no replacement sign-in or credential reset was attempted. Computer Use refused access to Apple’s security dialog, and the user was asked to complete that prompt. This is not a passed .6 desktop check. |
 | Desktop .5 saved sign-in | Installed the signed local build and reopened after its previous access expired. The same native grant refreshed at 20:54:38.956 UTC, reconnected WebSocket at 20:54:39.315 UTC and saved credentials; no new sign-in grant or local backend was created. |
 | Desktop .5 native identity | Actual Providers settings contained Codex, Claude and routed Claude, with fleet excluded. The existing Dev fixture displayed Claude Code and Model unknown because the owner supplied no model. |
 | Desktop .5 continuation | Exactly one prompt through the native composer returned `NATIVE_ENGINE_READY_20261117`. Native transcript contains one user prompt and one assistant reply, with unchanged native UUID and T3 binding. Persisted source IDs/text match byte-for-byte and the session returned idle. Delivered runtime_info correctly identifies the Claude Code harness. |
@@ -66,7 +67,8 @@ do not claim every process in that long-lived census survived.
 Private Dev evidence: `t3-identity-acp-live-proof-20261117.json`,
 `t3-identity-preservation-20261117.json`,
 `t3-identity5-metadata-preservation-20261117.json`,
-`t3-identity-public-auth-20261117-5.json`, and the isolated .5 report under
+`t3-identity-public-auth-20261117-5.json`,
+`t3-identity-public-auth-20261117-6.json`, and the isolated .5/.6 reports under
 `~/.local/state/cc-proxy/t3-external-identity-20261117/`. These observations are
 separate from the earlier dated continuation, control and iPhone checks below.
 

@@ -50,8 +50,12 @@ an older runtime directory.
 The completed Linux x64 archive version is `0.1.10-ccfleet.20261117.6`;
 SHA-256: `f150f7a927a794d25a2c47cf999ecb3d00ecff2b9b45bd3faf07701d8a03605c`.
 Its release manifest records the maintained source commit above and no configured
-hosted Connect service. This artifact identity does not
-establish live deployment acceptance.
+hosted Connect service. The matching macOS ARM64 build has these SHA-256 checksums:
+
+- DMG: `45d6a684468f4f778af9b666a5bdc2cb033ad722aae613a1619c5283f4ad788d`
+- ZIP: `f707c6c06e908104fb7589aabd2d5f42b071450afc11dc07767046fd1bcfc4f4`
+
+These artifact identities do not establish live deployment acceptance.
 Use the official installer to install the verified archive, then the exact cached
 runtime's `t3 service install --base-dir <existing-t3-home>` to reconcile the
 existing service. `service.env` and userdata stay with that home. This does not
