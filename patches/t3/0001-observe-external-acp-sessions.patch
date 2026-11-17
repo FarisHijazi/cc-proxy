@@ -1,0 +1,4398 @@
+From ba1e4cb907527bcfa6f6142229a8a59bcf7f2d3f Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Mon, 16 Nov 2026 13:39:09 +0000
+Subject: [PATCH] fix(acp): attach and control existing external sessions
+
+---
+ .../features/threads/ThreadRouteScreen.tsx    |  10 +-
+ .../src/state/use-thread-composer-state.ts    |   5 +
+ .../Adapters/AcpRegistryAdapterV2.test.ts     | 763 +++++++++++++++++-
+ .../src/orchestration-v2/EffectOutbox.ts      |   6 +
+ .../src/orchestration-v2/EffectWorker.test.ts | 104 ++-
+ .../src/orchestration-v2/EffectWorker.ts      | 128 ++-
+ .../src/orchestration-v2/Orchestrator.ts      |  70 +-
+ .../src/orchestration-v2/ProjectionStore.ts   |   5 +
+ .../ProviderAdapterRegistry.ts                |   3 +
+ .../ProviderEventIngestor.test.ts             | 182 +++++
+ .../orchestration-v2/ProviderEventIngestor.ts | 158 +++-
+ .../ProviderRuntimeRecoveryService.test.ts    |   1 +
+ .../ProviderSessionManager.test.ts            | 215 ++++-
+ .../ProviderSessionManager.ts                 | 138 +++-
+ .../ProviderTurnControlService.test.ts        | 128 ++-
+ .../ProviderTurnControlService.ts             |  75 ++
+ .../src/orchestration-v2/ThreadStop.test.ts   | 104 +++
+ .../src/orchestration-v2/runtimeLayer.ts      |   2 +
+ .../testkit/ProviderReplayHarness.ts          |   1 +
+ .../src/project/AgentSessionImporter.test.ts  |   2 +
+ .../src/project/AgentSessionImporter.ts       |   7 +
+ .../src/provider/AcpRegistrySessions.ts       |  50 +-
+ apps/server/src/ws.ts                         |  12 +
+ .../src/state/threadExecution.test.ts         |  95 +++
+ .../src/state/threadExecution.ts              |  45 +-
+ packages/contracts/src/acpRegistry.ts         |   1 +
+ packages/contracts/src/orchestrationV2.ts     |   3 +
+ packages/contracts/src/server.ts              |   1 +
+ .../src/server/driver.ts                      |   3 +
+ .../provider-acp-registry/src/server/probe.ts |   2 +
+ packages/provider-acp/package.json            |   4 +
+ packages/provider-acp/src/server/adapter.ts   | 672 ++++++++++++---
+ .../src/server/externalSession.ts             |  45 ++
+ .../src/server/ProviderAdapter.ts             |   7 +
+ .../src/orchestrationV2Timeline.test.ts       |  13 +
+ .../shared/src/orchestrationV2Timeline.ts     |   6 +-
+ 36 files changed, 2851 insertions(+), 215 deletions(-)
+ create mode 100644 packages/provider-acp/src/server/externalSession.ts
+
+diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
+index 4d814d3a..9a9bc2e6 100644
+--- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
++++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
+@@ -670,7 +670,7 @@ function ThreadRouteContent(
+     if (
+       !selectedThread ||
+       !readEnvironmentScope(selectedThread.environmentId, AuthOrchestrationOperateScope) ||
+-      composer.interruptibleRunId === null
++      (composer.interruptibleRunId === null && !composer.canInterruptExternalThread)
+     ) {
+       return;
+     }
+@@ -678,7 +678,7 @@ function ThreadRouteContent(
+       environmentId: selectedThread.environmentId,
+       input: {
+         threadId: selectedThread.id,
+-        runId: composer.interruptibleRunId,
++        ...(composer.interruptibleRunId === null ? {} : { runId: composer.interruptibleRunId }),
+       },
+     });
+   };
+@@ -1068,7 +1068,11 @@ function ThreadRouteContent(
+           connectionAwaitingApproval={routeEnvironmentRuntime?.connectionAwaitingApproval === true}
+           historyControls={historyControls}
+           activeThreadBusy={composer.activeThreadBusy}
+-          canStopThread={awaitingBootstrapTurn || composer.interruptibleRunId !== null}
++          canStopThread={
++            awaitingBootstrapTurn ||
++            composer.interruptibleRunId !== null ||
++            composer.canInterruptExternalThread
++          }
+           queuedRunEdit={composer.queuedRunEdit}
+           composerDraftKey={composer.composerDraftKey}
+           followUpBehavior={composer.followUpBehavior}
+diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
+index 57965350..d58f6259 100644
+--- a/apps/mobile/src/state/use-thread-composer-state.ts
++++ b/apps/mobile/src/state/use-thread-composer-state.ts
+@@ -21,6 +21,7 @@ import {
+   deriveRunlessWorkStartedAt,
+   deriveThreadActivityRun,
+   deriveThreadRuntime,
++  deriveInterruptibleExternalProviderThread,
+   threadRuntimeHasInterruptibleRun,
+ } from "@t3tools/client-runtime/state/thread-execution";
+ import { useEffect, useRef, useState } from "react";
+@@ -458,6 +459,9 @@ export function useThreadComposerState(input: {
+   const interruptibleRunId = threadRuntimeHasInterruptibleRun(selectedThreadRuntime)
+     ? (selectedThreadRuntime?.activeRunId ?? null)
+     : null;
++  const canInterruptExternalThread =
++    selectedThreadProjection !== null &&
++    deriveInterruptibleExternalProviderThread(selectedThreadProjection.projection) !== null;
+ 
+   const cancelQueuedRunEdit = () => {
+     if (selectedThreadKey === null || savingQueuedEditRef.current) return;
+@@ -943,6 +947,7 @@ export function useThreadComposerState(input: {
+     interactionMode,
+     activeThreadBusy,
+     interruptibleRunId,
++    canInterruptExternalThread,
+     onChangeDraftMessage,
+     onPickDraftMedia,
+     onPickDraftFiles,
+diff --git a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+index ee82cc06..faaf9af3 100644
+--- a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+@@ -210,6 +210,13 @@ const openClaudeReplaySession = Effect.fn("openClaudeReplaySession")(function* (
+   replayGate?: ProviderReplayGate,
+   continuationEnabled = true,
+   agentId = "claude-acp",
++  initialNativeThreadId?: string,
++  hooks?: {
++    readonly runtimeMode?: "full-access" | "approval-required";
++    readonly onRuntimeStart?: () => void;
++    readonly cancelError?: EffectAcpErrors.AcpError;
++    readonly activationError?: EffectAcpErrors.AcpError;
++  },
+ ) {
+   const fileSystem = yield* FileSystem.FileSystem;
+   const path = yield* Path.Path;
+@@ -255,7 +262,10 @@ const openClaudeReplaySession = Effect.fn("openClaudeReplaySession")(function* (
+     environment: {},
+     ...(continuationEnabled ? { continuationRequests } : {}),
+     makeRuntime: (runtimeInput: Parameters<typeof replayRuntime>[0]) => {
++      hooks?.onRuntimeStart?.();
+       onTermination = runtimeInput.onTermination;
++      const cancelError = hooks?.cancelError;
++      const activationError = hooks?.activationError;
+       return replayRuntime({
+         ...runtimeInput,
+         protocolLogging: {
+@@ -266,7 +276,15 @@ const openClaudeReplaySession = Effect.fn("openClaudeReplaySession")(function* (
+               ? Queue.offer(outgoing, JSON.parse(event.payload)).pipe(Effect.asVoid)
+               : Effect.void,
+         },
+-      });
++      }).pipe(
++        Effect.map((runtime) => ({
++          ...runtime,
++          ...(cancelError === undefined ? {} : { cancel: Effect.fail(cancelError) }),
++          ...(activationError === undefined
++            ? {}
++            : { start: () => runtime.start().pipe(Effect.mapError(() => activationError)) }),
++        })),
++      );
+     },
+   };
+   const adapter = yield* makeAcpRegistryAdapterV2(adapterOptions).pipe(
+@@ -274,7 +292,7 @@ const openClaudeReplaySession = Effect.fn("openClaudeReplaySession")(function* (
+   );
+   const threadId = ThreadId.make("thread-claude-lifecycle");
+   const modelSelection = { instanceId, model: "default" } as const;
+-  const runtimeMode = "approval-required";
++  const runtimeMode = hooks?.runtimeMode ?? "approval-required";
+   const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+     runtimeMode,
+     interactionMode: "default",
+@@ -285,6 +303,9 @@ const openClaudeReplaySession = Effect.fn("openClaudeReplaySession")(function* (
+     providerSessionId: ProviderSessionId.make("session-claude-lifecycle"),
+     modelSelection,
+     runtimePolicy,
++    ...(initialNativeThreadId === undefined
++      ? {}
++      : { initialNativeThreadId, initialProviderItemIdentityVersion: 2 as const }),
+   });
+   yield* Effect.addFinalizer(() => Effect.sync(() => replayGate?.releaseAll()));
+   if (continuationEnabled) {
+@@ -434,6 +455,743 @@ const claudeUnrelatedChildren = [
+ ];
+ 
+ describe("AcpRegistryAdapterV2", () => {
++  it.effect("fails an external import without starting an unbound replacement", () =>
++    Effect.gen(function* () {
++      let starts = 0;
++      const result = yield* openClaudeReplaySession(
++        [
++          claudeFrames.open[0],
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "initialize",
++              result: {
++                protocolVersion: 2,
++                info: { name: "external-fixture", version: "1" },
++                capabilities: { session: {} },
++                _meta: { "t3.codes/externalSession": true },
++              },
++            },
++          },
++          {
++            type: "expect_outbound",
++            frame: { kind: "request", method: "session/resume", params: "<any>" },
++          },
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "session/resume",
++              error: { code: -32000, message: "Existing session unavailable" },
++            },
++          },
++        ],
++        undefined,
++        true,
++        "claude-acp",
++        "missing-native-session",
++        {
++          activationError: new EffectAcpErrors.AcpTransportError({
++            detail: "Existing session unavailable",
++            method: "session/resume",
++            cause: "test",
++          }),
++          onRuntimeStart: () => {
++            starts += 1;
++            if (starts > 1) throw new Error("Unexpected replacement runtime");
++          },
++        },
++      ).pipe(Effect.exit);
++      assert.isTrue(Exit.isFailure(result));
++      assert.equal(starts, 1);
++    }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect("marks external cancellation transport failure as delivery unknown", () =>
++    Effect.gen(function* () {
++      const session = yield* openClaudeReplaySession(
++        [
++          claudeFrames.open[0],
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "initialize",
++              result: {
++                protocolVersion: 2,
++                info: { name: "external-fixture", version: "1" },
++                capabilities: { session: {} },
++                _meta: { "t3.codes/externalSession": true },
++              },
++            },
++          },
++          ...claudeFrames.open.slice(2),
++          ...claudeFrames.prompt(1),
++          claudeMarker("external working"),
++          claudeFrames.closeRequest,
++          claudeFrames.closed,
++        ],
++        undefined,
++        true,
++        "claude-acp",
++        undefined,
++        {
++          cancelError: new EffectAcpErrors.AcpTransportError({
++            detail: "Cancellation transport failed",
++            cause: "test",
++          }),
++        },
++      );
++      const input = session.turnInput(1);
++      yield* session.runtime.startTurn(input);
++      const started = yield* session.throughMarker("external working");
++      const turn = started.find((event) => event.type === "provider_turn.updated");
++      if (turn?.type !== "provider_turn.updated") throw new Error("Missing running turn");
++      const error = yield* session.runtime
++        .interruptTurn({
++          providerThread: input.providerThread,
++          providerTurnId: turn.providerTurn.id,
++          requestRuntimeRestart: true,
++        })
++        .pipe(Effect.flip);
++      if (error._tag !== "ProviderAdapterInterruptError")
++        throw new Error("Missing typed cancellation failure");
++      assert.isTrue(error.deliveryUnknown);
++      assert.isTrue(yield* session.runtime.hasPendingBackgroundWork!);
++    }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect("cancels external active work and waits for idle without closing its session", () =>
++    Effect.gen(function* () {
++      const gate = makeProviderReplayGate(["cancelled-idle"]);
++      const session = yield* openClaudeReplaySession(
++        [
++          claudeFrames.open[0],
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "initialize",
++              result: {
++                protocolVersion: 2,
++                info: { name: "external-fixture", version: "1" },
++                capabilities: { session: {} },
++                _meta: { "t3.codes/externalSession": true },
++              },
++            },
++          },
++          ...claudeFrames.open.slice(2),
++          ...claudeFrames.prompt(1),
++          claudeMarker("external working"),
++          {
++            type: "expect_outbound",
++            frame: {
++              kind: "notification",
++              method: "session/cancel",
++              params: { sessionId: CLAUDE_ROOT_SESSION },
++            },
++          },
++          claudeMarker("cancel dispatched"),
++          { ...claudeFrames.idle("cancelled"), label: "cancelled-idle" },
++          claudeFrames.closeRequest,
++          claudeFrames.closed,
++        ],
++        gate,
++      );
++      assert.isTrue(session.runtime.providerSession.capabilities.threads.canInterruptThread);
++      const input = session.turnInput(1);
++      yield* session.runtime.startTurn(input);
++      const started = yield* session.throughMarker("external working");
++      const turn = started.find((event) => event.type === "provider_turn.updated");
++      if (turn?.type !== "provider_turn.updated") throw new Error("Missing running provider turn");
++      const stopping = yield* session.runtime
++        .interruptTurn({
++          providerThread: input.providerThread,
++          providerTurnId: turn.providerTurn.id,
++          requestRuntimeRestart: true,
++        })
++        .pipe(Effect.forkScoped);
++      const beforeIdle = yield* session.throughMarker("cancel dispatched");
++      assert.isFalse(beforeIdle.some((event) => event.type === "turn.terminal"));
++      gate.release("cancelled-idle");
++      yield* Fiber.join(stopping);
++      const stopped = yield* session.until((event) => event.type === "turn.terminal");
++      const terminal = stopped.at(-1);
++      assert.isTrue(terminal?.type === "turn.terminal" && terminal.status === "cancelled");
++      assert.isTrue(
++        stopped.some(
++          (event) =>
++            event.type === "provider_thread.updated" && event.providerThread.status === "idle",
++        ),
++      );
++    }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect("binds an explicit native prompt echo and response to replay identities", () =>
++    Effect.gen(function* () {
++      const session = yield* openClaudeReplaySession([
++        ...claudeFrames.open,
++        {
++          type: "expect_outbound",
++          frame: {
++            kind: "request",
++            method: "session/prompt",
++            params: {
++              sessionId: CLAUDE_ROOT_SESSION,
++              prompt: "<any>",
++              _meta: { "t3.codes/messageId": "message-claude-lifecycle-1" },
++            },
++          },
++        },
++        claudeFrames.update(CLAUDE_ROOT_SESSION, {
++          sessionUpdate: "user_message",
++          messageId: "actual-native-user",
++          content: [{ type: "text", text: "Native reformatted prompt" }],
++          _meta: { "t3.codes/messageId": "message-claude-lifecycle-1" },
++        }),
++        claudeFrames.prompt(1)[2],
++        claudeFrames.update(CLAUDE_ROOT_SESSION, {
++          sessionUpdate: "agent_message",
++          messageId: "actual-native-answer",
++          content: [{ type: "text", text: "Native answer" }],
++        }),
++        claudeFrames.idle("end_turn"),
++        claudeFrames.closeRequest,
++        claudeFrames.closed,
++      ]);
++      assert.isFalse(session.runtime.providerSession.capabilities.threads.canInterruptThread);
++      const input = session.turnInput(1);
++      yield* session.runtime.startTurn(input);
++      const events = yield* session.until((event) => event.type === "turn.terminal");
++      const userItem = events.find(
++        (event) => event.type === "turn_item.updated" && event.turnItem.type === "user_message",
++      );
++      if (userItem?.type !== "turn_item.updated" || userItem.turnItem.type !== "user_message")
++        throw new Error("Missing native prompt binding");
++      assert.equal(
++        userItem.turnItem.id,
++        (yield* IdAllocator.IdAllocatorV2).derive.userTurnItem({
++          messageId: input.message.messageId,
++        }),
++      );
++      assert.equal(userItem.turnItem.messageId, input.message.messageId);
++      assert.equal(userItem.turnItem.text, "test prompt");
++      assert.equal(
++        userItem.turnItem.nativeItemRef?.nativeId,
++        `${CLAUDE_ROOT_SESSION}:history:user:message:actual-native-user`,
++      );
++      const assistant = events.findLast(
++        (event) => event.type === "message.updated" && event.message.role === "assistant",
++      );
++      if (assistant?.type !== "message.updated") throw new Error("Missing native response");
++      assert.equal(
++        assistant.nativeItemRef?.nativeId,
++        `${CLAUDE_ROOT_SESSION}:history:assistant:message:actual-native-answer`,
++      );
++      assert.equal(assistant.providerThreadId, input.providerThread.id);
++    }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect.each([
++    { kind: "approval", decision: "accept" },
++    { kind: "approval", decision: "decline" },
++    { kind: "question", decision: "accept" },
++    { kind: "question", decision: "cancel" },
++    { kind: "approval", decision: "withdraw" },
++    { kind: "question", decision: "withdraw" },
++  ] as const)("answers a preexisting external $kind with $decision before any prompt", (testCase) =>
++    Effect.gen(function* () {
++      const gate = makeProviderReplayGate(["withdrawal"]);
++      const method =
++        testCase.kind === "approval" ? "session/request_permission" : "elicitation/create";
++      const params =
++        testCase.kind === "approval"
++          ? {
++              sessionId: CLAUDE_ROOT_SESSION,
++              toolCall: {
++                toolCallId: "existing-control",
++                title: "Run selected command",
++                kind: "execute",
++                status: "pending",
++                rawInput: { command: "test" },
++              },
++              options: [
++                { optionId: "allow", name: "Allow once", kind: "allow_once" },
++                { optionId: "deny", name: "Deny", kind: "reject_once" },
++              ],
++            }
++          : {
++              sessionId: CLAUDE_ROOT_SESSION,
++              mode: "form",
++              message: "Choose a file",
++              requestedSchema: {
++                type: "object",
++                properties: { file: { type: "string", enum: ["a.ts", "b.ts"] } },
++                required: ["file"],
++              },
++            };
++      const session = yield* openClaudeReplaySession(
++        [
++          claudeFrames.open[0],
++          {
++            type: "emit_inbound",
++            frame: {
++              kind: "response",
++              method: "initialize",
++              result: {
++                protocolVersion: 1,
++                agentInfo: { name: "external-fixture", version: "1" },
++                agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } },
++                authMethods: [],
++                _meta: { "t3.codes/externalSession": { version: 1 } },
++              },
++            },
++          },
++          {
++            type: "expect_outbound",
++            frame: { kind: "request", method: "session/load", params: "<any>" },
++          },
++          claudeFrames.update(CLAUDE_ROOT_SESSION, {
++            sessionUpdate: "session_info_update",
++            _meta: {
++              "t3.codes/externalSessionState": { version: 1, state: "requires_action" },
++            },
++          }),
++          { type: "emit_inbound", frame: { kind: "response", method: "session/load", result: {} } },
++          { type: "emit_inbound", frame: { kind: "request", method, params } },
++          ...(testCase.decision === "withdraw"
++            ? [
++                {
++                  type: "emit_inbound",
++                  label: "withdrawal",
++                  frame: {
++                    kind: "notification",
++                    method: "$/cancel_request",
++                    params: { requestId: 999 },
++                  },
++                },
++                claudeMarker("unrelated withdrawal ignored"),
++                {
++                  type: "expect_outbound",
++                  frame: {
++                    kind: "notification",
++                    method: "session/cancel",
++                    params: { sessionId: CLAUDE_ROOT_SESSION },
++                  },
++                },
++                {
++                  type: "emit_inbound",
++                  frame: {
++                    kind: "notification",
++                    method: "$/cancel_request",
++                    params: { requestId: 1 },
++                  },
++                },
++                claudeMarker("withdrawal processed"),
++              ]
++            : []),
++          {
++            type: "expect_outbound",
++            frame: {
++              kind: "response",
++              method,
++              result:
++                testCase.kind === "approval"
++                  ? testCase.decision === "withdraw"
++                    ? { outcome: { outcome: "cancelled" } }
++                    : {
++                        outcome: {
++                          outcome: "selected",
++                          optionId: testCase.decision === "accept" ? "allow" : "deny",
++                        },
++                      }
++                  : testCase.decision === "accept"
++                    ? { action: "accept", content: { file: "a.ts" } }
++                    : { action: "cancel" },
++            },
++          },
++          claudeMarker("external request answered"),
++          claudeFrames.closeRequest,
++          claudeFrames.closed,
++        ],
++        gate,
++        false,
++        "fleet-fixture",
++        CLAUDE_ROOT_SESSION,
++        { runtimeMode: "full-access" },
++      );
++      const earlyResponse = Effect.gen(function* () {
++        while (true) {
++          const frame = (yield* Queue.take(session.outgoing)) as {
++            result?: unknown;
++            error?: unknown;
++          };
++          if ("result" in frame || "error" in frame) return [];
++        }
++      });
++      const events = yield* Effect.raceFirst(
++        session.until((event) => event.type === "runtime_request.updated"),
++        earlyResponse,
++      );
++      const event = events.find((event) => event.type === "runtime_request.updated");
++      assert.isDefined(event, "The external request must wait for the owner's explicit answer");
++      if (event?.type !== "runtime_request.updated") throw new Error("Missing external request");
++      assert.isNull(event.runtimeRequest.providerTurnId);
++      const node = events.find((event) => event.type === "node.updated");
++      if (node?.type !== "node.updated") throw new Error("Missing external request node");
++      assert.isNull(node.node.runId);
++      assert.isNull(node.node.parentNodeId);
++      assert.equal(node.node.providerThreadId, session.providerThread.id);
++      if (testCase.decision === "withdraw") {
++        gate.release("withdrawal");
++        const unchanged = yield* session.throughMarker("unrelated withdrawal ignored");
++        assert.isFalse(
++          unchanged.some(
++            (event) =>
++              event.type === "runtime_request.updated" &&
++              event.runtimeRequest.status === "cancelled",
++          ),
++        );
++        yield* session.runtime.interruptThread!({ providerThread: session.providerThread });
++        const withdrawn = yield* session.throughMarker("withdrawal processed");
++        assert.isTrue(
++          withdrawn.some(
++            (candidate) =>
++              candidate.type === "runtime_request.updated" &&
++              candidate.runtimeRequest.id === event.runtimeRequest.id &&
++              candidate.runtimeRequest.status === "cancelled",
++          ),
++        );
++      } else {
++        yield* session.runtime.respondToRuntimeRequest({
++          requestId: event.runtimeRequest.id,
++          ...(testCase.kind === "approval"
++            ? { decision: testCase.decision }
++            : testCase.decision === "accept"
++              ? { answers: { file: "a.ts" } }
++              : {}),
++        });
++      }
++      const settled = yield* session.throughMarker("external request answered");
++      assert.isFalse(
++        settled.some(
++          (event) => event.type === "turn.terminal" || event.type === "provider_turn.updated",
++        ),
++      );
++      assert.isEmpty(session.offers);
++    }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect(
++    "projects canonical native input only after the exact external dispatch is accepted",
++    () =>
++      Effect.gen(function* () {
++        const session = yield* openClaudeReplaySession(
++          [
++            claudeFrames.open[0],
++            {
++              type: "emit_inbound",
++              frame: {
++                kind: "response",
++                method: "initialize",
++                result: {
++                  protocolVersion: 1,
++                  agentInfo: { name: "external-fixture", version: "1" },
++                  agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } },
++                  authMethods: [],
++                  _meta: { "t3.codes/externalSession": { version: 1 } },
++                },
++              },
++            },
++            {
++              type: "expect_outbound",
++              frame: { kind: "request", method: "session/load", params: "<any>" },
++            },
++            {
++              type: "emit_inbound",
++              frame: { kind: "response", method: "session/load", result: {} },
++            },
++            {
++              type: "expect_outbound",
++              frame: {
++                kind: "request",
++                method: "session/prompt",
++                params: {
++                  sessionId: CLAUDE_ROOT_SESSION,
++                  prompt: "<any>",
++                  _meta: { "t3.codes/messageId": "message-claude-lifecycle-1" },
++                },
++              },
++            },
++            claudeFrames.update(CLAUDE_ROOT_SESSION, {
++              sessionUpdate: "session_info_update",
++              _meta: {
++                "t3.codes/externalSessionDispatch": {
++                  version: 1,
++                  messageId: "another-input",
++                  state: "accepted",
++                },
++              },
++            }),
++            claudeFrames.update(CLAUDE_ROOT_SESSION, {
++              sessionUpdate: "session_info_update",
++              _meta: {
++                "t3.codes/externalSessionDispatch": {
++                  version: 1,
++                  messageId: "message-claude-lifecycle-1",
++                  state: "accepted",
++                },
++              },
++            }),
++            claudeFrames.update(CLAUDE_ROOT_SESSION, {
++              sessionUpdate: "user_message_chunk",
++              messageId: "original-native-user",
++              content: { type: "text", text: "Original native input" },
++            }),
++            claudeFrames.update(CLAUDE_ROOT_SESSION, {
++              sessionUpdate: "agent_message_chunk",
++              messageId: "original-native-reply",
++              content: { type: "text", text: "Original native answer" },
++            }),
++            claudeFrames.update(CLAUDE_ROOT_SESSION, {
++              sessionUpdate: "session_info_update",
++              _meta: {
++                "t3.codes/externalSessionState": { version: 1, state: "idle" },
++              },
++            }),
++            {
++              type: "emit_inbound",
++              frame: {
++                kind: "response",
++                method: "session/prompt",
++                result: { stopReason: "end_turn" },
++              },
++            },
++            claudeFrames.closeRequest,
++            claudeFrames.closed,
++          ],
++          undefined,
++          false,
++          "fleet-fixture",
++          CLAUDE_ROOT_SESSION,
++        );
++        const input = session.turnInput(1);
++        yield* session.runtime.startTurn(input);
++        const events = yield* session.until((event) => event.type === "turn.terminal");
++        const inputs = events.flatMap((event) =>
++          event.type === "turn_item.updated" && event.turnItem.type === "user_message"
++            ? [event.turnItem]
++            : [],
++        );
++        const provisional = inputs.filter((item) => item.externalSessionInput === true);
++        assert.equal(provisional.length, 1);
++        assert.equal(provisional[0]!.messageId, input.message.messageId);
++        assert.isNull(provisional[0]!.nativeItemRef);
++        const native = inputs.filter((item) => item.externalSessionInput !== true);
++        assert.equal(native.length, 1);
++        assert.equal(native[0]!.text, "Original native input");
++        assert.equal(
++          native[0]!.nativeItemRef?.nativeId,
++          `${CLAUDE_ROOT_SESSION}:history:user:message:original-native-user`,
++        );
++        assert.notEqual(native[0]!.messageId, input.message.messageId);
++      }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
++  it.effect.each([
++    { activation: "initial", protocolVersion: 1 },
++    { activation: "resume", protocolVersion: 1 },
++    { activation: "initial", protocolVersion: 2 },
++    { activation: "resume", protocolVersion: 2 },
++  ] as const)(
++    "projects external history and original-session Stop without a local turn (%o)",
++    ({ activation, protocolVersion }) =>
++      Effect.gen(function* () {
++        const importedSession = "existing-fleet-session";
++        const gate = makeProviderReplayGate(["external-output"]);
++        const message = (role: "user" | "agent", messageId: string, text: string) =>
++          claudeFrames.update(importedSession, {
++            sessionUpdate: protocolVersion === 1 ? `${role}_message_chunk` : `${role}_message`,
++            messageId,
++            content: protocolVersion === 1 ? { type: "text", text } : [{ type: "text", text }],
++          });
++        const state = (value: "running" | "idle") =>
++          claudeFrames.update(
++            importedSession,
++            protocolVersion === 1
++              ? {
++                  sessionUpdate: "session_info_update",
++                  _meta: { "t3.codes/externalSessionState": { version: 1, state: value } },
++                }
++              : {
++                  sessionUpdate: "state_update",
++                  state: value,
++                  ...(value === "idle" ? { stopReason: "end_turn" } : {}),
++                },
++          );
++        const marker = (title: string) =>
++          claudeFrames.update(activation === "initial" ? importedSession : CLAUDE_ROOT_SESSION, {
++            sessionUpdate: "session_info_update",
++            title,
++          });
++        const session = yield* openClaudeReplaySession(
++          [
++            claudeFrames.open[0],
++            {
++              type: "emit_inbound",
++              frame: {
++                kind: "response",
++                method: "initialize",
++                result: {
++                  protocolVersion,
++                  ...(protocolVersion === 1
++                    ? {
++                        agentInfo: { name: "external-fixture", version: "1" },
++                        agentCapabilities: {
++                          loadSession: true,
++                          sessionCapabilities: { resume: {}, close: {} },
++                        },
++                      }
++                    : {
++                        info: { name: "external-fixture", version: "1" },
++                        capabilities: { session: {} },
++                      }),
++                  authMethods: [],
++                  _meta: { "t3.codes/externalSession": { version: 1 } },
++                },
++              },
++            },
++            ...(activation === "initial" ? [] : claudeFrames.open.slice(2)),
++            {
++              type: "expect_outbound",
++              frame: {
++                kind: "request",
++                method: protocolVersion === 1 ? "session/load" : "session/resume",
++                params: "<any>",
++              },
++            },
++            message("user", "existing-user", "Existing question"),
++            message("agent", "existing-answer", "Existing answer"),
++            state("running"),
++            {
++              type: "emit_inbound",
++              frame: {
++                kind: "response",
++                method: protocolVersion === 1 ? "session/load" : "session/resume",
++                result: {},
++              },
++            },
++            marker("history loaded"),
++            {
++              type: "expect_outbound",
++              frame: {
++                kind: "notification",
++                method: "session/cancel",
++                params: { sessionId: importedSession },
++              },
++            },
++            {
++              ...message(
++                "agent",
++                "existing-answer",
++                protocolVersion === 1
++                  ? " continued externally"
++                  : "Existing answer continued externally",
++              ),
++              label: "external-output",
++            },
++            message("agent", "next-answer", "Another answer"),
++            state("idle"),
++            marker("external output received"),
++            {
++              type: "expect_outbound",
++              frame: {
++                kind: "request",
++                method: "session/close",
++                params: { sessionId: importedSession },
++              },
++            },
++            claudeFrames.closed,
++          ],
++          gate,
++          false,
++          "fleet-fixture",
++          activation === "initial" ? importedSession : undefined,
++        );
++        const importedThread = {
++          ...session.providerThread,
++          nativeThreadRef: {
++            driver: ACP_REGISTRY_PROVIDER,
++            nativeId: importedSession,
++            strength: "strong" as const,
++          },
++        };
++        const attachedThread =
++          activation === "initial"
++            ? session.providerThread
++            : yield* session.runtime.resumeThread({ providerThread: importedThread });
++        assert.equal(attachedThread.status, "active");
++        const loaded = yield* session.throughMarker("history loaded");
++        const loadedMessages = loaded.flatMap((event) =>
++          event.type === "message.updated" ? [event.message] : [],
++        );
++        assert.deepEqual(
++          loadedMessages.map((message) => message.text),
++          ["Existing question", "Existing answer"],
++        );
++        const loadedItems = loaded.flatMap((event) =>
++          event.type === "turn_item.updated" ? [event.turnItem] : [],
++        );
++        assert.deepEqual(
++          loadedItems.map((item) => item.type),
++          ["user_message", "assistant_message"],
++        );
++        assert.isTrue(loadedItems.every((item) => item.runId === null && item.nodeId === null));
++        assert.isTrue(loadedItems.every((item) => item.providerThreadId === importedThread.id));
++        const loadedAgain = yield* session.runtime.resumeThread({
++          providerThread: { ...importedThread, status: "not_loaded" },
++        });
++        assert.equal(
++          loadedAgain.status,
++          "active",
++          "attaching an imported binding preserves observed external work",
++        );
++        assert.isDefined(session.runtime.interruptThread);
++        yield* session.runtime.interruptThread!({ providerThread: importedThread });
++        gate.release("external-output");
++        const live = yield* session.throughMarker("external output received");
++        const liveMessages = live.flatMap((event) =>
++          event.type === "message.updated" ? [event.message] : [],
++        );
++        assert.deepEqual(
++          liveMessages.map((message) => message.text),
++          ["Existing answer continued externally", "Another answer"],
++        );
++        assert.equal(liveMessages[0]!.id, loadedMessages[1]!.id);
++        assert.deepEqual(liveMessages[0]!.createdAt, loadedMessages[1]!.createdAt);
++        assert.notEqual(liveMessages[0]!.id, liveMessages[1]!.id);
++        const liveItems = live.flatMap((event) =>
++          event.type === "turn_item.updated" ? [event.turnItem] : [],
++        );
++        assert.equal(liveItems[0]!.id, loadedItems[1]!.id);
++        assert.deepEqual(
++          liveItems.map((item) => item.ordinal),
++          [loadedItems[1]!.ordinal, 3],
++        );
++        assert.isFalse([...loaded, ...live].some((event) => event.type === "turn.terminal"));
++        assert.deepEqual(session.offers, []);
++        assert.isTrue(
++          live.some(
++            (event) =>
++              event.type === "provider_thread.updated" &&
++              event.providerThread.nativeThreadRef?.nativeId === importedSession &&
++              event.providerThread.status === "idle",
++          ),
++        );
++      }).pipe(Effect.provide(layerTest), Effect.scoped),
++  );
++
+   it("preserves and sanitizes structured ACP errors without exposing arbitrary defects", () => {
+     const limit = new EffectAcpErrors.AcpRequestError({
+       code: -31001,
+@@ -1752,6 +2510,7 @@ describe("AcpRegistryAdapterV2", () => {
+         ],
+       );
+       assert.deepEqual(childThreads.at(-1)?.nativeMetadata, {
++        itemIdentityVersion: 2,
+         title: "Child review",
+         updatedAt: "2026-10-19T00:00:00Z",
+       });
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index 69fd6068..ed087d0d 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -58,6 +58,11 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
+     type: Schema.Literal("provider-turn.start"),
+     runId: RunId,
+   }),
++  Schema.Struct({
++    type: Schema.Literal("provider-thread.interrupt"),
++    providerSessionId: ProviderSessionId,
++    providerThreadId: ProviderThreadId,
++  }),
+   Schema.Struct({
+     type: Schema.Literal("provider-turn.interrupt"),
+     providerSessionId: ProviderSessionId,
+@@ -157,6 +162,7 @@ export const PROCESS_BOUND_EFFECT_TYPES = [
+   "provider-session.apply-thread-title",
+   "provider-turn.start",
+   "provider-turn.interrupt",
++  "provider-thread.interrupt",
+   "provider-turn.steer",
+   "provider-turn.restart",
+   "runtime-request.respond",
+diff --git a/apps/server/src/orchestration-v2/EffectWorker.test.ts b/apps/server/src/orchestration-v2/EffectWorker.test.ts
+index 428d7d47..ec0e2d01 100644
+--- a/apps/server/src/orchestration-v2/EffectWorker.test.ts
++++ b/apps/server/src/orchestration-v2/EffectWorker.test.ts
+@@ -35,6 +35,7 @@ import * as CheckpointService from "./CheckpointService.ts";
+ import * as EffectOutbox from "./EffectOutbox.ts";
+ import * as EffectWorker from "./EffectWorker.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
++import * as Orchestrator from "./Orchestrator.ts";
+ import * as RunFinalizationService from "./RunFinalizationService.ts";
+ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+ import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+@@ -99,6 +100,7 @@ function layerExecutorFor(input: {
+     Layer.succeed(
+       ProviderTurnControlService.ProviderTurnControlServiceV2,
+       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
++        interruptThread: () => Effect.void,
+         interrupt: input.interrupt ?? (() => Effect.void),
+         steer: () => Effect.void,
+         applyModelSelection: () => Effect.void,
+@@ -114,6 +116,7 @@ function layerExecutorFor(input: {
+     Layer.succeed(
+       ProviderSessionManager.ProviderSessionManagerV2,
+       ProviderSessionManager.ProviderSessionManagerV2.of({
++        loadImportedThread: () => Effect.void,
+         shutdown: Effect.void,
+         open: () => Effect.die("unused open"),
+         get: () => Effect.succeedNone,
+@@ -187,14 +190,22 @@ it.effect.each([
+   {
+     name: "settles a stopped run when its adapter has already lost the native turn",
+     unresponsive: false,
++    deliveryUnknown: false,
+     dispatched: ["thread.background-work.settle"],
+   },
+   {
+     name: "leaves the run running and flags the Stop when the provider never confirms it",
+     unresponsive: true,
++    deliveryUnknown: false,
+     dispatched: ["thread.interrupt.unresponsive"],
+   },
+-])("$name", ({ unresponsive, dispatched }) =>
++  {
++    name: "leaves an uncertain Stop unresolved without retrying cancellation",
++    unresponsive: false,
++    deliveryUnknown: true,
++    dispatched: ["thread.interrupt.unresponsive"],
++  },
++])("$name", ({ unresponsive, deliveryUnknown, dispatched }) =>
+   Effect.gen(function* () {
+     const now = yield* DateTime.now;
+     const events = yield* Ref.make<ReadonlyArray<string>>([]);
+@@ -206,7 +217,12 @@ it.effect.each([
+           operation: "interrupt",
+           providerTurnId,
+           ...(unresponsive ? { unresponsive } : {}),
+-          cause: unresponsive ? "Timed out." : "Provider turn is not active.",
++          ...(deliveryUnknown ? { deliveryUnknown } : {}),
++          cause: deliveryUnknown
++            ? "Connection lost after dispatch."
++            : unresponsive
++              ? "Timed out."
++              : "Provider turn is not active.",
+         }),
+       threads: {
+         dispatch: (command) =>
+@@ -538,6 +554,90 @@ it.effect.each([
+     assert.isTrue(Option.isSome(stopped));
+   }),
+ );
++it.effect.each(["native-session", "local-turn-state-write"] as const)(
++  "never retries an uncertain interrupt after %s failure",
++  (scenario) =>
++    Effect.gen(function* () {
++      const now = yield* DateTime.now;
++      const effect: EffectOutbox.OrchestrationEffectV2 = {
++        ...restartEffect(now, { type: "detach" }),
++        request:
++          scenario === "native-session"
++            ? {
++                type: "provider-thread.interrupt",
++                providerSessionId: oldSessionId,
++                providerThreadId,
++              }
++            : {
++                type: "provider-turn.interrupt",
++                providerSessionId: oldSessionId,
++                providerThreadId,
++                providerTurnId,
++              },
++      };
++      const deliveries = yield* Ref.make(0);
++      const outcomes = yield* Ref.make<ReadonlyArray<string>>([]);
++      const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
++        claimNext: () => Effect.succeedSome(effect),
++        get: () => Effect.succeedSome(effect),
++        awaitCancellation: () => Effect.never,
++        clearCancellation: () => Effect.void,
++        fail: () => Ref.update(outcomes, (current) => [...current, "failed"]).pipe(Effect.as(true)),
++        retry: () =>
++          Ref.update(outcomes, (current) => [...current, "retried"]).pipe(Effect.as(true)),
++        succeed: () =>
++          Ref.update(outcomes, (current) => [...current, "succeeded"]).pipe(Effect.as(true)),
++      });
++      const layerExecutor =
++        scenario === "native-session"
++          ? Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
++              execute: () =>
++                Ref.update(deliveries, (count) => count + 1).pipe(
++                  Effect.andThen(
++                    new EffectWorker.OrchestrationEffectExecutionError({
++                      effectId: effect.id,
++                      effectType: effect.request.type,
++                      cause: "Delivery was not confirmed",
++                    }),
++                  ),
++                ),
++            })
++          : layerExecutorFor({
++              events: outcomes,
++              interrupt: () =>
++                Ref.update(deliveries, (count) => count + 1).pipe(
++                  Effect.andThen(
++                    new ProviderTurnControlService.ProviderTurnControlError({
++                      threadId,
++                      providerTurnId,
++                      operation: "interrupt",
++                      deliveryUnknown: true,
++                      cause: "Connection lost after cancellation dispatch",
++                    }),
++                  ),
++                ),
++              threads: {
++                dispatch: () =>
++                  Effect.fail(
++                    new Orchestrator.OrchestratorProjectionError({
++                      threadId,
++                      cause: "Unable to persist the unresponsive state",
++                    }),
++                  ),
++              },
++            });
++      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
++        Effect.flatMap((worker) => worker.runOnce()),
++        Effect.provide(
++          EffectWorker.layerWithOptions({ workerId: "native-interrupt-test" }).pipe(
++            Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
++          ),
++        ),
++      );
++      assert.equal(yield* Ref.get(deliveries), 1);
++      assert.deepEqual(yield* Ref.get(outcomes), ["failed"]);
++    }),
++);
+ 
+ it.effect("arms cancellation before the durable pre-execution check", () =>
+   Effect.gen(function* () {
+diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
+index c6aa09ef..2f69d7e7 100644
+--- a/apps/server/src/orchestration-v2/EffectWorker.ts
++++ b/apps/server/src/orchestration-v2/EffectWorker.ts
+@@ -40,6 +40,7 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
+   {
+     effectId: Schema.String,
+     effectType: Schema.String,
++    retryable: Schema.optional(Schema.Boolean),
+     cause: Schema.optional(Schema.Defect()),
+   },
+ ) {}
+@@ -246,6 +247,23 @@ export const layerExecutor: Layer.Layer<
+                   }),
+               ),
+             );
++          case "provider-thread.interrupt":
++            return providerTurnControl
++              .interruptThread({
++                threadId: effect.threadId,
++                providerSessionId: effect.request.providerSessionId,
++                providerThreadId: effect.request.providerThreadId,
++              })
++              .pipe(
++                Effect.mapError(
++                  (cause) =>
++                    new OrchestrationEffectExecutionError({
++                      effectId: effect.id,
++                      effectType: effect.request.type,
++                      cause,
++                    }),
++                ),
++              );
+           case "provider-turn.interrupt": {
+             const request = effect.request;
+             return providerTurnControl
+@@ -272,12 +290,21 @@ export const layerExecutor: Layer.Layer<
+                         cause,
+                       }),
+                 ),
+-                Effect.map((outcome) => ({ unresponsive: false, outcome }) as const),
++                Effect.map(
++                  (outcome) => ({ unresponsive: false, deliveryUnknown: false, outcome }) as const,
++                ),
+                 // Settling here would end the run while the agent may still be running; the
+                 // user decides with Force stop instead.
+                 Effect.catchIf(
+-                  (cause) => request.subagent === undefined && cause.unresponsive === true,
+-                  () => Effect.succeed({ unresponsive: true, outcome: undefined } as const),
++                  (cause) =>
++                    request.subagent === undefined &&
++                    (cause.unresponsive === true || cause.deliveryUnknown === true),
++                  (cause) =>
++                    Effect.succeed({
++                      unresponsive: true,
++                      deliveryUnknown: cause.deliveryUnknown === true,
++                      outcome: undefined,
++                    } as const),
+                 ),
+                 Effect.catchIf(
+                   (cause) =>
+@@ -286,43 +313,64 @@ export const layerExecutor: Layer.Layer<
+                       request.type,
+                       Cause.pretty(Cause.fail(cause)),
+                     ),
+-                  () => Effect.succeed({ unresponsive: false, outcome: undefined } as const),
++                  () =>
++                    Effect.succeed({
++                      unresponsive: false,
++                      deliveryUnknown: false,
++                      outcome: undefined,
++                    } as const),
+                 ),
+-                Effect.andThen(({ unresponsive, outcome }) =>
+-                  unresponsive
+-                    ? threads.dispatch({
+-                        type: "thread.interrupt.unresponsive",
+-                        commandId: CommandId.make(`${effect.id}:unresponsive`),
+-                        threadId: effect.threadId,
+-                        providerThreadId: request.providerThreadId,
+-                        providerTurnId: request.providerTurnId,
+-                      })
+-                    : request.subagent !== undefined && outcome === undefined
+-                      ? Effect.void
+-                      : threads.dispatch({
+-                          type: "thread.background-work.settle",
+-                          commandId: CommandId.make(`${effect.id}:background-work-settled`),
+-                          ...(request.subagent === undefined || outcome === undefined
+-                            ? {}
+-                            : {
+-                                subagent: {
+-                                  id: request.subagent.id,
+-                                  stoppedAt: DateTime.makeUnsafe(effect.createdAt),
+-                                  outcome,
+-                                },
+-                              }),
++                Effect.andThen(({ unresponsive, deliveryUnknown, outcome }) =>
++                  Effect.gen(function* () {
++                    if (unresponsive) {
++                      yield* threads
++                        .dispatch({
++                          type: "thread.interrupt.unresponsive",
++                          commandId: CommandId.make(`${effect.id}:unresponsive`),
+                           threadId: effect.threadId,
+                           providerThreadId: request.providerThreadId,
+                           providerTurnId: request.providerTurnId,
+-                        }),
++                        })
++                        .pipe(
++                          Effect.mapError(
++                            (cause) =>
++                              new OrchestrationEffectExecutionError({
++                                effectId: effect.id,
++                                effectType: request.type,
++                                ...(deliveryUnknown ? { retryable: false } : {}),
++                                cause,
++                              }),
++                          ),
++                        );
++                      return;
++                    }
++                    if (request.subagent !== undefined && outcome === undefined) return;
++                    yield* threads.dispatch({
++                      type: "thread.background-work.settle",
++                      commandId: CommandId.make(`${effect.id}:background-work-settled`),
++                      ...(request.subagent === undefined || outcome === undefined
++                        ? {}
++                        : {
++                            subagent: {
++                              id: request.subagent.id,
++                              stoppedAt: DateTime.makeUnsafe(effect.createdAt),
++                              outcome,
++                            },
++                          }),
++                      threadId: effect.threadId,
++                      providerThreadId: request.providerThreadId,
++                      providerTurnId: request.providerTurnId,
++                    });
++                  }),
+                 ),
+-                Effect.mapError(
+-                  (cause) =>
+-                    new OrchestrationEffectExecutionError({
+-                      effectId: effect.id,
+-                      effectType: request.type,
+-                      cause,
+-                    }),
++                Effect.mapError((cause) =>
++                  isOrchestrationEffectExecutionError(cause)
++                    ? cause
++                    : new OrchestrationEffectExecutionError({
++                        effectId: effect.id,
++                        effectType: request.type,
++                        cause,
++                      }),
+                 ),
+               );
+           }
+@@ -960,6 +1008,10 @@ export const layerWithOptions = (
+           }
+ 
+           const error = Cause.pretty(exit.cause);
++          const retryForbidden = Option.exists(
++            Cause.findErrorOption(exit.cause),
++            (failure) => failure.retryable === false,
++          );
+           const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
+           yield* Effect.logWarning("Orchestration effect execution failed", {
+             effectId: effect.id,
+@@ -972,8 +1024,10 @@ export const layerWithOptions = (
+             ? yield* outbox
+                 .succeed({ effectId: effect.id, workerId })
+                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
+-            : effect.attemptCount >= maxAttempts &&
+-                (!ownsStartingRun(effect.request.type) || cannotSettleRun(exit.cause))
++            : retryForbidden ||
++                effect.request.type === "provider-thread.interrupt" ||
++                (effect.attemptCount >= maxAttempts &&
++                  (!ownsStartingRun(effect.request.type) || cannotSettleRun(exit.cause)))
+               ? yield* outbox
+                   .fail({ effectId: effect.id, workerId, error })
+                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index 27f7aa82..b2c186fb 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -13711,10 +13711,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+   ) {
+     const projection = yield* projectionStore
+-      .getThreadRecords(command.threadId, ["runs", "providerThreads", "turnItems", "subagents"], {
+-        turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
+-        turnItemStatuses: ["pending", "running", "waiting"],
+-      })
++      .getThreadRecords(
++        command.threadId,
++        ["runs", "providerThreads", "providerSessions", "turnItems", "subagents"],
++        {
++          turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
++          turnItemStatuses: ["pending", "running", "waiting"],
++        },
++      )
+       .pipe(
+         Effect.mapError(
+           (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+@@ -13730,20 +13734,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+         ? Effect.void
+         : Ref.update(effects, (existing) => [...existing, delegatedTasksStopEffect(command)]);
+     const latestRun = projection.runs.findLast((run) => run.status !== "queued");
++    const activeProviderThread = projection.providerThreads.find(
++      (thread) => thread.id === projection.thread.activeProviderThreadId,
++    );
++    const nativeInterrupt =
++      !hasLiveRun({ runs: projection.runs }) &&
++      activeProviderThread?.providerSessionId != null &&
++      activeProviderThread.status === "active" &&
++      projection.providerSessions.some(
++        (session) =>
++          session.id === activeProviderThread.providerSessionId &&
++          session.capabilities.threads.canInterruptThread === true,
++      )
++        ? activeProviderThread
++        : undefined;
++    if (nativeInterrupt?.providerSessionId != null) {
++      const providerSessionId = nativeInterrupt.providerSessionId;
++      yield* Ref.update(effects, (existing) => [
++        ...existing,
++        {
++          id: `effect:${command.commandId}:provider-thread.interrupt:${nativeInterrupt.id}`,
++          commandId: command.commandId,
++          threadId: command.threadId,
++          request: {
++            type: "provider-thread.interrupt",
++            providerSessionId,
++            providerThreadId: nativeInterrupt.id,
++          },
++        } satisfies PendingOrchestrationEffectV2,
++      ]);
++    }
+     const target =
+-      projection.runs.findLast(
+-        (run) =>
+-          run.status === "preparing" || run.status === "starting" || run.status === "running",
+-      ) ??
+-      (derivePendingBackgroundWork({
+-        latestRun,
+-        providerThreads: projection.providerThreads,
+-        turnItems: projection.turnItems,
+-        activeProviderThreadId: projection.thread.activeProviderThreadId,
+-        runs: projection.runs,
+-      }).length > 0
+-        ? latestRun
+-        : undefined);
++      nativeInterrupt !== undefined
++        ? undefined
++        : (projection.runs.findLast(
++            (run) =>
++              run.status === "preparing" || run.status === "starting" || run.status === "running",
++          ) ??
++          (derivePendingBackgroundWork({
++            latestRun,
++            providerThreads: projection.providerThreads,
++            turnItems: projection.turnItems,
++            activeProviderThreadId: projection.thread.activeProviderThreadId,
++            runs: projection.runs,
++          }).length > 0
++            ? latestRun
++            : undefined));
+     if (target !== undefined) {
+       const interruptEvents = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
+       const interruptEffects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index 5b71a6ac..f9c7f739 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -347,6 +347,10 @@ export interface ProjectionRuntimeResponseContext {
+ }
+ 
+ export interface ProjectionRecordFilter {
++  readonly turnItemNativeRef?: {
++    readonly providerThreadId: ProviderThreadId;
++    readonly ref: NonNullable<OrchestrationV2TurnItem["nativeItemRef"]>;
++  };
+   readonly providerThreadIds?: ReadonlyArray<ProviderThreadId>;
+   readonly providerTurnIds?: ReadonlyArray<ProviderTurnId>;
+   readonly providerTurnAttemptIds?: ReadonlyArray<RunAttemptId>;
+@@ -3575,6 +3579,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+ 
+     const turnItemMatch = (threadId: ThreadId, filter: ProjectionRecordFilter | undefined) => sql`
+       ${threadColumn(filter?.turnItemNodeIds)} = ${threadId}
++        ${filter?.turnItemNativeRef === undefined ? sql`` : sql`AND provider_thread_id = ${filter.turnItemNativeRef.providerThreadId} AND json_extract(payload_json, '$.nativeItemRef.driver') = ${filter.turnItemNativeRef.ref.driver} AND json_extract(payload_json, '$.nativeItemRef.nativeId') = ${filter.turnItemNativeRef.ref.nativeId}`}
+         ${filter?.turnItemRequestIds === undefined ? sql`` : sql`AND json_extract(payload_json, '$.requestId') IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRequestIds)}))`}
+         ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
+         ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
+diff --git a/apps/server/src/orchestration-v2/ProviderAdapterRegistry.ts b/apps/server/src/orchestration-v2/ProviderAdapterRegistry.ts
+index a04c1df8..80b8814a 100644
+--- a/apps/server/src/orchestration-v2/ProviderAdapterRegistry.ts
++++ b/apps/server/src/orchestration-v2/ProviderAdapterRegistry.ts
+@@ -48,6 +48,7 @@ export interface ProviderAdapterRegistryV2Shape {
+       readonly driver: ProviderAdapter.ProviderAdapterV2["Service"]["driver"];
+       readonly continuationKey: string;
+       readonly enabled: boolean;
++      readonly canObserve?: boolean;
+       readonly capabilities: OrchestrationV2ProviderCapabilities;
+     },
+     ProviderAdapterRegistryV2Error
+@@ -143,11 +144,13 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
+               (cause) => new ProviderAdapterRegistryMetadataError({ instanceId, cause }),
+             ),
+           );
++        const snapshot = yield* instance.snapshot.getSnapshot;
+         return {
+           driver: instance.driverKind,
+           continuationKey: instance.continuationIdentity.continuationKey,
+           enabled: instance.enabled,
+           capabilities,
++          canObserve: snapshot.nativeSessions?.canObserve === true,
+         };
+       }),
+     });
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
+index 7aa18f09..f4c51bec 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
+@@ -234,6 +234,188 @@ function threadCreatedEvent(
+ 
+ const layer = it.layer(layerTest);
+ 
++it.effect.each(["user", "assistant"] as const)(
++  "converges passive %s replay with the persisted native message binding",
++  (role) =>
++    Effect.gen(function* () {
++      const now = yield* DateTime.now;
++      const eventSink = yield* EventSink.EventSinkV2;
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
++      const ids = yield* IdAllocator.IdAllocatorV2;
++      const threadEvent = yield* threadCreatedEvent(now);
++      const threadId = threadEvent.threadId;
++      yield* eventSink.write({ events: [threadEvent] });
++      const providerSessionId = yield* ids.allocate.providerSession({
++        providerInstanceId: modelSelection.instanceId,
++        threadId,
++      });
++      const providerThreadId = ProviderThreadId.make("native-owner");
++      const nativeItemRef = {
++        driver: CODEX_DRIVER,
++        nativeId: `session:history:${role}:message:source-1`,
++        strength: "strong" as const,
++      };
++      const runId = RunId.make("original-run");
++      const nodeId = NodeId.make("original-node");
++      const message = {
++        createdBy: role === "user" ? ("user" as const) : ("agent" as const),
++        creationSource: "web" as const,
++        id: MessageId.make(`original-${role}`),
++        threadId,
++        runId,
++        nodeId,
++        role,
++        text: "Original text",
++        attachments: [],
++        streaming: false,
++        createdAt: now,
++        updatedAt: now,
++      };
++      const item: OrchestrationV2TurnItem = {
++        id: TurnItemId.make(`original-${role}`),
++        threadId,
++        runId,
++        nodeId,
++        providerThreadId,
++        providerTurnId: ProviderTurnId.make("original-turn"),
++        nativeItemRef,
++        parentItemId: null,
++        ordinal: 9,
++        status: "completed",
++        title: null,
++        startedAt: now,
++        completedAt: now,
++        updatedAt: now,
++        ...(role === "user"
++          ? {
++              type: "user_message",
++              createdBy: "user",
++              creationSource: "web",
++              messageId: message.id,
++              inputIntent: "turn_start",
++              text: message.text,
++              attachments: [],
++            }
++          : {
++              type: "assistant_message",
++              messageId: message.id,
++              text: message.text,
++              streaming: false,
++            }),
++      };
++      const ingest = (event: ProviderAdapter.ProviderAdapterV2Event) =>
++        ingestor.ingestNormalized({
++          providerSessionId,
++          providerInstanceId: modelSelection.instanceId,
++          threadId,
++          event,
++        });
++      yield* ingest({ type: "message.updated", driver: CODEX_DRIVER, message });
++      yield* ingest({
++        type: "turn_item.updated",
++        driver: CODEX_DRIVER,
++        turnItem: {
++          ...item,
++          nativeItemRef: role === "user" ? null : nativeItemRef,
++        },
++      });
++      const beforeAlias = yield* projections.getTurnItem({ threadId, itemId: item.id });
++      if (beforeAlias?.type !== "user_message" && beforeAlias?.type !== "assistant_message") {
++        return yield* Effect.die("Expected the persisted conversation item");
++      }
++      if (role === "user") {
++        yield* ingest({
++          type: "turn_item.updated",
++          driver: CODEX_DRIVER,
++          turnItem: {
++            ...item,
++            startedAt: null,
++            completedAt: null,
++            title: "native alias",
++          },
++        });
++        assert.deepEqual(yield* projections.getTurnItem({ threadId, itemId: item.id }), {
++          ...beforeAlias,
++          nativeItemRef,
++        });
++      }
++      yield* ingest({
++        type: "turn_item.updated",
++        driver: CODEX_DRIVER,
++        turnItem: {
++          ...item,
++          id: TurnItemId.make("other-owner"),
++          providerThreadId: ProviderThreadId.make("other-owner"),
++        },
++      });
++      const otherItem = yield* projections.getTurnItem({
++        threadId,
++        itemId: TurnItemId.make("other-owner"),
++      });
++
++      const replayMessage = {
++        ...message,
++        id: MessageId.make(`replay-${role}`),
++        runId: null,
++        nodeId: null,
++        creationSource: "provider" as const,
++        text: "Updated text",
++      };
++      const replayItem = {
++        ...item,
++        id: TurnItemId.make(`replay-${role}`),
++        messageId: replayMessage.id,
++        runId: null,
++        nodeId: null,
++        providerTurnId: null,
++        ordinal: 1,
++        text: "Updated text",
++      };
++      for (let replay = 0; replay < 2; replay++) {
++        yield* ingest({
++          type: "message.updated",
++          driver: CODEX_DRIVER,
++          message: replayMessage,
++          providerThreadId,
++          nativeItemRef,
++        });
++        yield* ingest({ type: "turn_item.updated", driver: CODEX_DRIVER, turnItem: replayItem });
++      }
++      const projection = yield* projections.getThreadProjection(threadId);
++      assert.equal(projection.messages.length, 1);
++      assert.equal(projection.turnItems.length, 2);
++      const expectedText = role === "user" ? message.text : "Updated text";
++      assert.deepEqual(projection.messages[0], { ...message, text: expectedText });
++      const persisted = projection.turnItems.find((candidate) => candidate.id === item.id);
++      assert.deepEqual(persisted, { ...beforeAlias, nativeItemRef, text: expectedText });
++      assert.deepEqual(
++        projection.turnItems.find((candidate) => candidate.id === TurnItemId.make("other-owner")),
++        otherItem,
++      );
++      yield* ingest({
++        type: "turn_item.updated",
++        driver: CODEX_DRIVER,
++        turnItem: { ...item, id: TurnItemId.make("ambiguous-source") },
++      });
++      const ambiguous = yield* ingestor.normalize({
++        providerSessionId,
++        providerInstanceId: modelSelection.instanceId,
++        threadId,
++        event: {
++          type: "message.updated",
++          driver: CODEX_DRIVER,
++          message: replayMessage,
++          providerThreadId,
++          nativeItemRef,
++        },
++      });
++      assert.equal(ambiguous[0]?.type, "message.updated");
++      if (ambiguous[0]?.type === "message.updated")
++        assert.equal(ambiguous[0].payload.id, replayMessage.id);
++    }).pipe(Effect.provide(layerTest)),
++);
++
+ it.effect("takes a hub's reset for an unreset usage_limit, then refreshes the snapshot", () =>
+   Effect.gen(function* () {
+     const refreshed = yield* Deferred.make<void>();
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+index 45ed0d1c..44d21e8b 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+@@ -7,6 +7,7 @@ import {
+   type OrchestrationV2Run,
+   type OrchestrationV2Subagent,
+   type OrchestrationV2ThreadProjection,
++  type OrchestrationV2TurnItem,
+   type ModelSelection,
+   ProviderInstanceId,
+   ProviderSessionId,
+@@ -464,6 +465,17 @@ export const layer: Layer.Layer<
+       return events;
+     });
+ 
++    const nativeTurnItem = Effect.fnUntraced(function* (
++      threadId: ThreadId,
++      providerThreadId: ProviderThreadId,
++      ref: NonNullable<OrchestrationV2TurnItem["nativeItemRef"]>,
++    ) {
++      const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
++        turnItemNativeRef: { providerThreadId, ref },
++      });
++      return turnItems.length === 1 ? turnItems[0] : undefined;
++    });
++
+     const normalize: ProviderEventIngestorV2Shape["normalize"] =
+       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
+       Effect.fnUntraced(
+@@ -568,28 +580,150 @@ export const layer: Layer.Layer<
+                   nodeId: input.event.subagent.id,
+                 }),
+               ];
+-            case "message.updated":
++            case "message.updated": {
++              const offered = input.event.message;
++              let message = offered;
++              if (
++                offered.runId === null &&
++                input.event.providerThreadId !== undefined &&
++                input.event.nativeItemRef !== undefined
++              ) {
++                const item = yield* nativeTurnItem(
++                  offered.threadId,
++                  input.event.providerThreadId,
++                  input.event.nativeItemRef,
++                );
++                if (
++                  (item?.type === "user_message" && offered.role === "user") ||
++                  (item?.type === "assistant_message" && offered.role === "assistant")
++                ) {
++                  const previous = (yield* projections.getMessagesById(offered.threadId, [
++                    item.messageId,
++                  ])).get(item.messageId);
++                  if (previous !== undefined) {
++                    message = {
++                      ...previous,
++                      ...offered,
++                      id: previous.id,
++                      runId: previous.runId,
++                      nodeId: previous.nodeId,
++                      createdBy: previous.createdBy,
++                      creationSource: previous.creationSource,
++                      createdAt: previous.createdAt,
++                      text:
++                        previous.role === "user" && previous.runId !== null
++                          ? previous.text
++                          : offered.text,
++                      attachments:
++                        offered.attachments.length === 0
++                          ? previous.attachments
++                          : offered.attachments,
++                    };
++                  }
++                }
++              }
+               return [
+                 yield* makeDomainEvent(input, {
+                   type: "message.updated",
+-                  threadId: input.event.message.threadId,
+-                  payload: input.event.message,
+-                  runId: input.event.message.runId,
+-                  nodeId: input.event.message.nodeId,
++                  threadId: message.threadId,
++                  payload: message,
++                  runId: message.runId,
++                  nodeId: message.nodeId,
+                 }),
+               ];
+-            case "turn_item.updated":
++            }
++            case "turn_item.updated": {
++              const offered = input.event.turnItem;
++              let turnItem = offered;
++              if (
++                offered.type === "user_message" &&
++                offered.runId !== null &&
++                (offered.nativeItemRef !== null || offered.externalSessionInput === true)
++              ) {
++                const previous = yield* projections.getTurnItem({
++                  threadId: offered.threadId,
++                  itemId: offered.id,
++                });
++                if (
++                  previous?.type === "user_message" &&
++                  previous.messageId === offered.messageId &&
++                  previous.runId === offered.runId &&
++                  previous.nodeId === offered.nodeId
++                ) {
++                  turnItem = {
++                    ...previous,
++                    ...(offered.nativeItemRef === null
++                      ? {}
++                      : { nativeItemRef: offered.nativeItemRef }),
++                    ...(offered.externalSessionInput === true
++                      ? { externalSessionInput: true }
++                      : {}),
++                    providerThreadId: offered.providerThreadId,
++                  };
++                }
++              }
++              if (
++                offered.runId === null &&
++                offered.providerThreadId !== null &&
++                offered.nativeItemRef !== null &&
++                (offered.type === "user_message" ||
++                  offered.type === "assistant_message" ||
++                  offered.type === "reasoning")
++              ) {
++                const previous = yield* nativeTurnItem(
++                  offered.threadId,
++                  offered.providerThreadId,
++                  offered.nativeItemRef,
++                );
++                if (previous !== undefined && previous.type === offered.type) {
++                  const binding = {
++                    id: previous.id,
++                    runId: previous.runId,
++                    nodeId: previous.nodeId,
++                    providerTurnId: previous.providerTurnId,
++                    ordinal: previous.ordinal,
++                    startedAt: previous.startedAt,
++                    completedAt: previous.completedAt ?? offered.completedAt,
++                  };
++                  if (offered.type === "user_message" && previous.type === "user_message") {
++                    turnItem = {
++                      ...previous,
++                      ...offered,
++                      ...binding,
++                      messageId: previous.messageId,
++                      createdBy: previous.createdBy,
++                      creationSource: previous.creationSource,
++                      text: previous.runId !== null ? previous.text : offered.text,
++                      attachments:
++                        offered.attachments.length === 0
++                          ? previous.attachments
++                          : offered.attachments,
++                    };
++                  } else if (
++                    offered.type === "assistant_message" &&
++                    previous.type === "assistant_message"
++                  ) {
++                    turnItem = {
++                      ...previous,
++                      ...offered,
++                      ...binding,
++                      messageId: previous.messageId,
++                    };
++                  } else if (offered.type === "reasoning" && previous.type === "reasoning") {
++                    turnItem = { ...previous, ...offered, ...binding };
++                  }
++                }
++              }
+               return [
+                 yield* makeDomainEvent(input, {
+                   type: "turn-item.updated",
+-                  threadId: input.event.turnItem.threadId,
+-                  payload: boundFileChangeForStorage(
+-                    stripUnservedToolOutputImageBytes(input.event.turnItem),
+-                  ),
+-                  runId: input.event.turnItem.runId,
+-                  nodeId: input.event.turnItem.nodeId,
++                  threadId: turnItem.threadId,
++                  payload: boundFileChangeForStorage(stripUnservedToolOutputImageBytes(turnItem)),
++                  runId: turnItem.runId,
++                  nodeId: turnItem.nodeId,
+                 }),
+               ];
++            }
+             case "runtime_request.updated":
+               return [
+                 yield* makeDomainEvent(input, {
+diff --git a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+index 0a1e71f7..30f6a438 100644
+--- a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+@@ -904,6 +904,7 @@ it.effect(
+         "provider-session.apply-thread-title",
+         "provider-turn.start",
+         "provider-turn.interrupt",
++        "provider-thread.interrupt",
+         "provider-turn.steer",
+         "provider-turn.restart",
+         "runtime-request.respond",
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+index 91978450..4bdef8a6 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+@@ -60,6 +60,7 @@ import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.
+ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
++import * as RuntimePolicy from "./RuntimePolicy.ts";
+ import * as CommandOutputHub from "./CommandOutputHub.ts";
+ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+ import {
+@@ -614,6 +615,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
+ });
+ 
+ function layerTest(input: {
++  readonly canObserve?: boolean;
+   readonly state: Ref.Ref<TestProviderRuntimeState>;
+   readonly idleTimeoutMs: number;
+   readonly maxIdlePinMs?: number;
+@@ -698,7 +700,27 @@ function layerTest(input: {
+       ...(input.scopeCloseReached === undefined
+         ? {}
+         : { scopeCloseReached: input.scopeCloseReached }),
+-    }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
++    }).pipe(
++      Effect.map((adapter) =>
++        input.canObserve === undefined
++          ? ProviderAdapterRegistry.layerSingle(adapter)
++          : Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistryV2, {
++              get: () => Effect.succeed(adapter),
++              list: () => Effect.succeed([adapter.instanceId]),
++              getMetadata: () =>
++                adapter.getCapabilities().pipe(
++                  Effect.map((capabilities) => ({
++                    driver: adapter.driver,
++                    continuationKey: "fixture",
++                    enabled: true,
++                    capabilities,
++                    canObserve: input.canObserve === true,
++                  })),
++                  Effect.orDie,
++                ),
++            }),
++      ),
++    ),
+   );
+   const layerConfiguredMcpRegistry =
+     input.pauseResolve === undefined
+@@ -741,6 +763,7 @@ function layerTest(input: {
+           layerProviderEventIngestorTest,
+           layerConfiguredMcpRegistry,
+           layerTestStores,
++          RuntimePolicy.layer,
+           input.installationGateLayer ?? ProviderInstallationGate.layer,
+           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
+           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
+@@ -4288,6 +4311,196 @@ it.effect.each(["manual_shutdown", "server_shutdown"] as const)(
+     }),
+ );
+ 
++it.effect.each([true, false, undefined])(
++  "ProviderSessionManagerV2 loads imported history and gates passive reopen on capability %s",
++  (canObserve) =>
++    Effect.gen(function* () {
++      const state = yield* Ref.make(emptyState);
++      const openedIdentityVersions = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
++      yield* Effect.gen(function* () {
++        const eventSink = yield* EventSink.EventSinkV2;
++        const idAllocator = yield* IdAllocator.IdAllocatorV2;
++        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
++        const projections = yield* ProjectionStore.ProjectionStoreV2;
++        const now = yield* DateTime.now;
++        const threadId = IdAllocator.deriveThreadFromProviderThread({
++          driver: CODEX_DRIVER,
++          providerInstanceId: modelSelection.instanceId,
++          nativeThreadId: "native-thread",
++        });
++        const providerThread = {
++          ...makeProviderThread({
++            idAllocator,
++            threadId,
++            providerSessionId: idAllocator.derive.providerSession({
++              providerInstanceId: modelSelection.instanceId,
++            }),
++            now,
++          }),
++          providerSessionId: null,
++          nativeMetadata: { itemIdentityVersion: 2 as const },
++          status: "not_loaded" as const,
++        };
++        yield* eventSink.write({
++          events: [
++            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
++            {
++              id: yield* idAllocator.allocate.event({ threadId }),
++              type: "provider-thread.updated",
++              threadId,
++              occurredAt: now,
++              payload: providerThread,
++            },
++          ],
++        });
++
++        yield* Effect.all(
++          [manager.loadImportedThread(threadId), manager.loadImportedThread(threadId)],
++          { concurrency: 2 },
++        );
++        yield* manager.loadImportedThread(threadId);
++
++        const projection = yield* projections.getThreadProjection(threadId);
++        assert.equal((yield* Ref.get(state)).openCount, 1);
++        assert.equal((yield* Ref.get(state)).resumeCount, 1);
++        assert.deepEqual(yield* Ref.get(openedIdentityVersions), [2]);
++        assert.isNotNull(projection.providerThreads[0]?.providerSessionId);
++        assert.equal(projection.runs.length, 0);
++        assert.equal(projection.messages.length, 0);
++        const loadedSessionId = projection.providerThreads[0]?.providerSessionId;
++        assert.isDefined(loadedSessionId);
++        assert.isNotNull(loadedSessionId);
++        yield* manager.close(loadedSessionId!);
++        yield* manager.loadImportedThread(threadId, { onlyIfImported: true });
++        const expectedOpens = canObserve === true ? 2 : 1;
++        assert.equal((yield* Ref.get(state)).openCount, expectedOpens);
++        assert.equal((yield* Ref.get(state)).resumeCount, expectedOpens);
++        assert.deepEqual(
++          yield* Ref.get(openedIdentityVersions),
++          canObserve === true ? [2, 2] : [2],
++        );
++        const ordinaryId = ThreadId.make("ordinary-thread");
++        yield* eventSink.write({
++          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId: ordinaryId, now })],
++        });
++        yield* manager.loadImportedThread(ordinaryId, { onlyIfImported: true });
++        assert.equal((yield* Ref.get(state)).openCount, expectedOpens);
++      }).pipe(
++        Effect.provide(
++          layerTest({
++            state,
++            idleTimeoutMs: 60_000,
++            ...(canObserve === undefined ? {} : { canObserve }),
++            startTurn: Effect.die("Import must never start a turn"),
++            beforeOpen: (input) =>
++              Ref.update(openedIdentityVersions, (versions) => [
++                ...versions,
++                input.initialProviderItemIdentityVersion,
++              ]),
++          }),
++        ),
++      );
++    }),
++);
++
++it.effect("ProviderSessionManagerV2 persists passive imported messages without a run", () =>
++  Effect.gen(function* () {
++    const state = yield* Ref.make(emptyState);
++    yield* Effect.gen(function* () {
++      const eventSink = yield* EventSink.EventSinkV2;
++      const idAllocator = yield* IdAllocator.IdAllocatorV2;
++      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      const now = yield* DateTime.now;
++      const threadId = ThreadId.make("passive-imported-history");
++      const providerSessionId = yield* idAllocator.allocate.providerSession({
++        providerInstanceId: modelSelection.instanceId,
++        threadId,
++      });
++      yield* eventSink.write({
++        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
++      });
++      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
++      const messageId = yield* idAllocator.allocate.message({ threadId, ordinal: 1 });
++      const message = {
++        createdBy: "agent" as const,
++        creationSource: "provider" as const,
++        id: messageId,
++        threadId,
++        runId: null,
++        nodeId: null,
++        role: "assistant" as const,
++        text: "Original reply",
++        attachments: [],
++        streaming: false,
++        createdAt: now,
++        updatedAt: now,
++      };
++      const providerThread = makeProviderThread({ idAllocator, threadId, providerSessionId, now });
++      const turnItem = {
++        id: TurnItemId.make("passive-native-reply"),
++        threadId,
++        runId: null,
++        nodeId: null,
++        providerThreadId: providerThread.id,
++        providerTurnId: null,
++        nativeItemRef: null,
++        parentItemId: null,
++        ordinal: 1,
++        status: "completed" as const,
++        title: null,
++        startedAt: now,
++        completedAt: now,
++        updatedAt: now,
++        type: "assistant_message" as const,
++        messageId,
++        text: "Original reply",
++        streaming: false,
++      };
++      const afterSequence = yield* eventSink.latestSequence({ threadId });
++      const persisted = yield* eventSink.stream({ threadId, afterSequence }).pipe(
++        Stream.filter((stored) =>
++          ["message.updated", "turn-item.updated", "provider-thread.updated"].includes(
++            stored.event.type,
++          ),
++        ),
++        Stream.take(5),
++        Stream.runDrain,
++        Effect.forkScoped,
++      );
++      const events = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
++      assert.isDefined(events);
++      yield* Queue.offerAll(events!, [
++        { type: "message.updated", driver: CODEX_DRIVER, message },
++        { type: "turn_item.updated", driver: CODEX_DRIVER, turnItem },
++        {
++          type: "message.updated",
++          driver: CODEX_DRIVER,
++          message: { ...message, text: "Updated reply" },
++        },
++        {
++          type: "turn_item.updated",
++          driver: CODEX_DRIVER,
++          turnItem: { ...turnItem, text: "Updated reply" },
++        },
++        {
++          type: "provider_thread.updated",
++          driver: CODEX_DRIVER,
++          providerThread: { ...providerThread, status: "active" },
++        },
++      ]);
++      yield* Fiber.join(persisted);
++      const projection = yield* projections.getThreadProjection(threadId);
++      assert.equal(projection.messages.length, 1);
++      assert.equal(projection.messages[0]?.text, "Updated reply");
++      assert.equal(projection.turnItems.length, 1);
++      assert.equal(projection.turnItems[0]?.type, "assistant_message");
++      assert.equal(projection.providerThreads[0]?.status, "active");
++      assert.equal(projection.runs.length, 0);
++    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
++  }),
++);
++
+ it.effect(
+   "ProviderSessionManagerV2 cancels a pending approval when a detach releases its session",
+   () =>
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index 8e4c381b..259da171 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -65,6 +65,7 @@ import {
+ } from "@t3tools/provider-core/server/subagentProjection";
+ import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
++import * as RuntimePolicy from "./RuntimePolicy.ts";
+ 
+ const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+ const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
+@@ -209,6 +210,15 @@ export class ProviderSessionActivityError extends Schema.TaggedError<ProviderSes
+   }
+ }
+ 
++export class ProviderThreadLoadError extends Schema.TaggedError<ProviderThreadLoadError>()(
++  "ProviderThreadLoadError",
++  { threadId: ThreadId, cause: Schema.optional(Schema.Defect()) },
++) {
++  override get message(): string {
++    return `Failed to load the existing provider conversation for thread ${this.threadId}.`;
++  }
++}
++
+ export const ProviderSessionManagerV2Error = Schema.Union([
+   ProviderSessionOpenError,
+   ProviderWorkspaceMissingError,
+@@ -216,11 +226,16 @@ export const ProviderSessionManagerV2Error = Schema.Union([
+   ProviderSessionCloseError,
+   ProviderSessionReleaseError,
+   ProviderSessionActivityError,
++  ProviderThreadLoadError,
+ ]);
+ export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error.Type;
+ 
+ export interface ProviderSessionManagerV2Shape {
+   readonly shutdown: Effect.Effect<void>;
++  readonly loadImportedThread: (
++    threadId: ThreadId,
++    options?: { readonly onlyIfImported?: boolean },
++  ) => Effect.Effect<void, ProviderSessionManagerV2Error>;
+   readonly open: (input: {
+     readonly threadId: ThreadId;
+     readonly providerSessionId: ProviderSessionId;
+@@ -348,7 +363,7 @@ function sessionKey(providerSessionId: ProviderSessionId): string {
+   return String(providerSessionId);
+ }
+ 
+-function sessionScopedArtifactThreadId(
++function sessionScopedEventThreadId(
+   event: ProviderAdapter.ProviderAdapterV2Event,
+ ): ThreadId | undefined {
+   switch (event.type) {
+@@ -356,6 +371,8 @@ function sessionScopedArtifactThreadId(
+       return event.sessionScoped === true
+         ? (event.providerThread.appThreadId ?? undefined)
+         : undefined;
++    case "message.updated":
++      return event.message.runId === null ? event.message.threadId : undefined;
+     case "runtime_request.updated":
+       return event.runtimeRequest.providerTurnId === null ? event.threadId : undefined;
+     case "node.updated":
+@@ -366,7 +383,11 @@ function sessionScopedArtifactThreadId(
+       if (event.turnItem.type === "command_execution")
+         return event.sessionScoped === true ? event.turnItem.threadId : undefined;
+       return event.turnItem.runId === null &&
+-        (event.turnItem.type === "approval_request" || event.turnItem.type === "user_input_request")
++        (event.turnItem.type === "approval_request" ||
++          event.turnItem.type === "user_input_request" ||
++          event.turnItem.type === "user_message" ||
++          event.turnItem.type === "assistant_message" ||
++          event.turnItem.type === "reasoning")
+         ? event.turnItem.threadId
+         : undefined;
+     default:
+@@ -420,11 +441,13 @@ export const layerWithOptions = (
+   | ProviderEventIngestor.ProviderEventIngestorV2
+   | ProviderAdapterRegistry.ProviderAdapterRegistryV2
+   | ProviderInstallationGate.ProviderInstallationGate
++  | RuntimePolicy.RuntimePolicyV2
+ > =>
+   Layer.effect(
+     ProviderSessionManagerV2,
+     Effect.gen(function* () {
+       const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
++      const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+       const fileSystem = yield* FileSystem.FileSystem;
+       const mcpSessionRegistry = yield* McpSessionRegistry.McpSessionRegistry;
+       const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+@@ -519,6 +542,7 @@ export const layerWithOptions = (
+       const releaseRecordRetries = yield* FiberSet.make();
+       const nextSubscriberId = yield* Ref.make(0);
+       const sessionOpen = yield* KeyedLock.make<ProviderSessionId>();
++      const importedThreadLoad = yield* KeyedLock.make<ThreadId>();
+       const threadAttachment = yield* KeyedLock.make<string>();
+       const threadAttachmentKey = (input: {
+         readonly providerSessionId: ProviderSessionId;
+@@ -2830,8 +2854,19 @@ export const layerWithOptions = (
+                       });
+                     });
+                   }
+-                  // Requests and recovered background commands can arrive before a run subscribes.
+-                  const threadId = sessionScopedArtifactThreadId(event);
++                  const scopedThreadId = sessionScopedEventThreadId(event);
++                  const live = (yield* Ref.get(sessions)).get(
++                    sessionKey(entry.runtime.providerSessionId),
++                  );
++                  const passiveThreadId =
++                    event.type === "provider_thread.updated" &&
++                    ![...(live?.busyTurns ?? [])].some((key) =>
++                      key.startsWith(busyTurnPrefix(event.providerThread.id)),
++                    )
++                      ? (event.providerThread.appThreadId ?? undefined)
++                      : undefined;
++                  // Imported history and native activity can arrive without a local run.
++                  const threadId = scopedThreadId ?? passiveThreadId;
+                   if (threadId !== undefined) {
+                     yield* Effect.gen(function* () {
+                       const current = (yield* Ref.get(sessions)).get(
+@@ -2864,8 +2899,10 @@ export const layerWithOptions = (
+                           ),
+                         );
+                     }).pipe(entry.requestEventPermit.withPermits(1));
+-                    yield* releaseLiveOutput;
+-                    return;
++                    if (scopedThreadId !== undefined) {
++                      yield* releaseLiveOutput;
++                      return;
++                    }
+                   }
+                   yield* publishToSubscribers(entry.eventSubscribers, { type: "event", event });
+                   yield* releaseLiveOutput;
+@@ -2948,8 +2985,94 @@ export const layerWithOptions = (
+         ),
+       );
+ 
+-      return ProviderSessionManagerV2.of({
++      const service: ProviderSessionManagerV2Shape = ProviderSessionManagerV2.of({
+         shutdown,
++        loadImportedThread: Effect.fn("ProviderSessionManager.loadImportedThread")(
++          (threadId, options) =>
++            importedThreadLoad.withLock(
++              threadId,
++              Effect.gen(function* () {
++                const projection = yield* projectionStore.getThreadRecords(threadId, [
++                  "providerThreads",
++                  "providerSessions",
++                ]);
++                const thread = projection.thread;
++                const providerThread = projection.providerThreads.find(
++                  (candidate) => candidate.id === thread.activeProviderThreadId,
++                );
++                if (
++                  options?.onlyIfImported === true &&
++                  (providerThread?.nativeThreadRef?.nativeId == null ||
++                    IdAllocator.deriveThreadFromProviderThread({
++                      driver: providerThread.driver,
++                      providerInstanceId: providerThread.providerInstanceId,
++                      nativeThreadId: providerThread.nativeThreadRef.nativeId,
++                    }) !== threadId)
++                )
++                  return;
++                if (
++                  thread.deletedAt !== null ||
++                  providerThread?.nativeThreadRef?.nativeId == null ||
++                  providerThread.appThreadId !== threadId
++                ) {
++                  return yield* new ProviderThreadLoadError({ threadId });
++                }
++                const modelSelection = thread.modelSelection;
++                if (options?.onlyIfImported === true) {
++                  const metadata = yield* (
++                    registry.getMetadata?.(modelSelection.instanceId) ?? Effect.undefined
++                  );
++                  if (metadata?.canObserve !== true) return;
++                }
++                const adapter = yield* registry.get(modelSelection.instanceId);
++                const capabilities = yield* adapter.getCapabilities();
++                const providerSessionId =
++                  providerThread.providerSessionId ??
++                  (capabilities.sessions.supportsMultipleProviderThreadsPerSession
++                    ? idAllocator.derive.providerSession({
++                        providerInstanceId: modelSelection.instanceId,
++                      })
++                    : yield* idAllocator.allocate.providerSession({
++                        providerInstanceId: modelSelection.instanceId,
++                        threadId,
++                      }));
++                const resolvedPolicy = yield* runtimePolicy.resolve({ thread, modelSelection });
++                const existingSession = projection.providerSessions.find(
++                  (candidate) => candidate.id === providerSessionId,
++                );
++                const runtime = yield* service.open({
++                  threadId,
++                  providerSessionId,
++                  modelSelection,
++                  runtimePolicy: resolvedPolicy,
++                  initialNativeThreadId: providerThread.nativeThreadRef.nativeId,
++                  ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
++                    ? {}
++                    : {
++                        initialProviderItemIdentityVersion:
++                          providerThread.nativeMetadata.itemIdentityVersion,
++                      }),
++                  ...(existingSession === undefined ? {} : { resumeFromSession: existingSession }),
++                });
++                const loaded = yield* runtime.resumeThread({
++                  threadId,
++                  providerThread: { ...providerThread, providerSessionId },
++                  modelSelection,
++                  runtimePolicy: resolvedPolicy,
++                });
++                yield* providerEventIngestor.ingestNormalized({
++                  providerSessionId,
++                  providerInstanceId: runtime.instanceId,
++                  threadId,
++                  event: {
++                    type: "provider_thread.updated",
++                    driver: runtime.driver,
++                    providerThread: loaded,
++                  },
++                });
++              }).pipe(Effect.mapError((cause) => new ProviderThreadLoadError({ threadId, cause }))),
++            ),
++        ),
+         open: (input) =>
+           sessionOpen.withLock(
+             input.providerSessionId,
+@@ -3427,6 +3550,7 @@ export const layerWithOptions = (
+             Stream.changes,
+           ),
+       } satisfies ProviderSessionManagerV2Shape);
++      return service;
+     }),
+   );
+ 
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
+index 532d019d..f2c3eca0 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
+@@ -1,8 +1,10 @@
+ import { assert, it } from "@effect/vitest";
+ import {
++  MessageId,
+   type ModelSelection,
+   NodeId,
+   type OrchestrationV2ProviderThread,
++  type OrchestrationV2Run,
+   type OrchestrationV2ThreadProjection,
+   ProjectId,
+   ProviderDriverKind,
+@@ -124,7 +126,7 @@ function makeProjection(input: {
+ }
+ 
+ it.effect(
+-  "interrupts the historical session only for the exact committed restart replacement",
++  "keeps historical turn and runless native interrupts bound to the exact committed session",
+   () =>
+     Effect.gen(function* () {
+       const now = yield* DateTime.now;
+@@ -206,6 +208,7 @@ it.effect(
+         rollbackThread: () => Effect.die("unused rollbackThread"),
+         forkThread: () => Effect.die("unused forkThread"),
+       };
++      const attachedRuntime = yield* Ref.make(Option.some(runtime));
+       const layerProjection = Layer.succeed(
+         ProjectionStore.ProjectionStoreV2,
+         ProjectionStore.ProjectionStoreV2.of({
+@@ -250,7 +253,7 @@ it.effect(
+           getNextTurnItemOrdinal: () => Effect.die("unused ordinal read"),
+           getTurnItem: () => Effect.die("unused turn item read"),
+           getMessagesById: () => Effect.die("unused getMessagesById"),
+-          getThreadRecords: () => Effect.die("unused record read"),
++          getThreadRecords: () => Ref.get(projection),
+           getRuntimeRequest: () => Effect.die("unused getRuntimeRequest"),
+           getRunningTurnContext: () => Effect.die("unused getRunningTurnContext"),
+           getThreadProviderContext: () => Effect.die("unused getThreadProviderContext"),
+@@ -288,12 +291,11 @@ it.effect(
+       const layerSessionManager = Layer.succeed(
+         ProviderSessionManager.ProviderSessionManagerV2,
+         ProviderSessionManager.ProviderSessionManagerV2.of({
++          loadImportedThread: () => Effect.void,
+           shutdown: Effect.void,
+           open: () => Effect.die("unused open"),
+           get: (providerSessionId) =>
+-            Effect.succeed(
+-              providerSessionId === oldSessionId ? Option.some(runtime) : Option.none(),
+-            ),
++            providerSessionId === oldSessionId ? Ref.get(attachedRuntime) : Effect.succeedNone,
+           isLive: (providerSessionId) => Effect.succeed(providerSessionId === oldSessionId),
+           close: () => Effect.void,
+           closeInstance: () => Effect.void,
+@@ -358,5 +360,121 @@ it.effect(
+       assert.equal(interrupted?.providerSessionId, oldSessionId);
+       assert.equal(interrupted?.id, providerThreadId);
+       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
++
++      const nativeThread: OrchestrationV2ProviderThread = {
++        ...providerThread,
++        providerSessionId: oldSessionId,
++        status: "active",
++      };
++      const nativeProjection: OrchestrationV2ThreadProjection = {
++        ...makeProjection({
++          now,
++          threadId,
++          providerThread: nativeThread,
++          providerTurnId,
++          attemptId,
++        }),
++        attempts: [],
++        providerTurns: [],
++      };
++      const nativeInterrupts = yield* Ref.make<Array<OrchestrationV2ProviderThread>>([]);
++      const nativeRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
++        ...runtime,
++        interruptThread: ({ providerThread: target }) =>
++          Ref.update(nativeInterrupts, (targets) => [...targets, target]),
++      };
++      const localRun: OrchestrationV2Run = {
++        id: RunId.make("run:local"),
++        threadId,
++        ordinal: 1,
++        providerInstanceId,
++        modelSelection,
++        providerThreadId,
++        userMessageId: MessageId.make("message:local"),
++        rootNodeId: null,
++        activeAttemptId: null,
++        status: "running",
++        requestedAt: now,
++        startedAt: now,
++        completedAt: null,
++        checkpointId: null,
++        contextHandoffId: null,
++      };
++      const invalidBindings: ReadonlyArray<{
++        readonly name: string;
++        readonly projection: OrchestrationV2ThreadProjection;
++      }> = [
++        {
++          name: "deleted thread",
++          projection: {
++            ...nativeProjection,
++            thread: { ...nativeProjection.thread, deletedAt: now },
++          },
++        },
++        {
++          name: "changed selection",
++          projection: {
++            ...nativeProjection,
++            thread: {
++              ...nativeProjection.thread,
++              activeProviderThreadId: ProviderThreadId.make("provider-thread:other"),
++            },
++          },
++        },
++        {
++          name: "missing provider thread",
++          projection: { ...nativeProjection, providerThreads: [] },
++        },
++        {
++          name: "other app thread",
++          projection: {
++            ...nativeProjection,
++            providerThreads: [{ ...nativeThread, appThreadId: ThreadId.make("thread:other") }],
++          },
++        },
++        {
++          name: "replaced session",
++          projection: {
++            ...nativeProjection,
++            providerThreads: [{ ...nativeThread, providerSessionId: replacementSessionId }],
++          },
++        },
++        ...(["preparing", "starting", "running"] as const).map((status) => ({
++          name: `local ${status} run`,
++          projection: { ...nativeProjection, runs: [{ ...localRun, status }] },
++        })),
++      ];
++      yield* Ref.set(attachedRuntime, Option.some(nativeRuntime));
++      yield* Effect.gen(function* () {
++        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
++        const input = { threadId, providerSessionId: oldSessionId, providerThreadId };
++        for (const scenario of invalidBindings) {
++          yield* Ref.set(projection, scenario.projection);
++          const result = yield* Effect.exit(control.interruptThread(input));
++          assert.isTrue(Exit.isFailure(result), scenario.name);
++          assert.deepEqual(yield* Ref.get(nativeInterrupts), [], scenario.name);
++        }
++        yield* Ref.set(projection, nativeProjection);
++        for (const unavailable of [
++          Option.some(runtime),
++          Option.none<ProviderAdapter.ProviderAdapterV2SessionRuntime>(),
++        ]) {
++          yield* Ref.set(attachedRuntime, unavailable);
++          const result = yield* Effect.exit(control.interruptThread(input));
++          assert.isTrue(Exit.isFailure(result));
++          assert.deepEqual(yield* Ref.get(nativeInterrupts), []);
++        }
++        yield* Ref.set(attachedRuntime, Option.some(nativeRuntime));
++        yield* Ref.set(projection, {
++          ...nativeProjection,
++          providerThreads: [{ ...nativeThread, status: "idle" }],
++        });
++        yield* control.interruptThread(input);
++        assert.deepEqual(yield* Ref.get(nativeInterrupts), []);
++        yield* Ref.set(projection, nativeProjection);
++        yield* control.interruptThread(input);
++        assert.deepEqual(yield* Ref.get(nativeInterrupts), [nativeThread]);
++        assert.deepEqual((yield* Ref.get(projection)).runs, []);
++      }).pipe(Effect.provide(layerControl));
+     }),
+ );
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnControlService.ts b/apps/server/src/orchestration-v2/ProviderTurnControlService.ts
+index f9727734..ee5db765 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnControlService.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnControlService.ts
+@@ -43,13 +43,35 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
+     steerDeclined: Schema.optional(Schema.Boolean),
+     /** The provider never confirmed the stop; Force stop is the way out. */
+     unresponsive: Schema.optional(Schema.Boolean),
++    deliveryUnknown: Schema.optional(Schema.Boolean),
+     cause: Schema.optional(Schema.Defect()),
+   },
+ ) {}
+ 
+ const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
+ 
++export class ProviderThreadInterruptError extends Schema.TaggedError<ProviderThreadInterruptError>()(
++  "ProviderThreadInterruptError",
++  {
++    threadId: ThreadId,
++    providerThreadId: ProviderThreadId,
++    providerSessionId: ProviderSessionId,
++    cause: Schema.Defect(),
++  },
++) {
++  override get message(): string {
++    return "Could not confirm the native session interrupt. Check its state before retrying.";
++  }
++}
++
++const isProviderThreadInterruptError = Schema.is(ProviderThreadInterruptError);
++
+ export interface ProviderTurnControlServiceV2Shape {
++  readonly interruptThread: (input: {
++    readonly threadId: ThreadId;
++    readonly providerSessionId: ProviderSessionId;
++    readonly providerThreadId: ProviderThreadId;
++  }) => Effect.Effect<void, ProviderThreadInterruptError>;
+   readonly interrupt: (input: {
+     readonly subagent?: {
+       readonly id: NodeId;
+@@ -271,6 +293,49 @@ export const layer: Layer.Layer<
+         if (Option.isNone(session) || session.value.applyThreadTitle === undefined) return;
+         yield* session.value.applyThreadTitle({ providerThread, title: input.title });
+       }),
++      interruptThread: Effect.fn("ProviderTurnControlService.interruptThread")(
++        function* (input) {
++          const projection = yield* projections.getThreadRecords(input.threadId, [
++            "providerThreads",
++            "runs",
++          ]);
++          const providerThread = projection.providerThreads.find(
++            (candidate) => candidate.id === input.providerThreadId,
++          );
++          if (
++            projection.thread.deletedAt !== null ||
++            projection.thread.activeProviderThreadId !== input.providerThreadId ||
++            providerThread?.appThreadId !== input.threadId ||
++            providerThread.providerSessionId !== input.providerSessionId ||
++            projection.runs.some(
++              (run) =>
++                run.status === "preparing" || run.status === "starting" || run.status === "running",
++            )
++          ) {
++            return yield* new ProviderThreadInterruptError({
++              ...input,
++              cause: "The native session binding changed before Stop was delivered.",
++            });
++          }
++          if (providerThread.status !== "active") return;
++          const session = yield* sessions.get(input.providerSessionId);
++          if (Option.isNone(session) || session.value.interruptThread === undefined) {
++            return yield* new ProviderThreadInterruptError({
++              ...input,
++              cause: "No attached runtime supports native session interruption.",
++            });
++          }
++          yield* session.value.interruptThread({ providerThread });
++        },
++        (effect, input) =>
++          effect.pipe(
++            Effect.mapError((cause) =>
++              isProviderThreadInterruptError(cause)
++                ? cause
++                : new ProviderThreadInterruptError({ ...input, cause }),
++            ),
++          ),
++      ),
+       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
+         function* (input) {
+           const loaded = yield* load({ ...input, operation: "interrupt" });
+@@ -314,6 +379,16 @@ export const layer: Layer.Layer<
+             })
+             .pipe(
+               Effect.catchTags({
++                ProviderAdapterInterruptError: (cause) =>
++                  Effect.fail(
++                    new ProviderTurnControlError({
++                      threadId: input.threadId,
++                      operation: "interrupt",
++                      providerTurnId: input.providerTurnId,
++                      ...(cause.deliveryUnknown === true ? { deliveryUnknown: true } : {}),
++                      cause,
++                    }),
++                  ),
+                 ProviderAdapterInterruptTimeoutError: (cause) =>
+                   Effect.fail(
+                     new ProviderTurnControlError({
+diff --git a/apps/server/src/orchestration-v2/ThreadStop.test.ts b/apps/server/src/orchestration-v2/ThreadStop.test.ts
+index fc52191d..a6265e61 100644
+--- a/apps/server/src/orchestration-v2/ThreadStop.test.ts
++++ b/apps/server/src/orchestration-v2/ThreadStop.test.ts
+@@ -76,6 +76,110 @@ const layerTest = ThreadManagementService.layer.pipe(
+ 
+ const encodeEffectRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
+ 
++it.effect.each([
++  { canInterruptThread: false, completedTurn: false },
++  { canInterruptThread: true, completedTurn: false },
++  { canInterruptThread: true, completedTurn: true },
++])(
++  "Stop targets imported native activity with capability $canInterruptThread after completed turn $completedTurn",
++  ({ canInterruptThread, completedTurn }) =>
++    Effect.gen(function* () {
++      const orchestrator = yield* Orchestrator.OrchestratorV2;
++      const projections = yield* ProjectionStore.ProjectionStoreV2;
++      const sql = yield* SqlClient.SqlClient;
++      const now = yield* DateTime.now;
++      const threadId = ThreadId.make(`thread:stop-imported:${canInterruptThread}`);
++      const providerSessionId = ProviderSessionId.make(`session:imported:${canInterruptThread}`);
++      yield* orchestrator.dispatch({
++        type: "thread.create",
++        commandId: CommandId.make(`create:${threadId}`),
++        threadId,
++        projectId: ProjectId.make("project:thread-stop"),
++        title: "Imported native session",
++        modelSelection,
++        runtimeMode: "approval-required",
++        interactionMode: "default",
++        branch: null,
++        worktreePath: null,
++        importedNativeThread: {
++          ref: { driver: adapter.driver, nativeId: "original-native-session", strength: "strong" },
++        },
++        createdBy: "user",
++        creationSource: "web",
++      });
++      if (completedTurn) {
++        yield* send(threadId, "an earlier local prompt", "start_immediately");
++        const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
++        yield* projections.apply({
++          id: EventId.make(`event:${threadId}:completed-run`),
++          type: "run.updated",
++          threadId,
++          runId: run.id,
++          occurredAt: now,
++          payload: { ...run, status: "completed", completedAt: now },
++        });
++      }
++      const before = yield* orchestrator.getThreadProjection(threadId);
++      const providerThread = {
++        ...before.providerThreads[0]!,
++        providerSessionId,
++        status: "active" as const,
++      };
++      yield* projections.apply({
++        id: EventId.make(`event:${threadId}:session`),
++        type: "provider-session.attached",
++        threadId,
++        occurredAt: now,
++        payload: {
++          id: providerSessionId,
++          driver: adapter.driver,
++          providerInstanceId: instanceId,
++          status: "ready",
++          cwd: "/workspace",
++          model: modelSelection.model,
++          capabilities: {
++            ...CodexProviderCapabilitiesV2,
++            threads: { ...CodexProviderCapabilitiesV2.threads, canInterruptThread },
++          },
++          createdAt: now,
++          updatedAt: now,
++          lastError: null,
++        },
++      });
++      yield* projections.apply({
++        id: EventId.make(`event:${threadId}:provider-thread`),
++        type: "provider-thread.updated",
++        threadId,
++        occurredAt: now,
++        payload: providerThread,
++      });
++      const commandId = CommandId.make(`stop:${threadId}`);
++      yield* orchestrator.dispatch({ type: "thread.stop", commandId, threadId });
++      const effects = yield* sql<{ payload_json: string }>`
++        SELECT payload_json FROM orchestration_v2_effect_outbox WHERE command_id = ${commandId}
++      `;
++      assert.deepEqual(
++        effects.map((row) => JSON.parse(row.payload_json)),
++        canInterruptThread
++          ? [
++              {
++                type: "provider-thread.interrupt",
++                providerSessionId,
++                providerThreadId: providerThread.id,
++              },
++            ]
++          : [],
++      );
++      const after = yield* orchestrator.getThreadProjection(threadId);
++      assert.deepEqual(
++        after.runs.map((run) => run.status),
++        completedTurn ? ["completed"] : [],
++      );
++      assert.lengthOf(after.messages, completedTurn ? 1 : 0);
++      assert.equal(after.providerThreads[0]?.status, "active");
++    }).pipe(Effect.provide(layerTest)),
++);
++
+ const pullRequest = (number: number) => ({
+   host: "github.com",
+   repository: "pingdotgg/t3code",
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.ts b/apps/server/src/orchestration-v2/runtimeLayer.ts
+index 4f834535..843e5fc5 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.ts
+@@ -137,6 +137,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
+   Layer.provide(
+     Layer.mergeAll(
+       layerCommandOutputHubProvided,
++      layerRuntimePolicyProvided,
+       ProviderAdapterRegistry.layerFromProviderInstanceRegistry,
+       layerEventSink,
+       IdAllocator.layer,
+@@ -250,6 +251,7 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
+   Layer.provide(
+     Layer.mergeAll(
+       layerAgentSessionScannerProvided,
++      layerProviderSessionManagerProvided,
+       layerProjectService,
+       layerOrchestratorProvided,
+       layerEventSink,
+diff --git a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
+index 0ba9137e..8b58b091 100644
+--- a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
++++ b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
+@@ -405,6 +405,7 @@ export function layerWithRegistry<Error>(
+     Layer.provide(
+       Layer.mergeAll(
+         layerCommandOutputHubProvided,
++        layerRuntime,
+         layerProvidedRegistry,
+         layerEventSinkProvided,
+         IdAllocator.layer,
+diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
+index 18c09461..b255c662 100644
+--- a/apps/server/src/project/AgentSessionImporter.test.ts
++++ b/apps/server/src/project/AgentSessionImporter.test.ts
+@@ -268,6 +268,7 @@ const makeImporter = Effect.fn(function* (
+           Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)(
+             getAdapter === undefined ? {} : { get: getAdapter },
+           ),
++          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+           Layer.succeed(
+             ThreadCommandExecutor.ThreadCommandExecutor,
+             threadCommands ?? (yield* ThreadCommandExecutor.make),
+@@ -1051,3 +1052,4 @@ it.effect("repeated imports reach linked-worktree sessions behind the scan budge
+     expect(oldest.worktreePath).toBe(worktree);
+   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+ );
++import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+diff --git a/apps/server/src/project/AgentSessionImporter.ts b/apps/server/src/project/AgentSessionImporter.ts
+index 0f873698..5135c062 100644
+--- a/apps/server/src/project/AgentSessionImporter.ts
++++ b/apps/server/src/project/AgentSessionImporter.ts
+@@ -37,6 +37,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
++import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+ import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
+ import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+@@ -202,6 +203,7 @@ const make = Effect.gen(function* () {
+   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
++  const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+   const settingsService = yield* ServerSettings.ServerSettingsService;
+   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
+@@ -507,6 +509,7 @@ const make = Effect.gen(function* () {
+   const importNativeHistory = Effect.fn("importNativeHistoryV2")(function* (input: {
+     readonly threadId: ThreadId;
+     readonly workspaceRoot: string;
++    readonly observe?: boolean;
+   }) {
+     const pendingThread = Effect.map(
+       orchestrator.getThreadRecords(input.threadId, ["providerThreads", "runs"]),
+@@ -544,6 +547,10 @@ const make = Effect.gen(function* () {
+           return messages.length;
+         }),
+       );
++    if (input.observe === true) {
++      yield* providerSessions.loadImportedThread(input.threadId);
++      return yield* commit([]);
++    }
+     const records = yield* pendingThread;
+     if (records === null) return 0;
+     const { thread, providerThreads } = records;
+diff --git a/apps/server/src/provider/AcpRegistrySessions.ts b/apps/server/src/provider/AcpRegistrySessions.ts
+index e0b46e08..69c1b207 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.ts
+@@ -185,16 +185,22 @@ const make = Effect.gen(function* () {
+         historyOrigin: existing.historyOrigin,
+         hasRun: existing.latestRunId !== null,
+       });
+-      yield* agentSessionImporter.importNativeHistory({ threadId, workspaceRoot }).pipe(
+-        Effect.mapError(
+-          (cause) =>
+-            new AcpRegistryOperationError({
+-              reason: "session_import_failed",
+-              message: "Could not import the ACP session history.",
+-              cause,
+-            }),
+-        ),
+-      );
++      yield* agentSessionImporter
++        .importNativeHistory({
++          threadId,
++          workspaceRoot,
++          observe: providerSnapshot.nativeSessions?.canObserve === true,
++        })
++        .pipe(
++          Effect.mapError(
++            (cause) =>
++              new AcpRegistryOperationError({
++                reason: "session_import_failed",
++                message: "Could not import the ACP session history.",
++                cause,
++              }),
++          ),
++        );
+       return { threadId, imported: repairing } as const;
+     }
+ 
+@@ -253,15 +259,21 @@ const make = Effect.gen(function* () {
+       });
+     }
+     // The thread is usable without its history, so a failed read only logs.
+-    yield* agentSessionImporter.importNativeHistory({ threadId, workspaceRoot }).pipe(
+-      Effect.catch((cause) =>
+-        Effect.logWarning("Could not import ACP session history", {
+-          instanceId: input.instanceId,
+-          sessionId: input.sessionId,
+-          cause,
+-        }),
+-      ),
+-    );
++    yield* agentSessionImporter
++      .importNativeHistory({
++        threadId,
++        workspaceRoot,
++        observe: providerSnapshot.nativeSessions?.canObserve === true,
++      })
++      .pipe(
++        Effect.catch((cause) =>
++          Effect.logWarning("Could not import ACP session history", {
++            instanceId: input.instanceId,
++            sessionId: input.sessionId,
++            cause,
++          }),
++        ),
++      );
+     return { threadId, imported: true } as const;
+   }, coordinator.withSessionMutation);
+ 
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 8e8b30ba..91527f4a 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -2282,6 +2282,18 @@ export const layerWsRpc = (
+         [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
+           Stream.unwrap(
+             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
++              Effect.andThen(
++                providerSessionManager
++                  .loadImportedThread(input.threadId, { onlyIfImported: true })
++                  .pipe(
++                    Effect.catchCause(() =>
++                      Effect.logWarning("orchestration-v2.imported-thread.activation-failed", {
++                        threadId: input.threadId,
++                      }),
++                    ),
++                    Effect.forkScoped,
++                  ),
++              ),
+               Effect.andThen(subscribeOrchestrationV2Thread(input)),
+             ),
+           ),
+diff --git a/packages/client-runtime/src/state/threadExecution.test.ts b/packages/client-runtime/src/state/threadExecution.test.ts
+index ea6de929..c65faafc 100644
+--- a/packages/client-runtime/src/state/threadExecution.test.ts
++++ b/packages/client-runtime/src/state/threadExecution.test.ts
+@@ -12,6 +12,7 @@ import {
+   RuntimeRequestId,
+   ThreadId,
+   type OrchestrationV2ExecutionNode,
++  type OrchestrationV2ProviderSession,
+   type OrchestrationV2RunStatus,
+   type OrchestrationV2RuntimeRequest,
+ } from "@t3tools/contracts";
+@@ -31,6 +32,7 @@ import {
+   deriveRunlessWorkStartedAt,
+   deriveThreadActivityRun,
+   deriveThreadRuntime,
++  deriveInterruptibleExternalProviderThread,
+   formatModelSelectionEffort,
+   isBackgroundWorkStopPending,
+   presentPendingBackgroundWork,
+@@ -79,6 +81,99 @@ function run(id: string, ordinal: number, status: OrchestrationV2RunStatus) {
+ }
+ 
+ describe("thread execution presentation", () => {
++  it("offers native Stop only for the exact attached external root without a local run", () => {
++    const instanceId = v2Projection.thread.modelSelection.instanceId;
++    const providerThreadId = ProviderThreadId.make("external-root");
++    const sessionId = ProviderSessionId.make("external-session");
++    const thread = {
++      id: providerThreadId,
++      driver: ProviderDriverKind.make("acpRegistry"),
++      providerInstanceId: instanceId,
++      providerSessionId: sessionId,
++      appThreadId: v2Projection.thread.id,
++      ownerNodeId: null,
++      nativeThreadRef: null,
++      nativeConversationHeadRef: null,
++      status: "active" as const,
++      firstRunOrdinal: null,
++      lastRunOrdinal: null,
++      handoffIds: [],
++      forkedFrom: null,
++      createdAt: now,
++      updatedAt: now,
++    };
++    const session = {
++      id: sessionId,
++      driver: thread.driver,
++      providerInstanceId: instanceId,
++      status: "ready" as const,
++      cwd: "/repo",
++      model: null,
++      createdAt: now,
++      updatedAt: now,
++      lastError: null,
++      // This selector reads only the negotiated native-interrupt capability.
++      capabilities: {
++        threads: { canInterruptThread: true },
++      } as OrchestrationV2ProviderSession["capabilities"],
++    };
++    const projection = {
++      ...v2Projection,
++      thread: { ...v2Projection.thread, activeProviderThreadId: providerThreadId },
++      providerThreads: [thread],
++      providerSessions: [session],
++    };
++    expect(deriveInterruptibleExternalProviderThread(projection)?.id).toBe(providerThreadId);
++    expect(deriveThreadRuntime(projection)).toMatchObject({ status: "running", activeRunId: null });
++    for (const status of ["preparing", "starting", "running", "waiting"] as const) {
++      expect(
++        deriveInterruptibleExternalProviderThread({
++          ...projection,
++          runs: [run("local", 1, status)],
++        }),
++      ).toBeNull();
++    }
++    for (const status of ["stopped", "error"] as const) {
++      expect(
++        deriveInterruptibleExternalProviderThread({
++          ...projection,
++          providerSessions: [{ ...session, status }],
++        }),
++      ).toBeNull();
++    }
++    expect(
++      deriveInterruptibleExternalProviderThread({
++        ...projection,
++        providerThreads: [{ ...thread, status: "idle" }],
++      }),
++    ).toBeNull();
++    expect(
++      deriveInterruptibleExternalProviderThread({
++        ...projection,
++        providerThreads: [{ ...thread, appThreadId: ThreadId.make("another") }],
++      }),
++    ).toBeNull();
++    expect(
++      deriveInterruptibleExternalProviderThread({
++        ...projection,
++        providerSessions: [{ ...session, providerInstanceId: ProviderInstanceId.make("another") }],
++      }),
++    ).toBeNull();
++    expect(
++      deriveInterruptibleExternalProviderThread({
++        ...projection,
++        providerSessions: [
++          {
++            ...session,
++            capabilities: {
++              ...session.capabilities,
++              threads: { ...session.capabilities.threads, canInterruptThread: false },
++            },
++          },
++        ],
++      }),
++    ).toBeNull();
++  });
+   it("shows extension statuses only from the selected provider's current live session", () => {
+     const instanceId = v2Projection.thread.modelSelection.instanceId;
+     const providerThreadId = ProviderThreadId.make("native-status-thread");
+diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
+index 622db98a..d3b01ece 100644
+--- a/packages/client-runtime/src/state/threadExecution.ts
++++ b/packages/client-runtime/src/state/threadExecution.ts
+@@ -57,6 +57,31 @@ const PROVIDER_STARTING_RUN_STATUSES = new Set(["starting", "running"]);
+ const EMPTY_EXTENSION_STATUSES: NonNullable<OrchestrationV2ProviderSession["extensionStatuses"]> =
+   [];
+ 
++export function deriveInterruptibleExternalProviderThread(projection: ThreadStructure) {
++  if (
++    isProviderNativeSubagentThread(projection.thread) ||
++    projection.runs.some((run) => ACTIVITY_RUN_STATUSES.has(run.status))
++  )
++    return null;
++  const thread = projection.providerThreads.find(
++    (candidate) =>
++      candidate.id === projection.thread.activeProviderThreadId &&
++      candidate.appThreadId === projection.thread.id &&
++      candidate.providerInstanceId === projection.thread.modelSelection.instanceId &&
++      candidate.status === "active",
++  );
++  if (thread === undefined) return null;
++  const session = projection.providerSessions.find(
++    (candidate) =>
++      candidate.id === thread.providerSessionId &&
++      candidate.providerInstanceId === thread.providerInstanceId &&
++      candidate.status !== "stopped" &&
++      candidate.status !== "error" &&
++      candidate.capabilities.threads.canInterruptThread === true,
++  );
++  return session === undefined ? null : thread;
++}
++
+ /** Only the selected provider's current session can supply transient extension status. */
+ export function deriveProviderExtensionStatuses(
+   projection:
+@@ -346,6 +371,7 @@ export function deriveThreadStructureRuntime(
+   projection: ThreadStructure,
+ ): ThreadStructureRuntime | null {
+   const latestRun = deriveLatestThreadRun(projection);
++  const externalThread = deriveInterruptibleExternalProviderThread(projection);
+   const providerSession = projection.providerSessions.findLast(
+     (session) => session.providerInstanceId === projection.thread.providerInstanceId,
+   );
+@@ -366,19 +392,24 @@ export function deriveThreadStructureRuntime(
+     }),
+   );
+   // A pull request watch can hold a thread that never ran.
+-  if (latestRun === null && !backgroundWorkHoldsRun) return null;
++  if (latestRun === null && !backgroundWorkHoldsRun && externalThread === null) return null;
+   const activeRunId =
+     latestMatchingRun(projection, (run) => INTERRUPTIBLE_RUN_STATUSES.has(run.status))?.id ?? null;
+   return {
+-    status: usageLimitedRun
+-      ? "failed"
+-      : backgroundWorkHoldsRun && latestRunProjection?.status !== "failed"
+-        ? "idle"
+-        : (activityRun?.status ?? "idle"),
++    status:
++      externalThread !== null
++        ? "running"
++        : usageLimitedRun
++          ? "failed"
++          : backgroundWorkHoldsRun && latestRunProjection?.status !== "failed"
++            ? "idle"
++            : (activityRun?.status ?? "idle"),
+     activeRunId,
+     activityStartedAt:
+       liveActivityRun === null
+-        ? null
++        ? externalThread === null
++          ? null
++          : DateTime.formatIso(externalThread.updatedAt)
+         : DateTime.formatIso(orchestrationV2RunWorkStartedAt(liveActivityRun)),
+     providerInstanceId: projection.thread.providerInstanceId,
+     providerName: providerSession?.driver ?? null,
+diff --git a/packages/contracts/src/acpRegistry.ts b/packages/contracts/src/acpRegistry.ts
+index fffbe8dd..aef667ec 100644
+--- a/packages/contracts/src/acpRegistry.ts
++++ b/packages/contracts/src/acpRegistry.ts
+@@ -291,6 +291,7 @@ export const AcpRegistryProbeResult = Schema.Struct({
+     canList: Schema.Boolean,
+     canLoad: Schema.Boolean,
+     canResume: Schema.Boolean,
++    canObserve: Schema.optional(Schema.Boolean),
+     canLogout: Schema.Boolean,
+     canDelete: Schema.Boolean,
+     canConfigureProviders: Schema.Boolean,
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index 38d2e98e..ce0e21f4 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -282,6 +282,7 @@ export type OrchestrationV2SessionCapabilities = typeof OrchestrationV2SessionCa
+ export const OrchestrationV2ThreadCapabilities = Schema.Struct({
+   canCreateEmptyThread: Schema.Boolean,
+   canReadThreadSnapshot: Schema.Boolean,
++  canInterruptThread: Schema.optional(Schema.Boolean),
+   canRollbackThread: Schema.Boolean,
+   canForkThread: Schema.Boolean,
+   canForkFromTurn: Schema.Boolean,
+@@ -1711,6 +1712,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
+     ...OrchestrationV2TurnItemBaseFields,
+     ...OrchestrationV2CreationFields,
+     type: Schema.Literal("user_message"),
++    externalSessionInput: Schema.optional(Schema.Literal(true)),
+     messageId: MessageId,
+     scheduledTaskId: Schema.optional(ScheduledTaskId),
+     senderThreadId: Schema.optional(ThreadId),
+@@ -2599,6 +2601,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
+     ...OrchestrationV2TurnItemJsonBaseFields,
+     ...OrchestrationV2CreationFields,
+     type: Schema.Literal("user_message"),
++    externalSessionInput: Schema.optional(Schema.Literal(true)),
+     messageId: MessageId,
+     scheduledTaskId: Schema.optional(ScheduledTaskId),
+     senderThreadId: Schema.optional(ThreadId),
+diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
+index 144d2814..5f7def72 100644
+--- a/packages/contracts/src/server.ts
++++ b/packages/contracts/src/server.ts
+@@ -246,6 +246,7 @@ export const ServerProvider = Schema.Struct({
+       canList: Schema.Boolean,
+       canLoad: Schema.Boolean,
+       canResume: Schema.Boolean,
++      canObserve: Schema.optional(Schema.Boolean),
+       canDelete: Schema.optional(Schema.Boolean),
+     }),
+   ),
+diff --git a/packages/provider-acp-registry/src/server/driver.ts b/packages/provider-acp-registry/src/server/driver.ts
+index 12b3685b..c2c21761 100644
+--- a/packages/provider-acp-registry/src/server/driver.ts
++++ b/packages/provider-acp-registry/src/server/driver.ts
+@@ -328,6 +328,9 @@ function baseSnapshot(
+             canList: input.probe.probe.sessionManagement.canList,
+             canLoad: input.probe.probe.sessionManagement.canLoad,
+             canResume: input.probe.probe.sessionManagement.canResume,
++            ...(input.probe.probe.sessionManagement.canObserve === true
++              ? { canObserve: true }
++              : {}),
+             canDelete: input.probe.probe.sessionManagement.canDelete,
+           },
+           configurableProviders: input.probe.probe.sessionManagement.canConfigureProviders,
+diff --git a/packages/provider-acp-registry/src/server/probe.ts b/packages/provider-acp-registry/src/server/probe.ts
+index e1689a40..761939bc 100644
+--- a/packages/provider-acp-registry/src/server/probe.ts
++++ b/packages/provider-acp-registry/src/server/probe.ts
+@@ -1,4 +1,5 @@
+ import { resolveProviderProbeTimeoutMs } from "@t3tools/provider-core/server/snapshotProbe";
++import { supportsExternalSession } from "@t3tools/provider-acp/server/externalSession";
+ import {
+   AcpRegistryListProvidersResult,
+   AcpRegistryOperationError,
+@@ -338,6 +339,7 @@ export function acpRegistryProbeResult(
+       canList: started.initializeResult.agentCapabilities?.sessionCapabilities?.list != null,
+       canLoad: started.initializeResult.agentCapabilities?.loadSession === true,
+       canResume: started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null,
++      ...(supportsExternalSession(started.initializeResult._meta) ? { canObserve: true } : {}),
+       canLogout: started.initializeResult.agentCapabilities?.auth?.logout != null,
+       canDelete: started.initializeResult.agentCapabilities?.sessionCapabilities?.delete != null,
+       canConfigureProviders: started.initializeResult.agentCapabilities?.providers != null,
+diff --git a/packages/provider-acp/package.json b/packages/provider-acp/package.json
+index 83f556e4..7d3b202f 100644
+--- a/packages/provider-acp/package.json
++++ b/packages/provider-acp/package.json
+@@ -3,6 +3,10 @@
+   "private": true,
+   "type": "module",
+   "exports": {
++    "./server/externalSession": {
++      "types": "./src/server/externalSession.ts",
++      "import": "./src/server/externalSession.ts"
++    },
+     "./server/AcpSessionRuntime": {
+       "types": "./src/server/AcpSessionRuntime.ts",
+       "import": "./src/server/AcpSessionRuntime.ts"
+diff --git a/packages/provider-acp/src/server/adapter.ts b/packages/provider-acp/src/server/adapter.ts
+index a9bcc4a1..1c983154 100644
+--- a/packages/provider-acp/src/server/adapter.ts
++++ b/packages/provider-acp/src/server/adapter.ts
+@@ -1,5 +1,11 @@
+ // @effect-diagnostics nodeBuiltinImport:off
+ 
++import {
++  acceptedExternalSessionInput,
++  externalSessionState,
++  supportsExternalSession,
++} from "./externalSession.ts";
++
+ import {
+   type ChatAttachment,
+   type ModelSelection,
+@@ -66,7 +72,7 @@ import * as Semaphore from "effect/Semaphore";
+ import * as Stream from "effect/Stream";
+ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+ import * as EffectAcpErrors from "effect-acp/errors";
+-import type * as EffectAcpProtocol from "effect-acp/protocol";
++import * as EffectAcpProtocol from "effect-acp/protocol";
+ import type * as EffectAcpSchema from "effect-acp/compat";
+ 
+ import { formatReadToolLabel, formatSearchToolLabel } from "@t3tools/shared/toolActivity";
+@@ -229,6 +235,7 @@ export type AcpAdapterV2NativeLogging = Pick<
+ >;
+ 
+ export interface AcpAdapterV2UserInputRequest {
++  readonly nativeSessionId?: string;
+   readonly nativeItemId: string;
+   readonly nativeRequestId: string;
+   readonly questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+@@ -2047,6 +2054,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         };
+         let pendingStopCloseTurn: ActiveAcpTurn | null = null;
+         let followsAgentWorkState = false;
++        let externallyManagedSession = false;
++        let observedExternalState: ReturnType<typeof externalSessionState> = null;
+         let agentWork: Extract<
+           EffectAcpSchema.SessionUpdate,
+           { sessionUpdate: "state_update" }
+@@ -2061,6 +2070,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+             : flavor.extractSubagentUpdate?.(tool);
+         let turnAttached = yield* Deferred.make<boolean>();
+         const activeSessionId = yield* Ref.make<string | null>(null);
++        const loadingSessionId = yield* Ref.make<string | null>(null);
+         const contextUsageBySessionId = yield* Ref.make(
+           new Map<string, ThreadTokenUsageSnapshot>(),
+         );
+@@ -2081,11 +2091,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         const setActiveSessionSetup = Effect.fnUntraced(function* (
+           setup: AcpSessionRuntime.AcpSessionRuntimeStartResult,
+         ) {
++          externallyManagedSession = supportsExternalSession(setup.initializeResult._meta);
+           followsAgentWorkState =
+-            flavor.followAgentWorkState === true &&
+-            continuationRequests !== undefined &&
++            (externallyManagedSession ||
++              (flavor.followAgentWorkState === true && continuationRequests !== undefined)) &&
+             setup.initializeResult.protocolVersion === 2;
+-          agentWork = null;
++          if (!externallyManagedSession) agentWork = null;
+           rootForegroundWork = undefined;
+           agentRequests.clear();
+           nativeChildren.clear();
+@@ -2588,7 +2599,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               },
+               terminal: clientTerminals !== undefined,
+               elicitation: { form: {}, ...(flavor.onUrlElicitation ? { url: {} } : {}) },
+-              ...(flavor.clientCapabilitiesMeta ? { _meta: flavor.clientCapabilitiesMeta } : {}),
++              _meta: {
++                ...flavor.clientCapabilitiesMeta,
++                "t3.codes/externalSession": { version: 1 },
++              },
+             },
+             clientInfo: { name: "t3-code", version: "0.0.0" },
+             onTermination: (error) =>
+@@ -2906,7 +2920,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           const turnItemId = providerTurnItemId(segment.nativeItemId);
+           const nativeItemRef = {
+             driver,
+-            nativeId: segment.nativeItemId,
++            nativeId:
++              segment.sourceMessageId === null
++                ? segment.nativeItemId
++                : `${context.nativeThreadId}:history:${kind === "reasoning" ? "thought" : kind}:message:${segment.sourceMessageId}`,
+             strength: "weak" as const,
+           };
+           if (kind !== "user" && emitsNode) {
+@@ -2949,7 +2966,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               createdAt: segment.startedAt,
+               updatedAt: now,
+             };
+-            yield* emitProviderEvent({ type: "message.updated", driver, message });
++            yield* emitProviderEvent({
++              type: "message.updated",
++              driver,
++              message,
++              providerThreadId: context.input.providerThread.id,
++              nativeItemRef,
++            });
+             yield* emitProviderEvent(
+               kind === "user"
+                 ? {
+@@ -3904,6 +3927,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         ): Effect.fn.Return<boolean> {
+           if (!followsAgentWorkState || flavor.extractSubagentSessionEvent === undefined)
+             return false;
++          if (context === null && notification.sessionId === (yield* Ref.get(loadingSessionId)))
++            return false;
+           const root = yield* Ref.get(activeSessionId);
+           const event = flavor.extractSubagentSessionEvent(notification);
+           if (event !== undefined) {
+@@ -4791,7 +4816,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           ) {
+             if (text.length === 0 && !replace) return;
+             const now = yield* DateTime.now;
+-            yield* Ref.update(snapshot, (current) => {
++            let providerThread = (yield* Ref.get(providerThreadByNativeSessionId)).get(
++              notification.sessionId,
++            );
++            if (
++              providerThread === undefined &&
++              notification.sessionId === input.initialNativeThreadId
++            ) {
++              providerThread = makeProviderThread({
++                driver,
++                providerInstanceId: options.instanceId,
++                idAllocator,
++                appThreadId: input.threadId,
++                providerSessionId: input.providerSessionId,
++                nativeThreadId: notification.sessionId,
++                ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
++                now,
++              });
++              const initialThread = providerThread;
++              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
++                new Map(current).set(notification.sessionId, initialThread),
++              );
++            }
++            const artifact = yield* Ref.modify(snapshot, (current) => {
+               const update = notification.update;
+               const sourceMessageId =
+                 (update.sessionUpdate === "user_message_chunk" ||
+@@ -4815,7 +4862,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               const key = String(messageId);
+               const previous = current.messages.get(key);
+               if (previous === undefined) current.order.push(key);
+-              current.messages.set(key, {
++              const messages = current.messages;
++              const message: OrchestrationV2ConversationMessage = {
+                 createdBy: previous?.createdBy ?? (role === "user" ? "user" : "agent"),
+                 creationSource: previous?.creationSource ?? "provider",
+                 id: messageId,
+@@ -4828,17 +4876,74 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                 streaming: false,
+                 createdAt: previous?.createdAt ?? now,
+                 updatedAt: now,
+-              });
+-              return {
+-                ...current,
+-                reasoningIds:
+-                  role === "thought" && !current.reasoningIds.has(messageId)
+-                    ? new Set(current.reasoningIds).add(messageId)
+-                    : current.reasoningIds,
+-                loadingRole: role,
+-                loadingMessageId: sourceMessageId ?? (startsNew ? null : current.loadingMessageId),
+-                loadingIndex,
+               };
++              messages.set(key, message);
++              const order = current.order.includes(key) ? current.order : [...current.order, key];
++              return [
++                { message, nativeItemId, ordinal: order.indexOf(key) + 1 },
++                {
++                  ...current,
++                  order,
++                  messages,
++                  reasoningIds:
++                    role === "thought" && !current.reasoningIds.has(messageId)
++                      ? new Set(current.reasoningIds).add(messageId)
++                      : current.reasoningIds,
++                  loadingRole: role,
++                  loadingMessageId:
++                    sourceMessageId ?? (startsNew ? null : current.loadingMessageId),
++                  loadingIndex,
++                },
++              ];
++            });
++            if (providerThread === undefined || !externallyManagedSession) return;
++            const { message, nativeItemId, ordinal } = artifact;
++            if (role !== "thought") {
++              yield* emitProviderEvent({
++                type: "message.updated",
++                driver,
++                message,
++                providerThreadId: providerThread.id,
++                nativeItemRef: { driver, nativeId: nativeItemId, strength: "weak" },
++              });
++            }
++            yield* emitProviderEvent({
++              type: "turn_item.updated",
++              driver,
++              turnItem: {
++                id: providerTurnItemId(nativeItemId),
++                threadId: message.threadId,
++                runId: null,
++                nodeId: null,
++                providerThreadId: providerThread.id,
++                providerTurnId: null,
++                nativeItemRef: { driver, nativeId: nativeItemId, strength: "weak" },
++                parentItemId: null,
++                ordinal,
++                status: "completed",
++                title: null,
++                startedAt: message.createdAt,
++                completedAt: now,
++                updatedAt: now,
++                ...(role === "thought"
++                  ? { type: "reasoning" as const, text: message.text, streaming: false }
++                  : role === "user"
++                    ? {
++                        type: "user_message" as const,
++                        createdBy: "user" as const,
++                        creationSource: "provider" as const,
++                        messageId: message.id,
++                        inputIntent: "turn_start" as const,
++                        text: message.text,
++                        attachments: [],
++                      }
++                    : {
++                        type: "assistant_message" as const,
++                        messageId: message.id,
++                        text: message.text,
++                        streaming: false,
++                      }),
++              },
+             });
+           });
+ 
+@@ -5248,7 +5353,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         });
+ 
+         const awaitRequestTurn = Effect.fnUntraced(function* (generation: number) {
+-          if (!followsAgentWorkState) return true;
++          if (externallyManagedSession || !followsAgentWorkState) return true;
+           while (true) {
+             const waiting = yield* runRuntimeCallbackAtGeneration(
+               generation,
+@@ -5300,6 +5405,88 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         ) {
+           const context = yield* Ref.get(activeTurn);
+           const update = notification.update;
++          if (
++            externallyManagedSession &&
++            context !== null &&
++            !context.finalized &&
++            notification.sessionId === context.nativeThreadId &&
++            ((update.sessionUpdate === "session_info_update" &&
++              acceptedExternalSessionInput(update._meta) === context.input.message.messageId) ||
++              ((update.sessionUpdate === "user_message" ||
++                update.sessionUpdate === "user_message_chunk") &&
++                update._meta?.["t3.codes/messageId"] === context.input.message.messageId))
++          ) {
++            yield* emitProviderEvent({
++              type: "turn_item.updated",
++              driver,
++              turnItem: {
++                ...context.input.message,
++                type: "user_message",
++                id: idAllocator.derive.userTurnItem({ messageId: context.input.message.messageId }),
++                threadId: context.input.threadId,
++                runId: context.input.runId,
++                nodeId: context.input.rootNodeId,
++                providerThreadId: context.input.providerThread.id,
++                providerTurnId: null,
++                nativeItemRef: null,
++                parentItemId: null,
++                ordinal: context.input.runOrdinal * 100,
++                status: "completed",
++                title: null,
++                startedAt: context.startedAt,
++                completedAt: context.startedAt,
++                updatedAt: yield* DateTime.now,
++                inputIntent: "turn_start",
++                externalSessionInput: true,
++              },
++            });
++          }
++          const externalState =
++            externallyManagedSession && update.sessionUpdate === "session_info_update"
++              ? externalSessionState(update._meta)
++              : null;
++          if (externalState !== null) {
++            observedExternalState = externalState;
++            agentWork =
++              externalState === "idle"
++                ? { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" }
++                : { sessionUpdate: "state_update", state: "running" };
++            const known =
++              (yield* Ref.get(providerThreadByNativeSessionId)).get(notification.sessionId) ??
++              (notification.sessionId === input.initialNativeThreadId
++                ? makeProviderThread({
++                    driver,
++                    providerInstanceId: options.instanceId,
++                    idAllocator,
++                    appThreadId: input.threadId,
++                    providerSessionId: input.providerSessionId,
++                    nativeThreadId: notification.sessionId,
++                    ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
++                    now: yield* DateTime.now,
++                  })
++                : undefined);
++            if (known !== undefined) {
++              const providerThread: OrchestrationV2ProviderThread = {
++                ...known,
++                status:
++                  externalState === "unavailable"
++                    ? "error"
++                    : externalState === "idle"
++                      ? "idle"
++                      : "active",
++                updatedAt: yield* DateTime.now,
++              };
++              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
++                new Map(current).set(notification.sessionId, providerThread),
++              );
++              yield* emitProviderEvent({
++                type: "provider_thread.updated",
++                driver,
++                providerThread,
++                sessionScoped: true,
++              });
++            }
++          }
+           if (
+             followsAgentWorkState &&
+             flavor.extractSubagentSessionEvent !== undefined &&
+@@ -5347,10 +5534,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   (yield* Ref.get(contextUsageBySessionId)).get(notification.sessionId) ??
+                   knownProviderThread.contextUsage ??
+                   null,
+-                nativeMetadata:
+-                  (yield* Ref.get(nativeMetadataBySessionId)).get(notification.sessionId) ??
+-                  knownProviderThread.nativeMetadata ??
+-                  null,
++                nativeMetadata: {
++                  ...knownProviderThread.nativeMetadata,
++                  ...(yield* Ref.get(nativeMetadataBySessionId)).get(notification.sessionId),
++                },
+                 updatedAt: now,
+               };
+               yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+@@ -5365,6 +5552,98 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+             return;
+           }
+           if (yield* followNativeChild(notification, context)) return;
++          if (
++            externallyManagedSession &&
++            (update.sessionUpdate === "user_message" ||
++              update.sessionUpdate === "user_message_chunk")
++          ) {
++            if (
++              followsAgentWorkState &&
++              context !== null &&
++              !context.finalized &&
++              notification.sessionId === context.nativeThreadId
++            ) {
++              context.workAccepted = true;
++              agentWork = { sessionUpdate: "state_update", state: "running" };
++            }
++            const text =
++              update.sessionUpdate === "user_message_chunk"
++                ? acpContentBlockDisplayText(update.content)
++                : (update.content ?? [])
++                    .flatMap((part) => acpContentBlockDisplayText(part) ?? [])
++                    .join("\n");
++            if (text !== undefined)
++              yield* appendLoadedHistory(
++                notification,
++                "user",
++                text,
++                update.sessionUpdate === "user_message",
++              );
++            return;
++          }
++          if (
++            context !== null &&
++            !context.finalized &&
++            notification.sessionId === context.nativeThreadId &&
++            (update.sessionUpdate === "user_message" ||
++              update.sessionUpdate === "user_message_chunk") &&
++            update.messageId != null &&
++            update._meta?.["t3.codes/messageId"] === context.input.message.messageId
++          ) {
++            context.consumedPromptMessageId = update.messageId;
++            context.workAccepted = true;
++            if (followsAgentWorkState)
++              agentWork = { sessionUpdate: "state_update", state: "running" };
++            const now = yield* DateTime.now;
++            yield* emitProviderEvent({
++              type: "turn_item.updated",
++              driver,
++              turnItem: {
++                ...context.input.message,
++                type: "user_message",
++                id: idAllocator.derive.userTurnItem({ messageId: context.input.message.messageId }),
++                threadId: context.input.threadId,
++                runId: context.input.runId,
++                nodeId: context.input.rootNodeId,
++                providerThreadId: context.input.providerThread.id,
++                providerTurnId: null,
++                nativeItemRef: {
++                  driver,
++                  nativeId: `${context.nativeThreadId}:history:user:message:${update.messageId}`,
++                  strength: "weak",
++                },
++                parentItemId: null,
++                ordinal: context.input.runOrdinal * 100,
++                status: "completed",
++                title: null,
++                startedAt: context.startedAt,
++                completedAt: context.startedAt,
++                updatedAt: now,
++                inputIntent: "turn_start",
++              },
++            });
++            return;
++          }
++          if (
++            externallyManagedSession &&
++            context === null &&
++            update.sessionUpdate === "state_update"
++          ) {
++            const knownProviderThread = (yield* Ref.get(providerThreadByNativeSessionId)).get(
++              notification.sessionId,
++            );
++            if (knownProviderThread !== undefined) {
++              const providerThread = {
++                ...knownProviderThread,
++                status: update.state === "idle" ? ("idle" as const) : ("active" as const),
++                updatedAt: yield* DateTime.now,
++              };
++              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
++                new Map(current).set(notification.sessionId, providerThread),
++              );
++              yield* emitProviderEvent({ type: "provider_thread.updated", driver, providerThread });
++            }
++          }
+           if (
+             followsAgentWorkState &&
+             !(yield* Ref.get(stoppedRunQuarantine)) &&
+@@ -5389,6 +5668,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               yield* settleIdleWork(context);
+             } else if (
+               context === null &&
++              !externallyManagedSession &&
++              (yield* Ref.get(lastTurnRoute)) !== null &&
+               !(yield* Ref.get(stoppedRunQuarantine)) &&
+               (acpRootSessionUpdateIngestsOutput(notification) ||
+                 update.sessionUpdate === "user_message" ||
+@@ -5918,19 +6199,61 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           return context;
+         });
+ 
++        const requestRoute = Effect.fn("AcpAdapterV2.requestRoute")(function* (
++          nativeSessionId?: string,
++        ) {
++          const active = yield* Ref.get(activeTurn);
++          const context = active?.finalized === true ? null : active;
++          if (externallyManagedSession) {
++            const selected = (yield* Ref.get(activeSessionId)) ?? input.initialNativeThreadId;
++            if (nativeSessionId === undefined || nativeSessionId !== selected) {
++              return yield* new EffectAcpErrors.AcpTransportError({
++                detail: "External input request does not belong to the attached session",
++                cause: "Mismatched external session identity",
++              });
++            }
++          } else if (context === null) {
++            return yield* new EffectAcpErrors.AcpTransportError({
++              detail: "ACP agent requested input without an active turn",
++              cause: "No active ACP turn",
++            });
++          }
++          const providerThread =
++            context?.input.providerThread ??
++            (nativeSessionId === undefined
++              ? undefined
++              : (yield* Ref.get(providerThreadByNativeSessionId)).get(nativeSessionId));
++          if (providerThread === undefined || providerThread.appThreadId !== input.threadId) {
++            return yield* new EffectAcpErrors.AcpTransportError({
++              detail: "External input request has no attached thread",
++              cause: "Missing external provider thread",
++            });
++          }
++          return {
++            context,
++            threadId: context?.input.threadId ?? providerThread.appThreadId,
++            runId: context?.input.runId ?? null,
++            rootNodeId: context?.input.rootNodeId ?? null,
++            providerThreadId: providerThread.id,
++            providerTurnId: context?.providerTurnId ?? null,
++          };
++        });
++        const nextExternalRequestOrdinal = yield* Ref.make(1_000_000_000);
++
+         const beginApprovalRequest = Effect.fnUntraced(function* (
+-          context: ActiveAcpTurn,
+           params: EffectAcpSchema.RequestPermissionRequest,
+           generation: number,
+           transportRequestId: string,
+         ) {
+-          yield* closeTextStreams(context);
++          const route = yield* requestRoute(params.sessionId);
++          const context = route.context;
++          if (context !== null) yield* closeTextStreams(context);
+           const parsed = parsePermissionRequest(params);
+           const approvalOptions = flavor.approvalOptions?.(params);
+           const nativeRequestId = params.toolCall.toolCallId;
+           const requestId = yield* idAllocator.allocate.runtimeRequest({
+             driver,
+-            providerTurnId: context.providerTurnId,
++            ...(route.providerTurnId === null ? {} : { providerTurnId: route.providerTurnId }),
+             nativeRequestId,
+           });
+           const decision = yield* Deferred.make<ProviderApprovalDecision>();
+@@ -5947,14 +6270,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           const nodeId = idAllocator.derive.approvalNode({ requestId });
+           const requestKind = providerRequestKind(parsed.kind);
+           const nativeItemRef = { driver, nativeId: nativeRequestId, strength: "weak" as const };
+-          const ordinal = yield* resolveItemOrdinal(
+-            context,
+-            `${context.nativeTurnId}:approval:${nativeRequestId}`,
+-          );
++          const ordinal =
++            context === null
++              ? yield* Ref.getAndUpdate(nextExternalRequestOrdinal, (value) => value + 1)
++              : yield* resolveItemOrdinal(
++                  context,
++                  `${context.nativeTurnId}:approval:${nativeRequestId}`,
++                );
+           const runtimeRequest: OrchestrationV2RuntimeRequest = {
+             id: requestId,
+             nodeId,
+-            providerTurnId: context.providerTurnId,
++            providerTurnId: route.providerTurnId,
+             nativeRequestRef: nativeItemRef,
+             kind: requestKind,
+             status: "pending",
+@@ -5967,15 +6293,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           };
+           const node: OrchestrationV2ExecutionNode = {
+             id: nodeId,
+-            threadId: context.input.threadId,
+-            runId: context.input.runId,
+-            parentNodeId: context.input.rootNodeId,
+-            rootNodeId: context.input.rootNodeId,
++            threadId: route.threadId,
++            runId: route.runId,
++            parentNodeId: route.rootNodeId,
++            rootNodeId: route.rootNodeId ?? nodeId,
+             kind: "approval_request",
+             status: "waiting",
+             countsForRun: false,
+-            providerThreadId: context.input.providerThread.id,
+-            providerTurnId: context.providerTurnId,
++            providerThreadId: route.providerThreadId,
++            providerTurnId: route.providerTurnId,
+             nativeItemRef,
+             runtimeRequestId: requestId,
+             checkpointScopeId: null,
+@@ -5984,11 +6310,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           };
+           const turnItem: OrchestrationV2TurnItem = {
+             id: idAllocator.derive.approvalTurnItem({ requestId }),
+-            threadId: context.input.threadId,
+-            runId: context.input.runId,
++            threadId: route.threadId,
++            runId: route.runId,
+             nodeId,
+-            providerThreadId: context.input.providerThread.id,
+-            providerTurnId: context.providerTurnId,
++            providerThreadId: route.providerThreadId,
++            providerTurnId: route.providerTurnId,
+             nativeItemRef,
+             parentItemId: null,
+             ordinal,
+@@ -6026,7 +6352,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           yield* emitProviderEvent({
+             type: "runtime_request.updated",
+             driver,
+-            threadId: context.input.threadId,
++            threadId: route.threadId,
+             runtimeRequest,
+           });
+           yield* emitProviderEvent({
+@@ -6048,11 +6374,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           generation: number,
+           transportRequestId: string,
+         ) {
+-          const context = yield* activeContext;
+-          yield* closeTextStreams(context);
++          const route = yield* requestRoute(request.nativeSessionId);
++          const context = route.context;
++          if (context !== null) yield* closeTextStreams(context);
+           const requestId = yield* idAllocator.allocate.runtimeRequest({
+             driver,
+-            providerTurnId: context.providerTurnId,
++            ...(route.providerTurnId === null ? {} : { providerTurnId: route.providerTurnId }),
+             nativeRequestId: request.nativeRequestId,
+           });
+           const answers = yield* Deferred.make<ProviderUserInputAnswers | null>();
+@@ -6073,11 +6400,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+             nativeId: request.nativeItemId,
+             strength: "weak" as const,
+           };
+-          const ordinal = yield* resolveItemOrdinal(context, request.nativeItemId);
++          const ordinal =
++            context === null
++              ? yield* Ref.getAndUpdate(nextExternalRequestOrdinal, (value) => value + 1)
++              : yield* resolveItemOrdinal(context, request.nativeItemId);
+           const runtimeRequest: OrchestrationV2RuntimeRequest = {
+             id: requestId,
+             nodeId,
+-            providerTurnId: context.providerTurnId,
++            providerTurnId: route.providerTurnId,
+             nativeRequestRef: {
+               driver,
+               nativeId: request.nativeRequestId,
+@@ -6094,15 +6424,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           };
+           const node: OrchestrationV2ExecutionNode = {
+             id: nodeId,
+-            threadId: context.input.threadId,
+-            runId: context.input.runId,
+-            parentNodeId: context.input.rootNodeId,
+-            rootNodeId: context.input.rootNodeId,
++            threadId: route.threadId,
++            runId: route.runId,
++            parentNodeId: route.rootNodeId,
++            rootNodeId: route.rootNodeId ?? nodeId,
+             kind: "user_input_request",
+             status: "waiting",
+             countsForRun: false,
+-            providerThreadId: context.input.providerThread.id,
+-            providerTurnId: context.providerTurnId,
++            providerThreadId: route.providerThreadId,
++            providerTurnId: route.providerTurnId,
+             nativeItemRef,
+             runtimeRequestId: requestId,
+             checkpointScopeId: null,
+@@ -6111,11 +6441,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           };
+           const turnItem: OrchestrationV2TurnItem = {
+             id: turnItemId,
+-            threadId: context.input.threadId,
+-            runId: context.input.runId,
++            threadId: route.threadId,
++            runId: route.runId,
+             nodeId,
+-            providerThreadId: context.input.providerThread.id,
+-            providerTurnId: context.providerTurnId,
++            providerThreadId: route.providerThreadId,
++            providerTurnId: route.providerTurnId,
+             nativeItemRef,
+             parentItemId: null,
+             ordinal,
+@@ -6151,7 +6481,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           yield* emitProviderEvent({
+             type: "runtime_request.updated",
+             driver,
+-            threadId: context.input.threadId,
++            threadId: route.threadId,
+             runtimeRequest,
+           });
+           yield* emitProviderEvent({
+@@ -6229,14 +6559,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           ),
+         );
+ 
+-        const cancelPendingRuntimeRequests = Effect.fnUntraced(function* () {
+-          const waiting = turnAttached;
+-          turnAttached = yield* Deferred.make<boolean>();
+-          yield* Deferred.succeed(waiting, false);
+-          const requests = yield* Ref.modify(pendingRuntimeRequests, (current) => [
+-            [...current.values()],
+-            new Map<string, PendingRuntimeRequest>(),
+-          ]);
++        const cancelPendingRuntimeRequests = Effect.fnUntraced(function* (
++          transportRequestId?: string,
++        ) {
++          if (transportRequestId === undefined) {
++            const waiting = turnAttached;
++            turnAttached = yield* Deferred.make<boolean>();
++            yield* Deferred.succeed(waiting, false);
++          }
++          const requests = yield* Ref.modify(pendingRuntimeRequests, (current) => {
++            const cancelled = [...current.values()].filter(
++              (request) =>
++                transportRequestId === undefined ||
++                request.transportRequestId === transportRequestId,
++            );
++            const remaining = new Map(current);
++            for (const request of cancelled) remaining.delete(String(request.requestId));
++            return [cancelled, remaining];
++          });
+           if (requests.length === 0) return;
+ 
+           const now = yield* DateTime.now;
+@@ -6844,6 +7184,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               projectAcpRuntimeSessionUpdate(handlerGeneration, rawNotification),
+             );
+           }
++          yield* targetRuntime.handleExtNotification(
++            "$/cancel_request",
++            Schema.Struct({ requestId: Schema.Union([Schema.String, Schema.Number]) }),
++            (params) => {
++              const requestId = EffectAcpProtocol.acpRequestIdentity(params.requestId);
++              return runRuntimeCallbackAtGeneration(
++                handlerGeneration,
++                Effect.suspend(() =>
++                  externallyManagedSession ? cancelPendingRuntimeRequests(requestId) : Effect.void,
++                ),
++              ).pipe(Effect.asVoid);
++            },
++          );
+           yield* targetRuntime.handleRequestPermission((nativeParams, requestContext) =>
+             Effect.gen(function* () {
+               const trackedTurn = yield* Ref.get(activeTurn);
+@@ -6890,20 +7243,23 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               const admitted = yield* runRuntimeCallbackAtGeneration(
+                 handlerGeneration,
+                 Effect.gen(function* () {
+-                  const context = followsAgentWorkState
+-                    ? yield* Ref.get(activeTurn)
+-                    : yield* activeContext;
++                  const context =
++                    followsAgentWorkState || externallyManagedSession
++                      ? yield* Ref.get(activeTurn)
++                      : yield* activeContext;
+                   // Kiro sends the tool's kind on its `tool_call` and leaves it
+                   // off the permission request for that call; take it from the
+                   // tool already seen under the same id so policy can tell a
+                   // read from a write.
+                   const knownKind = context?.tools.get(params.toolCall.toolCallId)?.kind;
+-                  const disposition = dispositionFor(
+-                    context?.input.runtimePolicy ?? latestRuntimePolicy,
+-                    params.toolCall.kind == null && knownKind !== undefined
+-                      ? { ...params, toolCall: { ...params.toolCall, kind: knownKind } }
+-                      : params,
+-                  );
++                  const disposition = externallyManagedSession
++                    ? "ask"
++                    : dispositionFor(
++                        context?.input.runtimePolicy ?? latestRuntimePolicy,
++                        params.toolCall.kind == null && knownKind !== undefined
++                          ? { ...params, toolCall: { ...params.toolCall, kind: knownKind } }
++                          : params,
++                      );
+                   if (disposition === "allow") {
+                     const optionId = selectAutoApprovedPermissionOption(answerableParams);
+                     return {
+@@ -6927,7 +7283,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   return {
+                     _tag: "Pending" as const,
+                     pending: yield* beginApprovalRequest(
+-                      yield* activeContext,
+                       params,
+                       handlerGeneration,
+                       transportRequestId,
+@@ -6986,7 +7341,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                 !offeredOptions.some((option) => option.decision === "acceptForSession")
+                   ? "accept"
+                   : answered;
+-              if (decision === "accept" || decision === "acceptForSession") {
++              if (
++                context !== null &&
++                !externallyManagedSession &&
++                (decision === "accept" || decision === "acceptForSession")
++              ) {
+                 clientPolicyGrants.recordApproval({
+                   toolKind: parsedPermission.kind,
+                   scope: decision === "acceptForSession" ? "session" : "turn",
+@@ -7130,6 +7489,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   return {
+                     nativeItemId: nativeRequestId,
+                     nativeRequestId,
++                    ...("sessionId" in params && typeof params.sessionId === "string"
++                      ? { nativeSessionId: params.sessionId }
++                      : {}),
+                     questions: form.questions,
+                   };
+                 }),
+@@ -7293,6 +7655,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           const startup = Effect.gen(function* () {
+             yield* spawnAcpRuntime(threadId, resumeSessionId);
+             yield* wireAcpRuntimeHandlers(runtime, yield* Ref.get(runtimeCallbackGeneration));
++            externallyManagedSession = supportsExternalSession((yield* runtime.initialize())._meta);
+             return yield* runtime.start();
+           });
+           return yield* flavor.withRuntimeStartup?.(startup) ?? startup;
+@@ -7528,6 +7891,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               ) {
+                 return yield* initialStart.failure;
+               }
++              const initialized = yield* runtime.initialize();
++              if (supportsExternalSession(initialized._meta)) {
++                return yield* initialStart.failure;
++              }
+               yield* Ref.set(initialSessionActivationFailure, {
+                 sessionId: input.initialNativeThreadId,
+                 error: initialStart.failure,
+@@ -7541,12 +7908,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+         yield* setActiveSessionSetup(started);
+         rememberTerminalEnvironment(started.sessionId, yield* readMcpContext(input.threadId));
+         yield* runtime.drainEvents;
+-        const capabilities = negotiatedCapabilities(
++        const negotiated = negotiatedCapabilities(
+           yield* readCapabilities,
+           started,
+           flavor.modelOptionArrivesLate === true,
+           flavor.forkFromTurn?.supported(started.initializeResult) === true,
+         );
++        const capabilities = {
++          ...negotiated,
++          threads: { ...negotiated.threads, canInterruptThread: externallyManagedSession },
++        };
+         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
+         const canResumeSession =
+           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
+@@ -7569,14 +7940,21 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           const mcpContext = yield* readMcpContext(threadId);
+           const activationOptions = acpMcpActivation(mcpContext);
+           prepareTerminalEnvironment(mcpContext, sessionId);
+-          const activated = canLoadSession
+-            ? yield* runtime.loadSession(sessionId, activationOptions)
+-            : canResumeSession
+-              ? yield* runtime.resumeSession(sessionId, activationOptions)
+-              : yield* new ProviderAdapter.ProviderAdapterProtocolError({
+-                  driver,
+-                  detail: `ACP driver cannot load or resume session ${sessionId}`,
+-                });
++          const activated = yield* Effect.acquireUseRelease(
++            Ref.getAndSet(loadingSessionId, sessionId),
++            () =>
++              Effect.gen(function* () {
++                return canLoadSession
++                  ? yield* runtime.loadSession(sessionId, activationOptions)
++                  : canResumeSession
++                    ? yield* runtime.resumeSession(sessionId, activationOptions)
++                    : yield* new ProviderAdapter.ProviderAdapterProtocolError({
++                        driver,
++                        detail: `ACP driver cannot load or resume session ${sessionId}`,
++                      });
++              }),
++            (previous) => Ref.set(loadingSessionId, previous),
++          );
+           rememberTerminalEnvironment(activated.sessionId, yield* readMcpContext(threadId));
+           return activated;
+         });
+@@ -8112,7 +8490,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           const updatedProviderThread: OrchestrationV2ProviderThread = {
+             ...context.input.providerThread,
+             providerSessionId: input.providerSessionId,
+-            status: "active",
++            status:
++              externallyManagedSession && observedExternalState === "unavailable"
++                ? "error"
++                : externallyManagedSession && agentWork?.state === "idle"
++                  ? "idle"
++                  : "active",
+             lastRunOrdinal: context.input.runOrdinal,
+             firstRunOrdinal:
+               context.input.providerThread.firstRunOrdinal ?? context.input.runOrdinal,
+@@ -8835,7 +9218,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+             yield* (
+               compactSession === undefined
+                 ? sendPromptWhenIdle(context, () =>
+-                    runtime.prompt({ prompt: promptParts!.prompt }, promptOptions),
++                    runtime.prompt(
++                      {
++                        prompt: promptParts!.prompt,
++                        _meta: { "t3.codes/messageId": turnInput.message.messageId },
++                      },
++                      promptOptions,
++                    ),
+                   )
+                 : Deferred.succeed(context.promptDispatched, undefined).pipe(
+                     Effect.andThen(compactSession.compact(runtime, requestedSessionId)),
+@@ -9176,16 +9565,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                       detail: "ACP runtime did not produce a session id",
+                     });
+                   }
+-                  const created = makeProviderThread({
+-                    driver,
+-                    providerInstanceId: options.instanceId,
+-                    idAllocator,
+-                    appThreadId: threadInput.threadId,
+-                    providerSessionId: input.providerSessionId,
+-                    nativeThreadId: sessionId,
+-                    ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
+-                    now,
+-                  });
++                  const created =
++                    (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId) ??
++                    makeProviderThread({
++                      driver,
++                      providerInstanceId: options.instanceId,
++                      idAllocator,
++                      appThreadId: threadInput.threadId,
++                      providerSessionId: input.providerSessionId,
++                      nativeThreadId: sessionId,
++                      ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
++                      now,
++                    });
+                   const providerThread =
+                     threadInput.forceNewNativeThread && threadInput.existingProviderThread
+                       ? { ...created, id: threadInput.existingProviderThread.id }
+@@ -9224,6 +9615,23 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   const restorePreviousItemIdentity = Effect.sync(() => {
+                     itemIdentityVersion = previousItemIdentityVersion;
+                   });
++                  yield* Ref.update(providerThreadByNativeSessionId, (current) => {
++                    const known = current.get(sessionId);
++                    return new Map(current).set(sessionId, {
++                      ...threadInput.providerThread,
++                      providerSessionId: input.providerSessionId,
++                      status:
++                        known?.status ??
++                        (threadInput.providerThread.status === "not_loaded"
++                          ? "idle"
++                          : threadInput.providerThread.status),
++                      contextUsage: known?.contextUsage ?? threadInput.providerThread.contextUsage,
++                      nativeMetadata: {
++                        ...threadInput.providerThread.nativeMetadata,
++                        ...known?.nativeMetadata,
++                      },
++                    });
++                  });
+                   const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
+                     threadInput.providerThread.appThreadId,
+                   ).pipe(Effect.tapError(() => restorePreviousItemIdentity));
+@@ -9244,8 +9652,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   const now = yield* DateTime.now;
+                   return {
+                     ...threadInput.providerThread,
++                    ...(yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId),
+                     providerSessionId: input.providerSessionId,
+-                    status: "idle" as const,
++                    status:
++                      (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId)?.status ??
++                      ("idle" as const),
+                     updatedAt: now,
+                   };
+                 }),
+@@ -9352,6 +9763,36 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                 ),
+               ),
+           ),
++          interruptThread: Effect.fn("AcpAdapterV2.interruptThread")(
++            function* (threadInput) {
++              return yield* runtimeTransitionPermit.withPermit(
++                Effect.gen(function* () {
++                  yield* awaitRuntimeTeardown();
++                  const sessionId = yield* nativeThreadId(driver, threadInput.providerThread);
++                  if (
++                    !externallyManagedSession ||
++                    sessionId !== (yield* Ref.get(activeSessionId)) ||
++                    (yield* Ref.get(activeTurn)) !== null
++                  ) {
++                    return yield* new ProviderAdapter.ProviderAdapterProtocolError({
++                      driver,
++                      detail: "The requested ACP session is not attached without a local turn",
++                    });
++                  }
++                  yield* runtime.cancel;
++                }),
++              );
++            },
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapter.ProviderAdapterProtocolError({
++                  driver,
++                  detail:
++                    "Failed to cancel the attached ACP session; check its state before retrying",
++                  cause,
++                }),
++            ),
++          ),
+           interruptTurn: Effect.fn("AcpAdapterV2.interruptTurn")(
+             function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
+               return yield* Effect.uninterruptibleMask((restore) =>
+@@ -9362,6 +9803,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   const transitionFiber = yield* Effect.gen(function* () {
+                     const transition = yield* Effect.gen(function* () {
+                       const interruptContext = yield* Ref.get(activeTurn);
++                      if (externallyManagedSession) {
++                        if (interruptContext?.providerTurnId !== turnInput.providerTurnId)
++                          return undefined;
++                        yield* restore(runtime.cancel);
++                        yield* cancelPendingRuntimeRequests();
++                        const confirmed = yield* restore(
++                          Deferred.await(interruptContext.completed).pipe(
++                            Effect.timeoutOption(ACP_STOP_CONFIRM_TIMEOUT_MS),
++                          ),
++                        );
++                        if (Option.isNone(confirmed)) {
++                          return yield* new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
++                            driver,
++                            providerThreadId: turnInput.providerThread.id,
++                            providerTurnId: turnInput.providerTurnId,
++                            timeoutMs: ACP_STOP_CONFIRM_TIMEOUT_MS,
++                          });
++                        }
++                        return undefined;
++                      }
+                       if (
+                         followsAgentWorkState &&
+                         turnInput.requestRuntimeRestart === true &&
+@@ -9672,6 +10133,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                         driver,
+                         providerThreadId: turnInput.providerThread.id,
+                         providerTurnId: turnInput.providerTurnId,
++                        ...(externallyManagedSession ? { deliveryUnknown: true } : {}),
+                         cause,
+                       }),
+                 ),
+@@ -9734,6 +10196,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                     snapshotInput.providerThread.appThreadId,
+                   );
+                   const sessionId = yield* nativeThreadId(driver, snapshotInput.providerThread);
++                  yield* Ref.update(providerThreadByNativeSessionId, (current) =>
++                    new Map(current).set(
++                      sessionId,
++                      current.get(sessionId) ?? snapshotInput.providerThread,
++                    ),
++                  );
+                   if ((yield* Ref.get(activeSessionId)) !== sessionId) {
+                     if (!capabilities.threads.canReadThreadSnapshot) {
+                       return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+@@ -9746,9 +10214,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                       snapshotInput.providerThread.appThreadId,
+                     );
+                     prepareTerminalEnvironment(mcpContext, sessionId);
+-                    const activated = yield* runtime.loadSession(
++                    const activated = yield* activateSession(
+                       sessionId,
+-                      acpMcpActivation(mcpContext),
++                      snapshotInput.providerThread.appThreadId,
+                     );
+                     rememberTerminalEnvironment(
+                       activated.sessionId,
+diff --git a/packages/provider-acp/src/server/externalSession.ts b/packages/provider-acp/src/server/externalSession.ts
+new file mode 100644
+index 00000000..7cb57629
+--- /dev/null
++++ b/packages/provider-acp/src/server/externalSession.ts
+@@ -0,0 +1,45 @@
++export function supportsExternalSession(
++  metadata: Readonly<Record<string, unknown>> | null | undefined,
++) {
++  const value = metadata?.["t3.codes/externalSession"];
++  return (
++    value === true ||
++    (typeof value === "object" && value !== null && "version" in value && value.version === 1)
++  );
++}
++
++export function externalSessionState(
++  metadata: Readonly<Record<string, unknown>> | null | undefined,
++) {
++  const value = metadata?.["t3.codes/externalSessionState"];
++  if (
++    typeof value !== "object" ||
++    value === null ||
++    !("version" in value) ||
++    value.version !== 1 ||
++    !("state" in value)
++  )
++    return null;
++  return value.state === "running" ||
++    value.state === "idle" ||
++    value.state === "requires_action" ||
++    value.state === "unavailable"
++    ? value.state
++    : null;
++}
++
++export function acceptedExternalSessionInput(
++  metadata: Readonly<Record<string, unknown>> | null | undefined,
++) {
++  const value = metadata?.["t3.codes/externalSessionDispatch"];
++  return typeof value === "object" &&
++    value !== null &&
++    "version" in value &&
++    value.version === 1 &&
++    "state" in value &&
++    value.state === "accepted" &&
++    "messageId" in value &&
++    typeof value.messageId === "string"
++    ? value.messageId
++    : null;
++}
+diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
+index ff879ef0..6e9fd2ea 100644
+--- a/packages/provider-core/src/server/ProviderAdapter.ts
++++ b/packages/provider-core/src/server/ProviderAdapter.ts
+@@ -14,6 +14,7 @@ import {
+   OrchestrationV2ProviderFailure,
+   OrchestrationV2ProviderRetry,
+   OrchestrationV2ProviderThread,
++  OrchestrationV2ProviderRef,
+   OrchestrationV2ProviderTurn,
+   OrchestrationV2RuntimeRequest,
+   OrchestrationV2Subagent,
+@@ -124,6 +125,8 @@ export const ProviderAdapterV2Event = Schema.Union([
+     type: Schema.Literal("message.updated"),
+     driver: ProviderDriverKind,
+     message: OrchestrationV2ConversationMessage,
++    providerThreadId: Schema.optional(ProviderThreadId),
++    nativeItemRef: Schema.optional(OrchestrationV2ProviderRef),
+   }),
+   Schema.Struct({
+     type: Schema.Literal("turn_item.updated"),
+@@ -411,6 +414,7 @@ export class ProviderAdapterInterruptError extends Schema.TaggedError<ProviderAd
+     driver: ProviderDriverKind,
+     providerThreadId: ProviderThreadId,
+     providerTurnId: ProviderTurnId,
++    deliveryUnknown: Schema.optional(Schema.Boolean),
+     cause: Schema.optional(Schema.Defect()),
+   },
+ ) {
+@@ -777,6 +781,9 @@ export interface ProviderAdapterV2SessionRuntime {
+   readonly interruptTurn: (
+     input: ProviderAdapterV2InterruptInput,
+   ) => Effect.Effect<void, ProviderAdapterV2Error>;
++  readonly interruptThread?: (input: {
++    readonly providerThread: OrchestrationV2ProviderThread;
++  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+   readonly stopSubagent?: (input: {
+     readonly providerThread: OrchestrationV2ProviderThread;
+     readonly nativeTaskId: string;
+diff --git a/packages/shared/src/orchestrationV2Timeline.test.ts b/packages/shared/src/orchestrationV2Timeline.test.ts
+index c2b7a0c9..068ff766 100644
+--- a/packages/shared/src/orchestrationV2Timeline.test.ts
++++ b/packages/shared/src/orchestrationV2Timeline.test.ts
+@@ -30,6 +30,19 @@ describe.each([
+       createOrchestrationV2TurnItemVisibility(input)(input.item),
+   ],
+ ] as const)("%s timeline visibility", (_, isVisible) => {
++  it("keeps accepted external command inputs out of the canonical native transcript", () => {
++    const input = { runs: [{ id: runId, status: "running" as const }], attempts: [], items: [] };
++    expect(
++      isVisible({
++        ...input,
++        item: { type: "user_message", runId, nodeId, externalSessionInput: true },
++      }),
++    ).toBe(false);
++    expect(isVisible({ ...input, item: { type: "user_message", runId: null, nodeId: null } })).toBe(
++      true,
++    );
++    expect(isVisible({ ...input, item: { type: "user_message", runId, nodeId } })).toBe(true);
++  });
+   it("hides unpaired interruption results from superseded attempts", () => {
+     expect(
+       isVisible({
+diff --git a/packages/shared/src/orchestrationV2Timeline.ts b/packages/shared/src/orchestrationV2Timeline.ts
+index e651dbfb..b144aec7 100644
+--- a/packages/shared/src/orchestrationV2Timeline.ts
++++ b/packages/shared/src/orchestrationV2Timeline.ts
+@@ -9,6 +9,7 @@ type TimelineRun = Pick<OrchestrationV2Run, "id" | "status">;
+ type TimelineRunAttempt = Pick<OrchestrationV2RunAttempt, "runId" | "rootNodeId" | "status">;
+ type TimelineTurnItem = Pick<OrchestrationV2TurnItem, "type" | "runId" | "nodeId"> & {
+   readonly inputIntent?: OrchestrationV2UserMessageInputIntent;
++  readonly externalSessionInput?: true | undefined;
+ };
+ 
+ function isOrchestrationV2SupersededInterrupt(input: {
+@@ -45,6 +46,7 @@ export function isOrchestrationV2TurnItemVisible(input: {
+   readonly items: ReadonlyArray<TimelineTurnItem>;
+ }): boolean {
+   const { item } = input;
++  if (item.type === "user_message" && item.externalSessionInput === true) return false;
+   if (
+     item.runId !== null &&
+     input.runs.some((run) => run.id === item.runId && run.status === "rolled_back")
+@@ -93,7 +95,8 @@ export function createOrchestrationV2TurnItemVisibility(input: {
+     if (roots === undefined) supersededRoots.set(attempt.runId, (roots = new Set()));
+     roots.add(attempt.rootNodeId);
+   }
+-  if (statuses.size === 0 && supersededRoots.size === 0) return () => true;
++  if (statuses.size === 0 && supersededRoots.size === 0)
++    return (item) => item.type !== "user_message" || item.externalSessionInput !== true;
+   const interruptRuns = new Set<TimelineTurnItem["runId"]>();
+   if (supersededRoots.size > 0) {
+     for (const item of input.items) {
+@@ -101,6 +104,7 @@ export function createOrchestrationV2TurnItemVisibility(input: {
+     }
+   }
+   return (item) => {
++    if (item.type === "user_message" && item.externalSessionInput === true) return false;
+     const status = item.runId === null ? undefined : statuses.get(item.runId);
+     if (status === "rolled_back") return false;
+     if (
+-- 
+2.47.3
+

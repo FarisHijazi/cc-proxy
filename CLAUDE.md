@@ -1,5 +1,57 @@
 # cc-proxy
 
+`scripts/cc-proxy-acp` is the ACP client adapter for T3's existing local-command
+provider. HQ remains the only session/action owner; MCP supplies compact discovery,
+and selected-session detail/actions use the private HQ origin. Never spawn/resume a
+replacement Claude process, map remote workdirs onto the local T3 workspace, retry
+an uncertain write, or guess native/tmux equivalence. T3's explicit external-session capability gates passive attachment and native controls.
+T3's `autoImportProjectId` opts an observable provider into the existing server's
+discovery loop (30-second delay between passes). Discovery creates only sidebar records; the history
+owner loads on selection. Preserve archived/deleted views and native workers.
+The necessary patches against a pinned official nightly are maintained in `patches/t3/`
+and installed through the existing service updater; never create a second T3 deployment.
+Read README "Existing fleet sessions in T3 Code", `patches/t3/README.md`, and
+`docs/testing/fleet-e2e-matrix.md` on demand.
+
+Fleet is a discovery connection. `t3.codes/externalSessionIdentity` v1 carries
+the owner-supplied Claude Code/Codex engine, connection, optional observed model
+and effective capabilities. Keep the existing opaque ACP bindings; never swap
+an imported thread to a native driver that launches another worker. Metadata-only
+events must survive serialization and preserve activity timestamps. New drafts
+exclude discovery connections; existing lazy bindings retain them while loading.
+The management/list handshake must advertise the same versioned capability as
+selected observation; otherwise the bridge intentionally omits catalog identity.
+Session connections uses ProviderSettingsPanel's existing environment selection;
+never gate it on a primary/local backend or add a second selection owner.
+
+Only exact Codex owner rows with the complete ended/read-only contract may
+load archived native history. Preserve native UUID and route binding, cancel
+pending controls on that transition, and keep all actions disabled. Never
+resume a thread for a read or treat an ordinary offline row as empty history.
+
+The eight-patch T3 series includes self-hosted Authentik sign-in through the existing
+EnvironmentAuth/SessionStore, AuthSessionRepository and ServerSecretStore owners.
+Keep `T3CODE_OIDC_REQUIRED=true` with the private config-file path in the existing
+`service.env`; do not trust forwarded identity headers or make legacy pairing a
+remote fallback. Browser refresh secrets remain HttpOnly; native credentials use
+the existing secure stores. Sign-in/renewal wakes the existing primary connection
+supervisor after an auth rejection; preserve that recovery without another socket
+owner. Lost refresh responses reuse a grant/session-bound 60-second receipt in the
+existing private ServerSecretStore; that server store is not encrypted. Desktop
+credentials use Electron safeStorage encryption. Root shell selection follows
+committed route matches while an OIDC callback is pending, preserving Settings'
+sidebar context. Safari/Home Screen needs only the served web build; stock native clients
+need matching app changes for renewable OIDC sign-in.
+Read `docs/self-hosted-t3-auth.md` on demand. Maintain the patch series when updating
+T3; an official binary does not implement these OIDC flags. Do not add a second
+service, relay, credential writer, or automatic update policy.
+
+`cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
+dashboard listener. `scripts/account_mcp_relay.py` owns transport forwarding only;
+HQ remains the fleet, action and OAuth token verifier. Preserve dashboard SSO and
+never add credentials or retry writes in the relay. Read README "Fleet MCP for
+Claude.ai" and `docs/devlog/claude_20261115-fleet-mcp.md` on demand (plain paths).
+
 Local Rust proxy that speaks the Anthropic Messages API and routes each request
 to a backend based on the model name. Repo: `FarisHijazi/cc-proxy`. It started as a
 GitHub fork of [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex)
@@ -248,6 +300,8 @@ Packaging: `pyproject.toml` ships `scripts/` inside the `cc-proxy` wheel; `pytho
 router from the release matching the package version, so bump `pyproject.toml` and `Cargo.toml` together.
 `Dockerfile` and `compose.yaml` run `--serve`. See `docs/devlog/claude_20261027-cc-proxy-packaging.md` (plain path).
 Run tests as CI does with an empty `HOME`: tests that read the machine's Codex login pass locally and fail in CI.
+The cold-catalog fallback test runs in an isolated subprocess because its temporary Codex environment must not redirect catalog requests from concurrent integration tests.
+The Nix-pinned compiler still needs atomic `fetch_update`; keep its deprecation allowance scoped to `next_monotonic_nonzero` so both Nix and current stable CI compile.
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,

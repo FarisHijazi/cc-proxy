@@ -1,0 +1,153 @@
+From 556d84aa10429b8c0d76030e80bad7b6d106d683 Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 17 Nov 2026 21:05:45 +0000
+Subject: [PATCH] fix(web): show fleet connections on remote-only clients
+
+---
+ .../settings/ConnectionsSettings.tsx          |   8 +-
+ ...onnectionsSettings.remote.browser.test.tsx | 114 ++++++++++++++++++
+ 2 files changed, 115 insertions(+), 7 deletions(-)
+ create mode 100644 apps/web/src/connectionsSettings.remote.browser.test.tsx
+
+diff --git a/apps/web/src/components/settings/ConnectionsSettings.tsx b/apps/web/src/components/settings/ConnectionsSettings.tsx
+index ec085fe4..1e8e012a 100644
+--- a/apps/web/src/components/settings/ConnectionsSettings.tsx
++++ b/apps/web/src/components/settings/ConnectionsSettings.tsx
+@@ -1680,13 +1680,7 @@ function ConnectionsSettingsContent({
+           <LocalEnvironmentSetting />
+         </SettingsSection>
+       ) : null}
+-      {primaryEnvironment ? (
+-        <ProviderSettingsPanel
+-          environmentId={primaryEnvironment.environmentId}
+-          scoped
+-          category="connections"
+-        />
+-      ) : null}
++      <ProviderSettingsPanel category="connections" />
+       <SettingsSection
+         {...searchableSetting("remote-environments")}
+         title="Environments"
+diff --git a/apps/web/src/connectionsSettings.remote.browser.test.tsx b/apps/web/src/connectionsSettings.remote.browser.test.tsx
+new file mode 100644
+index 00000000..7c35262b
+--- /dev/null
++++ b/apps/web/src/connectionsSettings.remote.browser.test.tsx
+@@ -0,0 +1,114 @@
++import { createMemoryHistory } from "@tanstack/react-router";
++import {
++  ProviderDriverKind,
++  ProviderInstanceId,
++  type EnvironmentId,
++  type UnifiedSettings,
++} from "@t3tools/contracts";
++import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
++import type * as Context from "effect/Context";
++import { expect, it, vi } from "vite-plus/test";
++import { page } from "vite-plus/test/browser";
++
++import { AppRoot } from "~/AppRoot";
++import "~/components/settings/ConnectionsSettings";
++import { __setClientSettingsForTests } from "~/hooks/useSettings";
++import { getRouter } from "~/router";
++import { CODEX_PROVIDER, installFakeEnvironment, type FakeDriver } from "../test/fakeEnvironment";
++import { render } from "../test/render";
++
++vi.mock("../../../packages/client-runtime/src/connection/driver.ts", async (importOriginal) => {
++  const [actual, { fakeDriver }, Layer] = await Promise.all([
++    importOriginal<{ readonly ConnectionDriver: Context.Key<unknown, FakeDriver> }>(),
++    import("../test/fakeEnvironment"),
++    import("effect/Layer"),
++  ]);
++  return { ...actual, layer: Layer.succeed(actual.ConnectionDriver, fakeDriver) };
++});
++vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
++  ...(await original()),
++  trackRpcRequestSent: () => {},
++}));
++vi.mock(import("~/state/environments"), async (original) => {
++  const actual = await original();
++  const { BearerConnectionTarget } = await import("@t3tools/client-runtime/connection");
++  return {
++    ...actual,
++    usePrimaryEnvironment: () => null,
++    usePrimaryEnvironmentId: () => null,
++    useEnvironments: () => {
++      const state = actual.useEnvironments();
++      return {
++        ...state,
++        environments: state.environments.map((environment) => ({
++          ...environment,
++          label: "Remote server",
++          entry: {
++            ...environment.entry,
++            target: new BearerConnectionTarget({
++              environmentId: environment.environmentId,
++              label: "Remote server",
++              connectionId: "saved-remote",
++            }),
++          },
++        })),
++      };
++    },
++  };
++});
++vi.mock(import("~/hooks/useSettings"), async (original) => {
++  const actual = await original();
++  return {
++    ...actual,
++    useEnvironmentSettings: ((
++      environmentId: EnvironmentId,
++      selector?: (settings: UnifiedSettings) => unknown,
++    ) => {
++      const settings: UnifiedSettings = {
++        ...actual.useEnvironmentSettings(environmentId),
++        providerInstances: {
++          [ProviderInstanceId.make("fleet_connection")]: {
++            driver: ProviderDriverKind.make("acpRegistry"),
++            enabled: true,
++            displayName: "Fleet connection",
++          },
++        },
++      };
++      return selector ? selector(settings) : settings;
++    }) as typeof actual.useEnvironmentSettings,
++  };
++});
++
++it("shows the saved remote's session connections without a primary environment", async () => {
++  using _environment = installFakeEnvironment([], {
++    providers: [
++      CODEX_PROVIDER,
++      {
++        ...CODEX_PROVIDER,
++        instanceId: "fleet_connection",
++        driver: "acpRegistry",
++        connectionRole: "discovery",
++      },
++    ],
++  });
++  __setClientSettingsForTests({
++    ...DEFAULT_CLIENT_SETTINGS,
++    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
++  });
++  const router = getRouter(createMemoryHistory({ initialEntries: ["/settings/connections"] }));
++  await router.load();
++  // AppRoot owns the real application router.
++  await using _app = await render(<AppRoot router={router} />, { router: false });
++  await expect
++    .element(page.getByRole("heading", { name: "Environments", exact: true }))
++    .toBeVisible();
++  await expect
++    .element(page.getByRole("heading", { name: "Session connections", exact: true }), {
++      timeout: 2_000,
++    })
++    .toBeVisible();
++  await expect.element(page.getByText("Fleet connection", { exact: true }).first()).toBeVisible();
++  await expect
++    .element(page.getByRole("heading", { name: "Providers", exact: true }))
++    .not.toBeInTheDocument();
++});
+-- 
+2.47.3
+

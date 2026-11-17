@@ -161,6 +161,136 @@ Claude token. Like the proxy it has no login and shows full conversations, so bi
 a private address only. To keep it running, use the systemd or launchd snippet above with
 this command in place of `cc-proxy --serve`.
 
+### Existing fleet sessions in T3 Code
+
+`scripts/cc-proxy-acp` connects T3 Code's existing **Local ACP command** provider to
+the fleet. It lists the sessions already running on every configured HQ node,
+offers the conversation text HQ holds, and sends new prompts to the same process.
+Disconnecting the adapter detaches its observer and leaves the original process running.
+No additional server or per-node deployment is needed.
+
+The script uses the official Python ACP and MCP SDKs, with pinned dependencies
+declared inline. Run it with `uv run --script`:
+
+```sh
+uv run --script /path/to/cc-proxy/scripts/cc-proxy-acp \
+  --mcp-url https://proxy.example.com/mcp \
+  --mcp-token-file /path/to/existing-mcp-token \
+  --hq-url http://private-hq:8389 \
+  --token-file /path/to/existing-hq-token
+```
+
+Use a stable installed copy of the script. Configure its **Local ACP command**
+entry with executable `uv` and the arguments above, one per row. The maintained
+build places the negotiated fleet entry under **Settings → Connections**.
+Choose an existing local project for the fleet conversation views and
+set the provider configuration's `autoImportProjectId` to its project ID through
+T3's settings API. The patched server adds discovered sessions to that project's
+sidebar automatically, with a 30-second delay between discovery passes, even with no browser open. It loads history when a
+conversation is selected and preserves archived/deleted views. **List sessions**
+and **Import** remain available for manual selection.
+
+Fleet is a discovery and connection layer, not a model provider. Existing
+conversations show Claude Code or Codex from the native owner, with the observed
+model when available. Configure fleet under **Settings → Connections**; it is
+excluded from new-session provider selection. Discovery enriches existing
+bindings without changing their IDs or activity order; retained history absent
+from discovery is enriched when opened. Unsupported controls stay unavailable.
+Session connections uses the existing environment selector, including saved
+remote servers when the desktop local backend is disabled.
+
+Import binds the existing native session ID; the bridge does not start or resume
+another Claude or Codex process. New blank threads cannot launch fleet agents.
+Rows include the host, transport and exact tmux session name so sessions sharing a
+project title remain distinguishable. Separate provenance paths are not guessed
+to be identical.
+
+The selected worker keeps its real workdir, account and tools on its own node.
+T3's local project file browser and git controls still belong to the selected T3
+project; they do not browse or modify that remote workdir. The bridge supplies
+updates from the selected session's existing HQ history. Unidentified token
+previews are excluded; large or older history remains bounded by the existing HQ
+reader. A recent-history notice appears when the owner reports truncation.
+
+Discovery uses the compact, authenticated MCP list. History and actions use only
+the configured private HQ origin. An existing HQ token is sent when configured;
+an empty token preserves an HQ that already relies on its private network boundary.
+The public MCP always requires its bearer token. Do not make a private HQ public
+to use this bridge.
+
+Imported threads start in T3's supervised permission mode. Native tool approvals
+and questions retain their original request IDs and revisions. Supported terminal
+choices use a question form; complex terminal menus and computer-use dialogs must
+be answered in HQ or the original terminal. Stale answers are rejected. A lost
+action response reports uncertain delivery and is never retried automatically.
+Explicit Stop targets the attached original session, including work started outside
+T3. It waits for observed idle; disconnecting only detaches the observer. Native
+controls require an explicit decision even when T3 uses a permissive local mode.
+
+The maintained T3 build uses an official nightly with the versioned
+external-session patches in [`patches/t3/`](patches/t3/README.md). Upstream supplies
+initial history import; the patch adds passive observation, stable native message
+identity, external Stop, and native requests already pending before attachment.
+The bridge keeps standard ACPv1 synchronous prompt completion. These additions
+require explicit client/provider opt-in; older T3 clients can continue a session
+but do not provide the full external-session experience.
+
+The eight-patch series' pinned base, build/update procedure and upgrade considerations
+are in its README. Actual live evidence and remaining limits are kept separately in the
+[fleet acceptance matrix](docs/testing/fleet-e2e-matrix.md). Text prompts are
+supported; image/file input and provider/model changes are not fleet operations.
+
+Previously discovered Codex sessions retain read-only native history after
+unloading. Reading history never resumes the thread. Sending, interrupting
+and approvals remain disabled until the native owner independently loads
+that exact UUID; unavailable peers and mismatched identities remain errors.
+
+### Self-hosted T3 sign-in
+
+The maintained T3 build supports Authentik sign-in to the same fleet environment
+from desktop browsers and iPhone Safari, including **Add to Home Screen**. Each
+device renews its own session; users do not copy pairing codes, tokens, or QR links.
+This path uses the existing T3 service and Authentik, without Clerk or T3 Connect.
+
+The native desktop/mobile sign-in flow requires a matching custom app build.
+Installing the server patch alone does not add it to the stock apps; Safari is
+the iPhone path that needs no custom app. Configuration, ingress boundaries and
+upgrade instructions are in [Self-hosted T3 authentication](docs/self-hosted-t3-auth.md).
+Deployment acceptance remains recorded in the [fleet test matrix](docs/testing/fleet-e2e-matrix.md).
+
+### Fleet MCP for Claude.ai
+
+Add `--mcp-upstream http://127.0.0.1:8392` to the existing `cc-proxy-ui` command to
+expose an existing authenticated HQ MCP through this same listener at `/mcp`.
+It remains one MCP server. HQ owns node discovery, session identity, history and
+guarded input; cc-proxy forwards the MCP transport and authentication challenge.
+Sessions launched through `claude-accounts` remain discoverable by the configured
+HQ fleet and native Remote Control integration. No per-node MCP process is needed.
+
+Configure the HQ adapter's `CC_TMUX_MCP_PUBLIC_URL` as the cc-proxy public origin
+(for example `https://proxy.example.com`). Reuse the existing Cloudflare Tunnel and
+reverse proxy. Route exactly `/mcp`, `/mcp/`, `/.well-known/oauth-protected-resource`,
+`/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`
+to the dashboard listener without
+an interactive forward-auth redirect: the MCP upstream itself validates Authentik
+OAuth JWTs and its owner allowlist. Preserve SSO on every dashboard/API path.
+Keep the adapter's existing static bearer authentication for already configured
+machine clients; anonymous calls must return 401 with `WWW-Authenticate` metadata.
+
+In Claude.ai's custom connector settings, enter `https://proxy.example.com/mcp`,
+choose your own OAuth client, and use the existing Authentik application's public
+client ID. Sign in with an identity on that application's allowlist. The issuer must
+permit Claude's `https://claude.ai/api/mcp/auth_callback` callback. Never put a bearer
+token in a URL. A working connection should list sessions, read their messages and
+send through the same HQ action path used by the dashboard. The existing HQ MCP URL
+can stay routed through the same cc-proxy listener for machine-client compatibility.
+
+The relay forwards caller bearer tokens without adding credentials, does not forward
+dashboard cookies, and never retries actions. It streams SSE as it arrives. Omitting
+`--mcp-upstream` leaves these routes disabled. Configure a fixed upstream origin;
+caller-selected upstreams and redirects are not followed. Authorization discovery's
+redirect is passed to the client so it can fetch the issuer's metadata directly.
+
 The sidebar separates Overview, Accounts, Routing, Models, Sessions, and Requests.
 It uses locally bundled Pico CSS, with no frontend build or CDN requirement. The mobile menu
 keeps the same views available. Models edits the equivalent-model groups used by fallback

@@ -1,5 +1,5 @@
 //! The signed-in `cursor-agent` path end to end, against a stand-in CLI found
-//! only at the installer's `~/.local/bin` (a systemd unit's bare `PATH`): the
+//! only at the installer's `~/.local/bin`, with no helper tools on `PATH`: the
 //! backend is available, every model it lists is advertised as
 //! `cursor-cli:<id>`, and picking one runs the CLI read-only with exactly that
 //! model. Its own test binary, because HOME and PATH are process-wide.
@@ -18,7 +18,7 @@ if [ "$1" = "--list-models" ]; then
   printf 'Available models\n\nauto - Auto (current, default)\nclaude-opus-5-5-high - Claude Opus 5.5 1M High\ngpt-5.6-sol-high - GPT-5.6 Sol 1M High\n'
   exit 0
 fi
-printf '%s\n' "$@" > "$(dirname "$0")/argv"
+printf '%s\n' "$@" > "${0%/*}/argv"
 model=auto
 while [ $# -gt 0 ]; do
   [ "$1" = "--model" ] && model=$2
@@ -53,13 +53,15 @@ async fn every_listed_cursor_cli_model_is_advertised_and_runs_read_only() {
     let home = tempfile::tempdir().expect("tempdir");
     let bin = home.path().join(".local/bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
+    let empty_path = home.path().join("empty-path");
+    std::fs::create_dir(&empty_path).expect("mkdir empty PATH");
     let agent = bin.join("cursor-agent");
     std::fs::write(&agent, FAKE_CURSOR_AGENT).expect("write fake cli");
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     // SAFETY: the only test in this binary, set before any thread reads it.
     unsafe {
         std::env::set_var("HOME", home.path());
-        std::env::set_var("PATH", "/usr/bin:/bin");
+        std::env::set_var("PATH", &empty_path);
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("CCP_CURSOR_CLI_BINARY");
         std::env::remove_var("CCP_SHOW_ALL_MODELS");

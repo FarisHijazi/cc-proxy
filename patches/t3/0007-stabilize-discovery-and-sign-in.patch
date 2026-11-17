@@ -1,0 +1,606 @@
+From 97d15c9d632be12860aa6ce79602b00b5175578c Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 17 Nov 2026 20:45:22 +0000
+Subject: [PATCH] fix(fleet): stabilize discovery and authenticated reconnect
+
+---
+ apps/server/src/auth/OidcAuth.test.ts         | 119 ++++++++++++++----
+ apps/server/src/auth/OidcAuth.ts              |  92 ++++++++++----
+ apps/web/src/authOidcRoute.browser.test.tsx   |  66 ++++++++++
+ apps/web/src/routes/__root.tsx                |   4 +-
+ .../src/server/probe.test.ts                  |  74 +++++++++++
+ .../provider-acp-registry/src/server/probe.ts |   1 +
+ .../testing/externalSession.fixture.mjs       |  58 +++++++++
+ 7 files changed, 367 insertions(+), 47 deletions(-)
+ create mode 100644 apps/web/src/authOidcRoute.browser.test.tsx
+ create mode 100644 packages/provider-acp-registry/src/server/probe.test.ts
+ create mode 100644 packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
+
+diff --git a/apps/server/src/auth/OidcAuth.test.ts b/apps/server/src/auth/OidcAuth.test.ts
+index 5c81960c..19076bff 100644
+--- a/apps/server/src/auth/OidcAuth.test.ts
++++ b/apps/server/src/auth/OidcAuth.test.ts
+@@ -75,8 +75,8 @@ const provider = (
+ const testLayer = (providerLayer = provider()) =>
+   OidcAuth.layer.pipe(
+     Layer.provideMerge(sessionLayer),
+-    Layer.provide(providerLayer),
+-    Layer.provide(Layer.succeed(OidcConfig.OidcConfig, { settings })),
++    Layer.provideMerge(providerLayer),
++    Layer.provideMerge(Layer.succeed(OidcConfig.OidcConfig, { settings })),
+   );
+ const begin = Effect.gen(function* () {
+   const auth = yield* OidcAuth.OidcAuth;
+@@ -203,7 +203,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
+           expect(first).toEqual(second);
+           expect(refreshes).toBe(1);
+           expect((yield* Effect.result(sessions.verify(token.access_token)))._tag).toBe("Failure");
+-          yield* TestClock.adjust("6 seconds");
++          yield* TestClock.adjust("61 seconds");
+           expect(
+             (yield* Effect.result(
+               auth.token(
+@@ -233,25 +233,80 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
+       },
+     );
+ 
+-    it.effect.each(["logout", "local-revoke", "provider-revoke"] as const)(
+-      "%s prevents refresh and local access",
+-      (mode) =>
+-        Effect.gen(function* () {
++    it.effect.each(["same process", "restarted owner"] as const)(
++      "recovers a lost rotation response after the client deadline with %s",
++      (mode) => {
++        let refreshes = 0;
++        return Effect.gen(function* () {
+           const { auth, token } = yield* login;
+           const sessions = yield* SessionStore.SessionStore;
+-          if (mode === "logout") yield* auth.logout(token.refresh_token);
+-          if (mode === "local-revoke")
+-            yield* sessions.revoke((yield* sessions.verify(token.access_token)).sessionId);
+-          expect(
+-            (yield* Effect.result(
+-              auth.token(
+-                { grant_type: "refresh_token", refresh_token: token.refresh_token },
+-                metadata,
+-              ),
+-            ))._tag,
+-          ).toBe("Failure");
+-          expect((yield* Effect.result(sessions.verify(token.access_token)))._tag).toBe("Failure");
+-        }).pipe(Effect.provide(testLayer(provider(undefined, mode === "provider-revoke")))),
++          const input = {
++            grant_type: "refresh_token" as const,
++            refresh_token: token.refresh_token,
++          };
++          const lost = yield* auth.token(input, metadata);
++          yield* TestClock.adjust("15 seconds");
++          const nextOwner =
++            mode === "restarted owner"
++              ? yield* OidcAuth.OidcAuth.pipe(Effect.provide(OidcAuth.layer))
++              : auth;
++          const recovered = yield* nextOwner.token(input, metadata);
++          expect(recovered.access_token).toBe(lost.access_token);
++          expect(recovered.refresh_token).toBe(lost.refresh_token);
++          expect(recovered.expires_in).toBe(885);
++          expect(refreshes).toBe(1);
++          yield* sessions.verify(recovered.access_token);
++          yield* TestClock.adjust("46 seconds");
++          expect((yield* Effect.result(nextOwner.token(input, metadata)))._tag).toBe("Failure");
++          expect((yield* Effect.result(sessions.verify(recovered.access_token)))._tag).toBe(
++            "Failure",
++          );
++        }).pipe(
++          Effect.provide(
++            testLayer(
++              provider(() => {
++                refreshes += 1;
++              }),
++            ),
++          ),
++        );
++      },
++    );
++
++    it.effect.each([
++      "logout",
++      "local-revoke",
++      "provider-revoke",
++      "logout-after-rotation",
++      "local-revoke-after-rotation",
++    ] as const)("%s prevents refresh and local access", (mode) =>
++      Effect.gen(function* () {
++        const { auth, token } = yield* login;
++        const sessions = yield* SessionStore.SessionStore;
++        const latest = mode.endsWith("after-rotation")
++          ? yield* auth.token(
++              { grant_type: "refresh_token", refresh_token: token.refresh_token },
++              metadata,
++            )
++          : token;
++        if (mode.startsWith("logout")) yield* auth.logout(token.refresh_token);
++        if (mode.startsWith("local-revoke"))
++          yield* sessions.revoke((yield* sessions.verify(latest.access_token)).sessionId);
++        expect(
++          (yield* Effect.result(
++            auth.token(
++              { grant_type: "refresh_token", refresh_token: token.refresh_token },
++              metadata,
++            ),
++          ))._tag,
++        ).toBe("Failure");
++        expect((yield* Effect.result(sessions.verify(token.access_token)))._tag).toBe("Failure");
++        expect((yield* Effect.result(sessions.verify(latest.access_token)))._tag).toBe("Failure");
++        const secrets = yield* ServerSecretStore.ServerSecretStore;
++        expect(
++          Option.isNone(yield* secrets.get(`oidc-rotation-${token.refresh_token.split(".")[0]}`)),
++        ).toBe(true);
++      }).pipe(Effect.provide(testLayer(provider(undefined, mode === "provider-revoke")))),
+     );
+ 
+     it.effect("keeps the device grant through a temporary provider outage", () => {
+@@ -321,7 +376,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
+       }),
+     );
+ 
+-    it.effect.each(["issue", "rotate-error", "rotate-conflict"] as const)(
++    it.effect.each(["issue", "receipt", "rotate-error", "rotate-conflict"] as const)(
+       "preserves the prior device session and rotated provider credential on %s failure",
+       (failure) => {
+         let armed = false;
+@@ -343,6 +398,24 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
+             };
+           }),
+         ).pipe(Layer.provideMerge(sessionLayer));
++        const faultySecrets = Layer.effect(
++          ServerSecretStore.ServerSecretStore,
++          Effect.gen(function* () {
++            const owner = yield* ServerSecretStore.ServerSecretStore;
++            return {
++              ...owner,
++              set: (name: string, value: Uint8Array) =>
++                armed && failure === "receipt" && name.startsWith("oidc-rotation-")
++                  ? Effect.fail(
++                      new ServerSecretStore.SecretStorePersistError({
++                        resource: "injected receipt persistence failure",
++                        cause: undefined,
++                      }),
++                    )
++                  : owner.set(name, value),
++            };
++          }),
++        ).pipe(Layer.provideMerge(faultySessions));
+         const faultyRepository = Layer.effect(
+           AuthSessions.AuthSessionRepository,
+           Effect.gen(function* () {
+@@ -357,11 +430,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
+                     : owner.rotateOidcGrant(input),
+             };
+           }),
+-        ).pipe(Layer.provideMerge(faultySessions));
++        ).pipe(Layer.provideMerge(faultySecrets));
+         const layer = OidcAuth.layer.pipe(
+           Layer.provideMerge(faultyRepository),
+           Layer.provide(provider((token) => providerTokens.push(token))),
+-          Layer.provide(Layer.succeed(OidcConfig.OidcConfig, { settings })),
++          Layer.provideMerge(Layer.succeed(OidcConfig.OidcConfig, { settings })),
+         );
+         return Effect.gen(function* () {
+           const { auth, token } = yield* login;
+diff --git a/apps/server/src/auth/OidcAuth.ts b/apps/server/src/auth/OidcAuth.ts
+index b6c9498f..8492afb4 100644
+--- a/apps/server/src/auth/OidcAuth.ts
++++ b/apps/server/src/auth/OidcAuth.ts
+@@ -9,6 +9,7 @@ import * as Clock from "effect/Clock";
+ import * as Context from "effect/Context";
+ import * as SecureRandom from "effect/crypto/SecureRandom";
+ import * as Duration from "effect/Duration";
++import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
+@@ -39,6 +40,21 @@ interface TokenResult {
+   readonly token_type: "Bearer";
+   readonly expires_in: number;
+ }
++const RotationReceipt = Schema.Struct({
++  version: Schema.Literal(1),
++  previousHash: Schema.String,
++  sessionId: Schema.String,
++  expiresAt: Schema.Number,
++  result: Schema.Struct({
++    access_token: Schema.String,
++    refresh_token: Schema.String,
++    token_type: Schema.Literal("Bearer"),
++    expires_in: Schema.Number,
++  }),
++});
++const decodeRotationReceipt = Schema.decodeEffect(Schema.fromJsonString(RotationReceipt));
++const encodeRotationReceipt = Schema.encodeEffect(Schema.fromJsonString(RotationReceipt));
++
+ interface PendingAuthorization {
+   readonly redirectUri: string;
+   readonly challenge: string;
+@@ -84,6 +100,7 @@ const equal = (left: string, right: string) =>
+   left.length === right.length && NodeCrypto.timingSafeEqual(Buffer.from(left), Buffer.from(right));
+ export const oidcStateCookieName = (state: string) => `t3_oidc_${hash(state).slice(0, 20)}`;
+ const secretName = (id: string) => `oidc-refresh-${id}`;
++const receiptName = (id: string) => `oidc-rotation-${id}`;
+ const invalidGrant = () => new OidcAuthError({ reason: "invalid_grant" });
+ 
+ const make = Effect.gen(function* () {
+@@ -96,14 +113,12 @@ const make = Effect.gen(function* () {
+   const lock = yield* Semaphore.make(1);
+   const pending = new Map<string, PendingAuthorization>();
+   const codes = new Map<string, PendingCode>();
+-  // Concurrent browser tabs share the preceding rotation for five seconds, never a second grant.
+-  const rotations = new Map<string, { expiresAt: number; result: TokenResult; grantId: string }>();
+   const randomToken = random
+     .randomBytes(32)
+     .pipe(Effect.map((bytes) => Buffer.from(bytes).toString("base64url")));
+   const unavailable = () => new OidcAuthError({ reason: "temporarily_unavailable" });
+   const purge = (now: number) => {
+-    for (const map of [pending, codes, rotations]) {
++    for (const map of [pending, codes]) {
+       for (const [key, value] of map) if (value.expiresAt <= now) map.delete(key);
+     }
+   };
+@@ -177,11 +192,10 @@ const make = Effect.gen(function* () {
+     const now = yield* Clock.currentTimeMillis;
+     yield* repository.revokeOidcGrant(grant.grantId, now).pipe(Effect.mapError(unavailable));
+     yield* sessions.revoke(grant.sessionId).pipe(Effect.mapError(unavailable));
+-    for (const [key, rotation] of rotations)
+-      if (rotation.grantId === grant.grantId) rotations.delete(key);
+     const credential = yield* secrets
+       .get(secretName(grant.grantId))
+       .pipe(Effect.mapError(unavailable));
++    yield* secrets.remove(receiptName(grant.grantId)).pipe(Effect.mapError(unavailable));
+     yield* secrets.remove(secretName(grant.grantId)).pipe(Effect.mapError(unavailable));
+     if (Option.isSome(credential))
+       yield* provider.revoke(new TextDecoder().decode(credential.value)).pipe(Effect.ignore);
+@@ -263,18 +277,40 @@ const make = Effect.gen(function* () {
+         return yield* invalidGrant();
+       }
+       const refreshHash = hash(refreshToken);
++      const credential = yield* secrets
++        .get(secretName(grant.grantId))
++        .pipe(Effect.mapError(unavailable));
++      if (Option.isNone(credential)) return yield* invalidGrant();
+       if (!equal(grant.refreshHash, refreshHash)) {
+-        const cached = rotations.get(refreshHash);
+-        if (cached && cached.grantId === grant.grantId && cached.expiresAt > now)
+-          return cached.result;
++        const receipt = yield* secrets
++          .get(receiptName(grant.grantId))
++          .pipe(Effect.mapError(unavailable));
++        const cached = Option.isSome(receipt)
++          ? yield* decodeRotationReceipt(new TextDecoder().decode(receipt.value)).pipe(
++              Effect.mapError(unavailable),
++            )
++          : undefined;
++        if (
++          cached &&
++          cached.expiresAt > now &&
++          equal(cached.previousHash, refreshHash) &&
++          grant.previousRefreshHash !== null &&
++          equal(grant.previousRefreshHash, refreshHash) &&
++          cached.sessionId === grant.sessionId &&
++          equal(hash(cached.result.refresh_token), grant.refreshHash) &&
++          DateTime.toEpochMillis(session.value.expiresAt) > now
++        )
++          return {
++            ...cached.result,
++            expires_in: Math.max(
++              1,
++              Math.floor((DateTime.toEpochMillis(session.value.expiresAt) - now) / 1000),
++            ),
++          };
+         if (grant.previousRefreshHash !== null && equal(grant.previousRefreshHash, refreshHash))
+           yield* revoke(grant);
+         return yield* invalidGrant();
+       }
+-      const credential = yield* secrets
+-        .get(secretName(grant.grantId))
+-        .pipe(Effect.mapError(unavailable));
+-      if (Option.isNone(credential)) return yield* invalidGrant();
+       const refreshed = yield* provider
+         .refresh({
+           refreshToken: new TextDecoder().decode(credential.value),
+@@ -307,6 +343,27 @@ const make = Effect.gen(function* () {
+           ttl: Duration.seconds(expiresIn),
+         })
+         .pipe(Effect.mapError(unavailable));
++      const result = {
++        access_token: issued.token,
++        refresh_token: nextRefresh,
++        token_type: "Bearer" as const,
++        expires_in: expiresIn,
++      };
++      // A lost HTTP response may outlive the client's 10-second deadline and 5-second retry.
++      const receipt = yield* encodeRotationReceipt({
++        version: 1,
++        previousHash: refreshHash,
++        sessionId: issued.sessionId,
++        expiresAt: (yield* Clock.currentTimeMillis) + 60_000,
++        result,
++      }).pipe(
++        Effect.mapError(unavailable),
++        Effect.onError(() => sessions.revoke(issued.sessionId).pipe(Effect.ignore)),
++      );
++      yield* secrets.set(receiptName(grant.grantId), new TextEncoder().encode(receipt)).pipe(
++        Effect.mapError(unavailable),
++        Effect.onError(() => sessions.revoke(issued.sessionId).pipe(Effect.ignore)),
++      );
+       const rotated = yield* repository
+         .rotateOidcGrant({
+           grantId: grant.grantId,
+@@ -322,17 +379,6 @@ const make = Effect.gen(function* () {
+         yield* sessions.revoke(issued.sessionId).pipe(Effect.ignore);
+         return yield* invalidGrant();
+       }
+-      const result = {
+-        access_token: issued.token,
+-        refresh_token: nextRefresh,
+-        token_type: "Bearer" as const,
+-        expires_in: expiresIn,
+-      };
+-      rotations.set(refreshHash, {
+-        expiresAt: (yield* Clock.currentTimeMillis) + 5_000,
+-        result,
+-        grantId: grant.grantId,
+-      });
+       yield* sessions.revoke(grant.sessionId).pipe(Effect.mapError(unavailable));
+       return result;
+     },
+diff --git a/apps/web/src/authOidcRoute.browser.test.tsx b/apps/web/src/authOidcRoute.browser.test.tsx
+new file mode 100644
+index 00000000..f2f3b0c2
+--- /dev/null
++++ b/apps/web/src/authOidcRoute.browser.test.tsx
+@@ -0,0 +1,66 @@
++import { createMemoryHistory } from "@tanstack/react-router";
++import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
++import type * as Context from "effect/Context";
++import { expect, it, vi } from "vite-plus/test";
++import { page } from "vite-plus/test/browser";
++
++import { AppRoot } from "~/AppRoot";
++import { __setClientSettingsForTests } from "~/hooks/useSettings";
++import { getRouter } from "~/router";
++import { installFakeEnvironment, type FakeDriver } from "../test/fakeEnvironment";
++import { act, render } from "../test/render";
++import { Route } from "./routes/auth.oidc.callback";
++
++vi.mock("../../../packages/client-runtime/src/connection/driver.ts", async (importOriginal) => {
++  const [actual, { fakeDriver }, Layer] = await Promise.all([
++    importOriginal<{ readonly ConnectionDriver: Context.Key<unknown, FakeDriver> }>(),
++    import("../test/fakeEnvironment"),
++    import("effect/Layer"),
++  ]);
++  return { ...actual, layer: Layer.succeed(actual.ConnectionDriver, fakeDriver) };
++});
++vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
++  ...(await original()),
++  trackRpcRequestSent: () => {},
++}));
++
++it("keeps Settings inside its sidebar provider while an OIDC callback is pending", async () => {
++  using _environment = installFakeEnvironment([]);
++  __setClientSettingsForTests({
++    ...DEFAULT_CLIENT_SETTINGS,
++    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
++  });
++  let complete = () => {};
++  const pending = new Promise<void>((resolve) => {
++    complete = resolve;
++  });
++  using callback = vi.spyOn(Route.options, "beforeLoad").mockImplementation(async () => {
++    await pending;
++  });
++  const router = getRouter(createMemoryHistory({ initialEntries: ["/settings/general"] }));
++  await router.load();
++  // AppRoot owns the real application router.
++  await using _app = await render(<AppRoot router={router} />, { router: false });
++  await expect.element(page.getByRole("dialog", { name: "Settings", exact: true })).toBeVisible();
++
++  const navigation = router.navigate({ to: "/auth/oidc/callback" });
++  try {
++    await vi.waitFor(() => expect(callback).toHaveBeenCalledOnce());
++    await expect.element(page.getByRole("dialog", { name: "Settings", exact: true })).toBeVisible();
++    await expect
++      .element(page.getByText("Something went wrong.", { exact: true }))
++      .not.toBeInTheDocument();
++  } finally {
++    await act(async () => {
++      complete();
++      await navigation;
++    });
++  }
++
++  await expect
++    .element(page.getByRole("heading", { name: "Sign in to your workspace" }))
++    .toBeVisible();
++  await expect
++    .element(page.getByRole("dialog", { name: "Settings", exact: true }))
++    .not.toBeInTheDocument();
++});
+diff --git a/apps/web/src/routes/__root.tsx b/apps/web/src/routes/__root.tsx
+index 4c676293..2892ccd1 100644
+--- a/apps/web/src/routes/__root.tsx
++++ b/apps/web/src/routes/__root.tsx
+@@ -7,6 +7,7 @@ import {
+   createRootRoute,
+   type ErrorComponentProps,
+   useLocation,
++  useMatches,
+   useNavigate,
+   useRouter,
+ } from "@tanstack/react-router";
+@@ -143,7 +144,8 @@ function RootRouteView() {
+ }
+ 
+ function RootRouteBranch() {
+-  const pathname = useLocation({ select: (location) => location.pathname });
++  // Pending navigation changes location before the old outlet unmounts. Its shell must follow the same matches.
++  const pathname = useMatches({ select: (matches) => matches.at(-1)?.pathname ?? "/" });
+   const { authGateState } = Route.useRouteContext();
+   const primaryEnvironmentAuthenticated = authGateState.status === "authenticated";
+   // A sync IPC read; the setting only changes across a relaunch.
+diff --git a/packages/provider-acp-registry/src/server/probe.test.ts b/packages/provider-acp-registry/src/server/probe.test.ts
+new file mode 100644
+index 00000000..9de95172
+--- /dev/null
++++ b/packages/provider-acp-registry/src/server/probe.test.ts
+@@ -0,0 +1,74 @@
++// @effect-diagnostics nodeBuiltinImport:off
++import * as NodeURL from "node:url";
++import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, it } from "@effect/vitest";
++import { ProviderInstanceId } from "@t3tools/contracts";
++import * as HostProcess from "@t3tools/shared/HostProcess";
++import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Schema from "effect/Schema";
++import { AcpRegistrySettings } from "../settings.ts";
++import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
++import { listAcpRegistrySessions } from "./probe.ts";
++
++const settings = Schema.decodeSync(AcpRegistrySettings)({
++  source: "local",
++  commandPath: "fixture",
++});
++const layerHost = TestProviderHost.layer().pipe(
++  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
++);
++
++it.live(
++  "negotiates native identity on the management wire without starting or loading sessions",
++  () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-external-discovery-" });
++      const log = `${cwd}/methods.log`;
++      yield* fs.writeFileString(log, "");
++      const command = yield* HostProcess.ExecutablePath;
++      const result = yield* listAcpRegistrySessions({
++        instanceId: ProviderInstanceId.make("fleet-connection"),
++        settings,
++        cwd,
++        environment: {},
++      }).pipe(
++        Effect.provide(
++          Layer.mock(AcpRegistrySupport.AcpRegistryCatalog)({
++            resolve: () =>
++              Effect.succeed({
++                distribution: "local",
++                spawn: {
++                  command,
++                  args: [
++                    NodeURL.fileURLToPath(
++                      new URL("./testing/externalSession.fixture.mjs", import.meta.url),
++                    ),
++                    log,
++                  ],
++                  cwd,
++                },
++              }),
++          }),
++        ),
++      );
++      assert.deepEqual(
++        result.sessions.map((row) => row.sessionId),
++        ["opaque-claude-route", "opaque-codex-route", "malformed-route"],
++      );
++      assert.deepEqual(
++        result.sessions.map((row) => row.externalSession?.engine),
++        ["claude-code", "codex", undefined],
++      );
++      assert.equal(result.sessions[0]?.externalSession?.connection.host, "worker");
++      assert.isTrue(result.sessions[0]?.externalSession?.capabilities.send);
++      assert.deepEqual((yield* fs.readFileString(log)).trim().split("\n"), [
++        "initialize",
++        "session/list",
++      ]);
++    }).pipe(Effect.scoped, Effect.provide(layerHost)),
++);
+diff --git a/packages/provider-acp-registry/src/server/probe.ts b/packages/provider-acp-registry/src/server/probe.ts
+index 7788d5c9..91775351 100644
+--- a/packages/provider-acp-registry/src/server/probe.ts
++++ b/packages/provider-acp-registry/src/server/probe.ts
+@@ -613,6 +613,7 @@ const makeAcpRegistryManagementRuntime = Effect.fn("AcpRegistryProbe.makeManagem
+         spawn: resolved.spawn,
+         cwd: input.cwd,
+         clientCapabilities: {
++          _meta: { "t3.codes/externalSession": { version: 1 } },
+           auth: { terminal: false },
+           elicitation: { url: {} },
+           fs: { readTextFile: false, writeTextFile: false },
+diff --git a/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs b/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
+new file mode 100644
+index 00000000..57970409
+--- /dev/null
++++ b/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
+@@ -0,0 +1,58 @@
++import * as NodeFS from "node:fs";
++import * as NodeReadline from "node:readline";
++let negotiated = false;
++const identity = (engine, transport) => ({
++  version: 1,
++  engine,
++  connection: { kind: "fleet", host: "worker", transport },
++  capabilities: {
++    send: true,
++    interrupt: true,
++    respond: false,
++    setModel: false,
++    setPermissionMode: false,
++    terminal: false,
++  },
++});
++NodeReadline.createInterface({ input: process.stdin }).on("line", (line) => {
++  const request = JSON.parse(line);
++  if (request.id === undefined) return;
++  NodeFS.appendFileSync(process.argv[2], request.method + "\n");
++  let result;
++  if (request.method === "initialize") {
++    negotiated =
++      request.params.clientCapabilities?._meta?.["t3.codes/externalSession"]?.version === 1;
++    result = {
++      protocolVersion: 1,
++      agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} } },
++      authMethods: [],
++      _meta: {
++        "t3.codes/externalSession": { version: 1 },
++        "t3.codes/connectionRole": { version: 1, role: "discovery" },
++      },
++    };
++  } else if (request.method === "session/list") {
++    result = {
++      sessions: [
++        ["opaque-claude-route", identity("claude-code", "tmux")],
++        ["opaque-codex-route", identity("codex", "codex")],
++        ["malformed-route", { ...identity("codex", "codex"), capabilities: { send: "true" } }],
++      ].map(([sessionId, value]) => ({
++        sessionId,
++        cwd: "/remote/project",
++        title: "Existing session",
++        ...(negotiated ? { _meta: { "t3.codes/externalSessionIdentity": value } } : {}),
++      })),
++    };
++  } else {
++    process.stdout.write(
++      JSON.stringify({
++        jsonrpc: "2.0",
++        id: request.id,
++        error: { code: -32601, message: "Native actions are forbidden in this discovery fixture" },
++      }) + "\n",
++    );
++    return;
++  }
++  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
++});
+-- 
+2.47.3
+

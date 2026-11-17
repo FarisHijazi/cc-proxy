@@ -29,13 +29,20 @@ static LIVE_MODELS: std::sync::RwLock<Option<(std::time::Instant, Vec<String>)>>
 
 /// The Claude model ids Anthropic last listed; `None` until a signed-in caller asked.
 pub fn live_models() -> Option<Vec<String>> {
-    LIVE_MODELS.read().ok()?.as_ref().map(|(_, ids)| ids.clone())
+    LIVE_MODELS
+        .read()
+        .ok()?
+        .as_ref()
+        .map(|(_, ids)| ids.clone())
 }
 
 pub fn live_models_stale() -> bool {
     LIVE_MODELS
         .read()
-        .map(|live| live.as_ref().is_none_or(|(at, _)| at.elapsed() >= LIVE_MODELS_TTL))
+        .map(|live| {
+            live.as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= LIVE_MODELS_TTL)
+        })
         .unwrap_or(true)
 }
 

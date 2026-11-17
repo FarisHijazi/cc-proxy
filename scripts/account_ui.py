@@ -50,6 +50,7 @@ provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cu
 cursor_quota = runpy.run_path(str(HERE / "account_cursor_quota.py"), run_name="account_cursor_quota")["cursor_quota"]
 codex_quota = runpy.run_path(str(HERE / "account_codex_quota.py"), run_name="account_codex_quota")["codex_quota"]
 RemoteLinks = runpy.run_path(str(HERE / "account_remote_links.py"), run_name="account_remote_links")["RemoteLinks"]
+MCPRelay = runpy.run_path(str(HERE / "account_mcp_relay.py"), run_name="account_mcp_relay")["MCPRelay"]
 LINKS_CACHE_S = 60
 # Three blocking calls to Cursor per read, so read it less often than usage.
 QUOTA_CACHE_S = 300
@@ -536,7 +537,7 @@ class Dashboard:
         return {**state, "created_key": created} if created else state
 
 
-def handler(dashboard):
+def handler(dashboard, mcp_relay=None):
     class Handler(BaseHTTPRequestHandler):
         def reply(self, status, body, kind="application/json"):
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -548,6 +549,8 @@ def handler(dashboard):
             self.wfile.write(data)
 
         def do_GET(self):
+            if mcp_relay and mcp_relay.handle(self):
+                return
             url = urlsplit(self.path)
             query = {k: v[-1] for k, v in parse_qs(url.query).items()}
             try:
@@ -573,6 +576,8 @@ def handler(dashboard):
                 return self.reply(500, {"error": str(error)})
 
         def do_POST(self):
+            if mcp_relay and mcp_relay.handle(self):
+                return
             if urlsplit(self.path).path != "/api/config":
                 return self.reply(404, {"error": "not found"})
             try:
@@ -580,6 +585,12 @@ def handler(dashboard):
                 return self.reply(200, dashboard.update(change))
             except (ValueError, KeyError, TypeError) as error:
                 return self.reply(400, {"error": str(error)})
+
+        def do_DELETE(self):
+            if not (mcp_relay and mcp_relay.handle(self)):
+                self.reply(404, {"error": "not found"})
+
+        do_OPTIONS = do_DELETE
 
         def log_message(self, *_):
             pass
@@ -597,9 +608,11 @@ def main():
     parser.add_argument("--hq", help="HQ (cchq) API origin, e.g. http://127.0.0.1:8389, for Remote Control links")
     parser.add_argument("--api-base", help="the --serve proxy's --api-port address, e.g. http://HOST:PORT, shown with new keys")
     parser.add_argument("--hq-public-url", help="HQ's browser URL, e.g. https://hq.example.com (default: --hq)")
+    parser.add_argument("--mcp-upstream", help="existing authenticated fleet MCP origin, e.g. http://127.0.0.1:8392; exposes /mcp on this listener")
     args = parser.parse_args()
     dashboard = Dashboard(args.accounts_file.expanduser(), args.proxy, args.proxy_ca.expanduser(), args.hq, args.hq_public_url, args.api_base)
-    server = ThreadingHTTPServer((args.listen_host, args.port), handler(dashboard))
+    relay = MCPRelay(args.mcp_upstream) if args.mcp_upstream else None
+    server = ThreadingHTTPServer((args.listen_host, args.port), handler(dashboard, relay))
     print(f"cc-proxy dashboard on http://{args.listen_host}:{args.port}", flush=True)
     server.serve_forever()
 

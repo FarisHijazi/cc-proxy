@@ -92,11 +92,9 @@ impl GeminiProvider {
         let requested = body.model.as_deref().unwrap_or(GEMINI_DEFAULT_MODEL);
         let resolved = if self.local {
             let config = crate::config::local_config();
-            config.upstream_model.unwrap_or_else(|| {
-                config
-                    .model
-                    .unwrap_or_else(|| "local-model".into())
-            })
+            config
+                .upstream_model
+                .unwrap_or_else(|| config.model.unwrap_or_else(|| "local-model".into()))
         } else {
             resolve_model(requested)
         };
@@ -115,13 +113,14 @@ impl GeminiProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved);
         }
-        let mut translated = translate_request_with(body, &resolved, self.local).map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_REQUEST,
-                ProviderErrorKind::InvalidRequest,
-                error.to_string(),
-            )
-        })?;
+        let mut translated =
+            translate_request_with(body, &resolved, self.local).map_err(|error| {
+                ProviderError::new(
+                    StatusCode::BAD_REQUEST,
+                    ProviderErrorKind::InvalidRequest,
+                    error.to_string(),
+                )
+            })?;
         if self.local {
             translated.stream_options = Some(serde_json::json!({"include_usage": true}));
             // Some local servers accept only string tool_choice values. A
@@ -681,7 +680,10 @@ mod tests {
         };
         let mapped = super::gemini_provider_error(error);
         assert_eq!(mapped.status, http::StatusCode::BAD_REQUEST);
-        assert_eq!(mapped.message, "prompt is too long: 140052 tokens > 131072 maximum");
+        assert_eq!(
+            mapped.message,
+            "prompt is too long: 140052 tokens > 131072 maximum"
+        );
         assert_eq!(mapped.error_type(), "invalid_request_error");
     }
 

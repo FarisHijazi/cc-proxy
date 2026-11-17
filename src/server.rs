@@ -397,7 +397,12 @@ async fn refresh_live_claude_models(registry: &Registry, headers: &axum::http::H
     let mut request = axum::http::Request::new(Body::empty());
     *request.uri_mut() = axum::http::Uri::from_static("/v1/models?limit=1000");
     let outgoing = request.headers_mut();
-    for name in ["authorization", "anthropic-version", "anthropic-beta", "user-agent"] {
+    for name in [
+        "authorization",
+        "anthropic-version",
+        "anthropic-beta",
+        "user-agent",
+    ] {
         if let Some(value) = headers.get(name) {
             outgoing.insert(name, value.clone());
         }
