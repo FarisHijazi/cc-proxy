@@ -13,6 +13,24 @@ and installed through the existing service updater; never create a second T3 dep
 Read README "Existing fleet sessions in T3 Code", `patches/t3/README.md`, and
 `docs/testing/fleet-e2e-matrix.md` on demand.
 
+Only exact Codex owner rows with the complete ended/read-only contract may
+load archived native history. Preserve native UUID and route binding, cancel
+pending controls on that transition, and keep all actions disabled. Never
+resume a thread for a read or treat an ordinary offline row as empty history.
+
+The five-patch T3 series includes self-hosted Authentik sign-in through the existing
+EnvironmentAuth/SessionStore, AuthSessionRepository and ServerSecretStore owners.
+Keep `T3CODE_OIDC_REQUIRED=true` with the private config-file path in the existing
+`service.env`; do not trust forwarded identity headers or make legacy pairing a
+remote fallback. Browser refresh secrets remain HttpOnly; native credentials use
+the existing secure stores. Sign-in/renewal wakes the existing primary connection
+supervisor after an auth rejection; preserve that recovery without another socket
+owner. Safari/Home Screen needs only the served web build; stock native clients
+need matching app changes for renewable OIDC sign-in.
+Read `docs/self-hosted-t3-auth.md` on demand. Maintain the patch series when updating
+T3; an official binary does not implement these OIDC flags. Do not add a second
+service, relay, credential writer, or automatic update policy.
+
 `cc-proxy-ui --mcp-upstream` exposes the existing authenticated HQ MCP on the same
 dashboard listener. `scripts/account_mcp_relay.py` owns transport forwarding only;
 HQ remains the fleet, action and OAuth token verifier. Preserve dashboard SSO and

@@ -52,7 +52,7 @@ class InvalidAnswer(RequestError):
 
 
 def available(row):
-    return (row.get("alive") is True and row.get("online") is not False
+    return (row.get("alive") is True and row.get("online") is not False and row.get("read_only") is not True
             and row.get("lifecycle") not in {"ended", "unreachable", "unknown"})
 
 
@@ -124,7 +124,12 @@ class HQ:
 
     async def detail(self, session_id):
         row = await self.get(f"/api/sessions/{quote(session_id, safe='')}")
-        if not available(row) or not row.get("revision"):
+        if row.get("id") != session_id:
+            raise failure("Fleet HQ returned a different session identity.")
+        archived = (row.get("provider") == "codex" and row.get("transport") == "codex"
+                    and row.get("read_only") is True and row.get("alive") is False
+                    and row.get("online") is True and row.get("lifecycle") == "ended")
+        if not (available(row) or archived) or not row.get("revision"):
             raise failure("This fleet session is offline or ended; it cannot be controlled.")
         return row
 
@@ -136,6 +141,8 @@ class HQ:
                 row = await self.detail(session_id)
             except (RequestError, httpx.TransportError, ValueError) as exc:
                 raise ActionRejected("Fleet action was not sent because its current state could not be verified.") from exc
+            if not available(row):
+                raise ActionRejected("This fleet session is offline or ended; it cannot be controlled.")
             if revision is not None and revision != row["revision"]:
                 raise ActionRejected("The request changed. Read the session again before answering.")
             body = {"action": action, "revision": revision or row["revision"],
@@ -350,12 +357,15 @@ class FleetAgent(Agent):
             await self.emit_state(session_id, row, attached)
             idle = (row.get("activity") or row.get("status")) == "idle"
             control = bool(row.get("native_control") or row.get("menu"))
-            key = self.control_identity(row)
+            key = self.control_identity(row) if available(row) else None
             if attached.control_task and key != attached.control_key:
                 task, attached.control_task = attached.control_task, None
                 attached.control_key = None
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+            if not available(row):
+                self.observation_failed(attached)
+                return
             if attached.pending and not control:
                 attached.settled = attached.settled + 1 if attached.answered and idle else 0
                 if attached.cancelled and idle:
@@ -514,6 +524,8 @@ class FleetAgent(Agent):
                 raise failure("A submitted prompt is still being observed for this session.")
             row = await self.hq.detail(session_id)
             await self.emit_messages(session_id, row, attached)
+            if not available(row):
+                raise ActionRejected("This fleet session is offline or ended; it cannot be controlled.")
             if row.get("native_control") or row.get("menu"):
                 raise failure("The existing session has an unanswered request. Answer it before sending another prompt.")
             attached.pending = text

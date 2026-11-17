@@ -5,6 +5,91 @@ fixture does not establish that a particular Claude/Codex version or T3 UI handl
 the same interaction. The latest candidate must retain source identities and must
 never replace a worker or retry an uncertain write.
 
+## Self-hosted Authentik acceptance (2026-11-17)
+
+The existing service is active on `0.1.10-ccfleet.20261117.3`, source
+`da4e1eb262edb862fc08328431b9f2b0a403183a`; systemd reports activation at
+18:51:14 UTC. The required OIDC configuration and port remain in the existing
+`service.env`. The five maintained patches and archive checksum are recorded in
+[the patch README](../../patches/t3/README.md).
+
+The first real browser attempt on `.2` exposed a failure that negative auth tests
+had not found: Authentik sign-in and HTTP sidebar loading succeeded, but opening a
+conversation reported the environment offline. A manual reload recovered it.
+The fifth patch reconnects the existing primary supervisor when sign-in or renewal
+changes its credentials; it does not create another connection owner. Its
+regression exercises the actual supervisor lifecycle. A separate positive server
+test covers a persisted OIDC browser cookie through HTTP/WebSocket authentication
+and guarded RPC, then rejects it after grant revocation.
+
+The corrected `.3` build passed an actual Chrome sequence: logout, Authentik
+sign-in, callback, then opening the existing Dev discovery fixture **without a
+manual reload**. Its exact `AUTO_DISCOVERY_READY_20261117` assistant message was
+visible. Existing histories on the other two VMs also opened without the offline
+error. Those final history checks were read-only; they did not send worker input.
+This establishes browser sign-in and existing-session reading, not every native
+control or every client surface.
+
+| Check | Final `.3` evidence |
+| --- | --- |
+| Isolated packaged runtime | 19 checks passed in a fresh temporary home using the real OIDC configuration; tracked child and process group stopped. |
+| Anonymous UI and current JavaScript asset | Public GET returned 302 to Authentik; Cloudflare reported DYNAMIC, including the exact deployed JS filename. |
+| Protected HTTP and real WebSocket Upgrade | Public requests returned 401 for anonymous access, spoofed Authentik headers, forwarded-loopback claims and invalid bearer tokens. |
+| Public auth metadata | OIDC config returned 200 with `enabled=true` and `no-store`; environment descriptor returned 200. These do not expose session content. |
+| Browser Origin and CORS | Isolated packaged token/logout requests rejected missing, foreign and `null` Origins with 400. Preflight returned 204 with wildcard origin but no credential allowance. |
+| Real logout and new sign-in | Read-only SQLite metadata shows old grant/session revoked at 18:54:24 UTC; new session issued at 18:54:49.708 UTC and WebSocket connected at 18:54:54.080 UTC. |
+| Durable authorization | New grant/session are active, exactly linked, match the configured issuer/subject allowlist and carry 16 standard client scopes. No tokens or subject values were recorded in the evidence. |
+| Automatic browser renewal on `.3` | Same Chrome grant renewed naturally at 19:08:52.567 UTC, extending access expiry to 19:23:52.567 UTC. The old session was revoked and authenticated WebSocket reconnected at 19:08:55.454 UTC. No manual reload/sign-in, forced expiry or grant manipulation was used. |
+| Desktop native app | Matching `.3` macOS app completed its native OIDC callback and displayed the exact Dev discovery marker plus existing histories from both other VMs without auth errors. A separate Electron grant was issued at 19:00:20.183 UTC and connected over authenticated WebSocket at 19:00:24.110 UTC. Pending permission dialogs are not inferred from these read checks. |
+| Automatic native renewal on `.3` | Same Electron grant renewed naturally at 19:14:30.723 UTC, extending access expiry to 19:29:30.723 UTC. Its old session was revoked and authenticated WebSocket reconnected at 19:14:31.282 UTC. No user reauthentication or forced expiry was used. |
+| Native credential restoration | Quit/reopen required no sign-in prompt; the encrypted catalog read succeeded at 19:04:48 UTC and the Dev fixture history reopened. No second local backend/listener on port 3774 was observed. |
+| Native composer continuation | One prompt to the reserved Dev toy produced exact assistant marker `DESKTOP_AUTH_READY_20261117` and returned idle around 19:06 UTC. All 11 Dev baseline workers retained their original PID/birth identities afterward. No ordinary user conversation received test input. |
+| Cross-device history | The existing Chrome login, without reload, displayed exact `DESKTOP_AUTH_READY_20261117` from the native desktop prompt in the same Dev fixture. |
+| Active Mac root | Actual Chrome opened native Codex root `01a1e076…`, matched the verified active root identity and displayed current conversation content without a syncing or auth error. No input was sent to that live root. |
+| Ended Mac history | Mac HQ 0.9.6 and the updated ACP adapter loaded the exact ended diagnostic subagent’s saved message through the existing native reader. Chrome displayed that history without a syncing state. Native UUID remained `notLoaded`, current root remained active, and T3 run IDs stayed empty. The backend rejects every send/control; the current T3 UI still permits an unsent draft and can enable Submit. The verification draft was cleared without submission. |
+| iPhone Safari | User completed Authentik sign-in on their iPhone and confirmed that existing VM conversations open. This is user-observed physical-device acceptance, not automation. Home Screen installation and stock native mobile OIDC are not claimed. |
+| Worker identity audit at 18:55 UTC | One baseline PID differed; the corresponding route is an HQ scheduled routine. Journal records its existing reaper at 18:25:01 UTC and next scheduled spawn at 18:40:02 UTC, both before `.3` activation. The other 11 workers on that VM retained exact PID/birth identities. |
+
+The routine audit found an existing 105-minute reaper, present since October 12,
+and no HQ restart during the interval. The old PID-to-pane record is unavailable;
+timing and the sole replacement support the correlation, so this is not a claim
+that every original PID was unchanged. The audit sent no worker input.
+
+The ended-history correction passed 529 HQ tests, 107 ACP tests and an independent
+security review. Mac HQ alone moved to 0.9.6; the other five readers and ftower MCP
+remain on 0.9.5. The Mac swap preserved 21 protected process identities and 31 tmux
+panes. ACP activation changed only the existing provider command path through the
+supported settings API, with no T3 restart or native worker action. Verification
+waited for actual capability enrichment on the server-config stream: the immediate
+provider refresh response is a readiness placeholder. The exact source message ID
+and text hash matched T3’s persisted projection. Private evidence:
+`~/.local/state/cc-proxy/t3-archived-history-live-proof-20261117.json` on Dev and
+`~/.codex/tmp/fleet-mcp/archived-codex-096-post-t3-proof.json` on Mac.
+
+A final read-only census at 19:27 UTC found 25 of the 28 original VM process
+identities. Two VMs retained all 16 original processes; the third retained 9/12.
+Besides the known scheduled routine, its oncall conversation resumed the same
+UUID through the existing account router in a new process and remained busy.
+The initiator is not known. A separate task process had ended without a replacement;
+its exit cause is unknown. Both owner services on that VM retained their prior
+PIDs/start times and zero restarts. This work performed no service or worker action
+on that VM, and the audit did not restart anything. Do not equate a long-lived
+census difference with a deployment-caused termination. Detailed identity evidence
+remains private under `~/.codex/tmp/fleet-mcp/` on Mac.
+
+Public probes ran at 18:57:24–26 UTC. The SQLite observation at 18:57:26 UTC is
+metadata-only; `last_connected_at` is written by the authenticated WebSocket path.
+Private Dev evidence is retained with restricted permissions under
+`~/.local/state/cc-proxy/t3-oidc-acceptance-20261117/`:
+`t3-public-auth-final3-20261117.json`,
+`isolated-smoke-0.1.10-ccfleet.20261117.3.json`, and separate browser/Electron grant
+snapshots `t3-auth-grants-20261117T190243Z.json` and
+`t3-auth-grants-20261117T190916Z.json`. That observation confirms natural browser
+rotation and reconnection; `t3-auth-grants-20261117T191439Z.json` subsequently
+confirms independent Electron renewal and reconnection. Earlier
+continuation/Stop and native-control results below retain their own versions and
+dates; they are not silently relabelled as fresh `.3` tests.
+
 ## Sidebar and runtime identity recovery (2026-11-17)
 
 The prior 40-route audit checked T3's import picker, not its sidebar. Only five
@@ -32,8 +117,9 @@ tmux names to distinguish sessions sharing a project title.
 
 The packaged T3 runtime passed an isolated startup/authentication smoke check.
 The actual public browser completed Authentik Google sign-in and opened existing
-Claude histories from each of the three VMs without sending input. Anonymous
-root/API/WebSocket probes redirect to Authentik. A Cloudflare cache bypass scoped
+Claude histories from each of the three VMs without sending input. At that earlier
+stage, anonymous root/API/WebSocket probes redirected to Authentik; the final
+OIDC boundary above instead returns 401 from protected API/WebSocket routes. A Cloudflare cache bypass scoped
 to the T3 hostname also gates static assets that had previously been cached.
 
 Private evidence: `t3-sidebar-live-proof-20261117.json`,
@@ -155,7 +241,7 @@ A missing result is not treated as proof that a write was never delivered.
 
 ## Deployed T3 acceptance (2026-11-16)
 
-The existing T3 service runs `0.1.10-ccfleet.20261116.2`, built from the two
+On 2026-11-16, the existing T3 service ran `0.1.10-ccfleet.20261116.2`, built from the two
 patches in `patches/t3/`. No replacement Claude or Codex worker was launched.
 
 - The final discovery audit matched all 40 current opaque MCP routes in both T3

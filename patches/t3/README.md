@@ -1,58 +1,67 @@
-# T3 external session support
+# T3 fleet sessions and self-hosted sign-in
 
-`0001-observe-external-acp-sessions.patch` applies to official T3 Code nightly
-`v0.1.10-nightly.20261116.4774`, commit
-`16695c812fffe75e85f8cc3084d2c561aa3ca93f`. Apply `0002-wait-for-persisted-history.patch` and then
-`0003-discover-external-sessions.patch`. The resulting source commit is
-`d4b098aac07af7059484752f9dd23d3360a3491a`. The second patch waits for the
-existing event pump to persist loaded history before sending the first thread
-snapshot; load errors remain errors instead of becoming empty conversations.
+Apply the five patches in filename order with `git am` from a clean worktree at
+official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
+`16695c812fffe75e85f8cc3084d2c561aa3ca93f`. The maintained source commit is
+`da4e1eb262edb862fc08328431b9f2b0a403183a`.
 
-Upstream already imports existing history. This patch adds selected-session
-observation, native transcript identity, external Stop, and pending native
-questions/permissions without creating a replacement agent or synthetic run.
-Only providers explicitly advertising the versioned external-session capability
-are observed when opened. Ordinary ACP providers retain their existing lifecycle.
+| Patch | Purpose |
+| --- | --- |
+| `0001-observe-external-acp-sessions.patch` | Observe selected external sessions, preserve native transcript identity, and handle external Stop and pending native questions/permissions. |
+| `0002-wait-for-persisted-history.patch` | Wait for the existing event pump to persist imported history before the first snapshot; preserve load failures as errors. |
+| `0003-discover-external-sessions.patch` | Discover sessions into the sidebar through the existing server/import owners. |
+| `0004-self-hosted-oidc.patch` | Authentik sign-in and renewable device sessions for the served web client and matching native client builds. |
+| `0005-reconnect-oidc-session.patch` | Recover the existing browser connection after sign-in or renewal without a manual reload; cover cookie HTTP/WebSocket authorization and guarded RPC. |
 
-The third patch fixes the gap between the import picker and the sidebar. An
-explicit provider `autoImportProjectId` enables discovery inside the existing
-server, with a 30-second delay after each completed pass. It creates deterministic thread records without loading
-agents; selection imports history through the existing owner. Archived/deleted
-views and temporarily offline sessions are preserved. The destination is local
-view storage, not a mapping of remote workdirs onto local files.
+External observation requires the versioned provider/client capability; ordinary
+ACP providers retain their existing lifecycle. Provider `autoImportProjectId`
+opts into discovery with a 30-second delay after each pass. Discovery creates
+stable sidebar records without starting or resuming workers. Selection imports
+history through the existing owner; archived/deleted views remain preserved.
+The local destination project stores conversation views, not remote workdirs.
 
-Apply with `git am` from a clean worktree at the pinned base. Use T3's documented
-toolchain and release scripts: `scripts/update-release-package-versions.ts`,
-`vp run --filter t3 build`, `apps/server/scripts/cli.ts build-exe`, and
-`scripts/build-cli-archive.ts`. The archive needs the resource-monitor bundle
-from that exact official nightly. Restore the release manifests/lockfile after
-packaging. Do not copy a new binary into an older runtime tree.
+OIDC reuses T3's environment, session, credential and persistence owners. It is
+optional for other deployments; a public self-hosted deployment must require its
+configuration explicitly. See [the operator guide](../../docs/self-hosted-t3-auth.md)
+for Authentik, client compatibility and ingress configuration.
 
-The Linux archive version is `0.1.10-ccfleet.20261117.1`; its SHA-256 is
-`bbe91260598d46f5ecf955982dbcb3c3d3fb2418d0b4ae7c2c95f4d48ee91bc5`.
-It is installed through the official installer and existing `t3 update` service
-path. The user's stable-channel preference is unchanged. A later official update
-may replace this patch; rebase/retest it or remove it when upstream covers these
-behaviors. No second T3 service is required.
+## Build and activate
 
-Validation: `check:changed` passed 760 tests, mobile compiler checks, affected
-typechecks, formatting, lint, and dependency checks. The final request-withdrawal
-delta passed the 57-test ACP lifecycle suite, focused lint, and server typecheck.
-The history barrier passed its failing-before regression and stream-failure case,
-then `check:changed` (112 tests and 27 affected typechecks) and the 57-test ACP suite.
-Automatic discovery passed failing-before regressions, 39 focused WS/discovery
-checks, and `check:changed` (62 related tests and 27 package typechecks).
-The three exported patches reproduce the source tree exactly. The new archive
-started in an isolated fresh home, served its UI, rejected anonymous protected
-API requests, and exited cleanly.
-The prior packaged runtime started against an isolated migrated data copy, served its
-web client, rejected anonymous protected API access, and shut down cleanly.
-Live acceptance evidence belongs in
-[the fleet test matrix](../../docs/testing/fleet-e2e-matrix.md).
+Use T3's documented toolchain and release scripts:
+`scripts/update-release-package-versions.ts`, `vp run --filter t3 build`,
+`apps/server/scripts/cli.ts build-exe`, and `scripts/build-cli-archive.ts`.
+The archive needs the resource-monitor bundle from the pinned official nightly.
+Restore release manifests/lockfile after packaging. Never replace a binary inside
+an older runtime directory.
 
-Before a live upgrade, back up the database with SQLite's online backup API,
-settings, service configuration, and original runtime outside the updater's
-version-pruning directory. The official nightly includes schema migrations;
-rollback requires the matching pre-upgrade data backup, not just an older binary.
-T3's `server-owner.sqlite` is an active ownership lock, contains no user data,
-and must not be copied or unlinked while the service runs.
+The Linux archive version is `0.1.10-ccfleet.20261117.3`; SHA-256:
+`d6afc14aa37572e3177b1c87daede485af7859db027d8763cb153eeb7d33d3cb`.
+Use the official installer to install the verified archive, then the exact cached
+runtime's `t3 service install --base-dir <existing-t3-home>` to reconcile the
+existing service. `service.env` and userdata stay with that home. This does not
+require a second T3 deployment or a systemwide update policy.
+
+T3's server does not update itself automatically. A manual official update can
+replace these patches, including the code that enforces the OIDC configuration;
+rebase and retest before updating. Keep the user's release-channel preference.
+
+## Verification and recovery
+
+The five exported patches reproduce the committed source tree exactly. The OIDC
+integration `check:changed` passed 299 tests, 23 React Compiler checks and
+typechecks across 41 affected packages. The reconnect correction passed 14 tests,
+2 React Compiler checks and 9 package typechecks. Both runs passed formatting,
+lint and dependency checks. Authentication coverage includes PKCE/state/redirect binding, exact identity validation,
+revocation, concurrent refresh/replay, transient provider failure, persistence
+failure and a requesting client disconnecting during rotation.
+
+These source/build checks do not establish live acceptance. Packaged-runtime,
+public ingress and browser sign-in results belong in the
+[fleet test matrix](../../docs/testing/fleet-e2e-matrix.md).
+
+Before activation, back up the database through SQLite's online backup API,
+settings, service configuration and old runtime outside the updater's
+version-pruning directory. Schema changes require the matching pre-upgrade data
+backup for rollback, not just an older binary. T3's `server-owner.sqlite` is an
+active ownership lock, contains no user data, and must not be copied or unlinked
+while the service runs. Preserve running fleet workers during service maintenance.

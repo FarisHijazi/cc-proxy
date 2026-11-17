@@ -121,7 +121,7 @@ def owner():
 
 @asynccontextmanager
 async def connection(owner, tmp_path, *, permission="deny", form_action="accept", form_content=None,
-                     cancel_on_request=False):
+                     cancel_on_request=False, discoverable=True):
     token = tmp_path / "isolated-token"
     token.write_text("isolated-token")
     process = await asyncio.create_subprocess_exec(sys.executable, str(SCRIPT),
@@ -174,7 +174,7 @@ async def connection(owner, tmp_path, *, permission="deny", form_action="accept"
         assert initialized["result"]["protocolVersion"] == 1
         listed = await call("session/list", {})
         assert "result" in listed, listed
-        assert [item["sessionId"] for item in listed["result"]["sessions"]] == [SID]
+        assert [item["sessionId"] for item in listed["result"]["sessions"]] == ([SID] if discoverable else [])
         loaded = await call("session/load", {"sessionId": SID, "cwd": "/isolated", "mcpServers": []})
         assert "result" in loaded, loaded
         yield call, updates, requests
@@ -428,4 +428,48 @@ def test_wire_invalid_answer_reopens_current_question_without_posting_until_corr
             assert [action['action'] for action in owner['attempts']] == ['send', 'respond']
             assert owner['decisions'][0]['updated_input']['answers'] == {'Which?': 'choice-one'}
             assert any(u.get('title') == 'Answer needs correction' for u in updates)
+    asyncio.run(check())
+
+
+def test_wire_archived_history_loads_without_rediscovery_or_control(owner, tmp_path):
+    async def check():
+        owner["row"].update(provider="codex", transport="codex", alive=False, online=True, lifecycle="ended", read_only=True,
+                            status="ended", capabilities={"send": False, "interrupt": False})
+        async with connection(owner, tmp_path, discoverable=False) as (call, updates, requests):
+            assert [(u["messageId"], u["content"]["text"]) for u in updates
+                    if u["sessionUpdate"] == "agent_message_chunk"] == [("prior", "Prior history")]
+            assert any(u.get("_meta", {}).get("t3.codes/externalSessionState", {}).get("state")
+                       == "unavailable" for u in updates)
+            result = await call("session/prompt", prompt_params())
+            assert "offline or ended" in result["error"]["message"]
+            assert owner["attempts"] == owner["delivered"] == requests == []
+            updates.clear()
+            result = await call("session/load", {"sessionId": SID, "cwd": "/isolated", "mcpServers": []})
+            assert "result" in result
+            assert [u["messageId"] for u in updates if "messageId" in u] == ["prior"]
+            assert owner["attempts"] == []
+    asyncio.run(check())
+
+
+def test_wire_session_becoming_read_only_stops_observation_without_another_action(owner, tmp_path):
+    async def check():
+        owner["failure"] = "busy"
+
+        async def archive_running_session(update, send):
+            if update.get("_meta", {}).get("t3.codes/externalSessionState", {}).get("state") == "running":
+                owner["row"].update(provider="codex", transport="codex", alive=False, online=True, lifecycle="ended", read_only=True,
+                                    status="ended", capabilities={"send": False, "interrupt": False})
+
+        async with connection(owner, tmp_path) as (call, updates, requests):
+            result = await call("session/prompt", prompt_params(), archive_running_session)
+            assert "observation failed" in result["error"]["message"]
+            assert any(u.get("_meta", {}).get("t3.codes/externalSessionState", {}).get("state")
+                       == "unavailable" for u in updates)
+            assert [action["action"] for action in owner["attempts"]] == ["send"]
+            assert requests == []
+            updates.clear()
+            result = await call("session/load", {"sessionId": SID, "cwd": "/isolated", "mcpServers": []})
+            assert "result" in result
+            assert [u["messageId"] for u in updates if "messageId" in u] == ["prior", "native-user"]
+            assert len(owner["attempts"]) == 1
     asyncio.run(check())

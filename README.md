@@ -217,18 +217,36 @@ Explicit Stop targets the attached original session, including work started outs
 T3. It waits for observed idle; disconnecting only detaches the observer. Native
 controls require an explicit decision even when T3 uses a permissive local mode.
 
-The deployed T3 build uses an official nightly with the narrow, versioned
-external-session patch in [`patches/t3/`](patches/t3/README.md). Upstream supplies
+The maintained T3 build uses an official nightly with the versioned
+external-session patches in [`patches/t3/`](patches/t3/README.md). Upstream supplies
 initial history import; the patch adds passive observation, stable native message
 identity, external Stop, and native requests already pending before attachment.
 The bridge keeps standard ACPv1 synchronous prompt completion. These additions
 require explicit client/provider opt-in; older T3 clients can continue a session
 but do not provide the full external-session experience.
 
-The patch's pinned base, build/update procedure and upgrade considerations are in
-its README. Actual live evidence and remaining limits are kept separately in the
+The five-patch series' pinned base, build/update procedure and upgrade considerations
+are in its README. Actual live evidence and remaining limits are kept separately in the
 [fleet acceptance matrix](docs/testing/fleet-e2e-matrix.md). Text prompts are
 supported; image/file input and provider/model changes are not fleet operations.
+
+Previously discovered Codex sessions retain read-only native history after
+unloading. Reading history never resumes the thread. Sending, interrupting
+and approvals remain disabled until the native owner independently loads
+that exact UUID; unavailable peers and mismatched identities remain errors.
+
+### Self-hosted T3 sign-in
+
+The maintained T3 build supports Authentik sign-in to the same fleet environment
+from desktop browsers and iPhone Safari, including **Add to Home Screen**. Each
+device renews its own session; users do not copy pairing codes, tokens, or QR links.
+This path uses the existing T3 service and Authentik, without Clerk or T3 Connect.
+
+The native desktop/mobile sign-in flow requires a matching custom app build.
+Installing the server patch alone does not add it to the stock apps; Safari is
+the iPhone path that needs no custom app. Configuration, ingress boundaries and
+upgrade instructions are in [Self-hosted T3 authentication](docs/self-hosted-t3-auth.md).
+Deployment acceptance remains recorded in the [fleet test matrix](docs/testing/fleet-e2e-matrix.md).
 
 ### Fleet MCP for Claude.ai
 

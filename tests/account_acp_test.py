@@ -1091,3 +1091,95 @@ def test_multi_select_other_is_explicit_and_cannot_collide_with_native_options(l
         else:
             assert hq.actions[0][2]['response']['updated_input']['answers'] == {'Pick': expected}
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("action", ["send", "interrupt", "respond", "select", "key"])
+def test_archived_history_is_readable_but_every_action_is_rejected_before_post(action):
+    async def check():
+        requests = []
+        archived = row(provider="codex", transport="codex", alive=False, online=True, lifecycle="ended", read_only=True, status="ended",
+                       capabilities={"send": False, "interrupt": False, "respond": False})
+
+        def handle(request):
+            requests.append(request.method)
+            return httpx.Response(200, json=archived)
+
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        try:
+            assert await hq.detail(SID) == archived
+            with pytest.raises(bridge["ActionRejected"], match="offline or ended"):
+                await hq.action(SID, action)
+            assert requests == ["GET", "GET"]
+        finally:
+            await hq.http.aclose()
+    asyncio.run(check())
+
+
+def test_archived_history_cannot_retarget_an_existing_session():
+    async def check():
+        archived = row(id="another-session", alive=False, lifecycle="ended", read_only=True)
+        hq = HQ("http://hq.example", "toy-secret",
+                transport=httpx.MockTransport(lambda _: httpx.Response(200, json=archived)))
+        try:
+            with pytest.raises(RequestError, match="different session identity"):
+                await hq.detail(SID)
+        finally:
+            await hq.http.aclose()
+    asyncio.run(check())
+
+
+def test_archived_transition_cancels_existing_permission_without_answering_it():
+    async def check():
+        current = row(provider="codex", transport="codex", native_control={"request_id": "pending-permission", "tool_name": "Bash",
+                                     "input": {"command": "true"}})
+        methods = []
+        requested = asyncio.Event()
+
+        def handle(request):
+            methods.append(request.method)
+            return httpx.Response(200, json=current)
+
+        async def wait_for_permission(*args, **kwargs):
+            requested.set()
+            await asyncio.Future()
+
+        hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        conn.request_permission = wait_for_permission
+        agent.on_connect(conn)
+        agent.external_session = True
+        try:
+            await agent.load_session("/local/fleet", SID)
+            attached = agent.sessions[SID]
+            await agent.poll(SID, attached)
+            await requested.wait()
+            permission = attached.control_task
+            current.update(alive=False, online=True, lifecycle="ended", read_only=True, status="ended")
+            await agent.poll(SID, attached)
+            assert permission.cancelled()
+            assert attached.control_task is None and attached.control_key is None
+            assert attached.state == "unavailable"
+            assert methods == ["GET", "GET", "GET"]
+        finally:
+            await agent.close_session(SID)
+            await hq.http.aclose()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("changes", [{"provider": None}, {"transport": "tmux"},
+    {"read_only": False}, {"alive": True}, {"online": False}, {"lifecycle": "unreachable"},
+    {"revision": None}])
+def test_archived_history_requires_the_complete_codex_owner_contract(changes):
+    async def check():
+        archived = row(provider="codex", transport="codex", read_only=True,
+                       alive=False, online=True, lifecycle="ended")
+        archived.update(changes)
+        hq = HQ("http://hq.example", "toy-secret",
+                transport=httpx.MockTransport(lambda _: httpx.Response(200, json=archived)))
+        try:
+            with pytest.raises(RequestError):
+                await hq.detail(SID)
+        finally:
+            await hq.http.aclose()
+    asyncio.run(check())

@@ -1,0 +1,497 @@
+From da4e1eb262edb862fc08328431b9f2b0a403183a Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 17 Nov 2026 18:48:57 +0000
+Subject: [PATCH] fix(auth): reconnect the primary environment after OIDC
+ sign-in
+
+---
+ apps/server/src/auth/OidcRemotePolicy.test.ts |  70 ++++++
+ .../auth/OidcSessionCoordinator.tsx           |  50 +++-
+ .../primary/oidcConnectionRecovery.test.ts    | 218 ++++++++++++++++++
+ .../primary/oidcConnectionRecovery.ts         |  50 ++++
+ .../client-runtime/src/connection/index.ts    |   1 +
+ 5 files changed, 387 insertions(+), 2 deletions(-)
+ create mode 100644 apps/web/src/environments/primary/oidcConnectionRecovery.test.ts
+ create mode 100644 apps/web/src/environments/primary/oidcConnectionRecovery.ts
+
+diff --git a/apps/server/src/auth/OidcRemotePolicy.test.ts b/apps/server/src/auth/OidcRemotePolicy.test.ts
+index e8719dff..efabccf9 100644
+--- a/apps/server/src/auth/OidcRemotePolicy.test.ts
++++ b/apps/server/src/auth/OidcRemotePolicy.test.ts
+@@ -1,11 +1,14 @@
+ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { expect, it } from "@effect/vitest";
++import { AuthStandardClientScopes, WS_METHODS, WsRpcGroup } from "@t3tools/contracts";
+ import * as Clock from "effect/Clock";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Redacted from "effect/Redacted";
+ import * as HttpServerRequest from "effect/http/HttpServerRequest";
++import * as RpcTest from "effect/rpc/RpcTest";
++import * as RpcAuthorization from "./RpcAuthorization.ts";
+ import * as ServerConfig from "../config.ts";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as Sqlite from "../persistence/Sqlite.ts";
+@@ -105,6 +108,73 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("OIDC remote boun
+         ).toBe(scenario === "valid" ? "Success" : "Failure");
+       }).pipe(Effect.provide(authLayer)),
+   );
++  it.effect(
++    "accepts an OIDC browser cookie through HTTP, WebSocket and guarded RPC until revocation",
++    () =>
++      Effect.gen(function* () {
++        const auth = yield* EnvironmentAuth.EnvironmentAuth;
++        const sessions = yield* SessionStore.SessionStore;
++        const repository = yield* AuthSessions.AuthSessionRepository;
++        const now = yield* Clock.currentTimeMillis;
++        const issued = yield* sessions.issue({
++          subject: "oidc:browser-grant",
++          method: "bearer-access-token",
++          scopes: AuthStandardClientScopes,
++        });
++        yield* repository.createOidcGrant({
++          grantId: "browser-grant",
++          issuer: settings.issuer,
++          subject: "owner",
++          refreshHash: "hash",
++          previousRefreshHash: null,
++          sessionId: issued.sessionId,
++          expiresAt: now + 60_000,
++          revokedAt: null,
++        });
++        const cookieRequest = (path: string) =>
++          HttpServerRequest.fromWeb(
++            new Request(`${settings.publicOrigin}${path}`, {
++              headers: {
++                host: "environment.example",
++                origin: settings.publicOrigin,
++                "x-forwarded-proto": "https",
++                cookie: `${sessions.cookieName}=${issued.token}`,
++              },
++            }),
++          );
++        const http = cookieRequest("/api/orchestration/shell");
++        const ws = cookieRequest("/ws?orchestrationProtocol=2");
++        const authenticated = yield* auth.authenticateHttpRequest(http);
++        const upgraded = yield* auth.authenticateWebSocketUpgrade(ws, "rpc");
++        expect(authenticated.sessionId).toBe(issued.sessionId);
++        expect(upgraded).toEqual(authenticated);
++        const group = WsRpcGroup.omit(
++          ...[...WsRpcGroup.requests.keys()].filter(
++            (
++              tag,
++            ): tag is Exclude<
++              keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES,
++              typeof WS_METHODS.serverProbe
++            > => tag !== WS_METHODS.serverProbe,
++          ),
++        );
++        const rpc = yield* RpcTest.makeClient(group).pipe(
++          Effect.provide(
++            Layer.mergeAll(
++              group.toLayerHandler(WS_METHODS.serverProbe, () => Effect.succeed({})),
++              RpcAuthorization.layer(upgraded.scopes),
++            ),
++          ),
++        );
++        expect(yield* rpc[WS_METHODS.serverProbe]({})).toEqual({});
++        yield* repository.revokeOidcGrant("browser-grant", now);
++        expect((yield* Effect.result(auth.authenticateHttpRequest(http)))._tag).toBe("Failure");
++        expect((yield* Effect.result(auth.authenticateWebSocketUpgrade(ws, "rpc")))._tag).toBe(
++          "Failure",
++        );
++      }).pipe(Effect.provide(authLayer)),
++  );
++
+   it.effect("retains only direct loopback CLI access and rejects forwarded loopback claims", () =>
+     Effect.gen(function* () {
+       const auth = yield* EnvironmentAuth.EnvironmentAuth;
+diff --git a/apps/web/src/components/auth/OidcSessionCoordinator.tsx b/apps/web/src/components/auth/OidcSessionCoordinator.tsx
+index 327f0bea..49faa8a2 100644
+--- a/apps/web/src/components/auth/OidcSessionCoordinator.tsx
++++ b/apps/web/src/components/auth/OidcSessionCoordinator.tsx
+@@ -1,4 +1,11 @@
+-import { useEffect } from "react";
++import { useEffect, useState } from "react";
++import { useAtomValue } from "@effect/atom-react";
++import { Atom, AsyncResult } from "effect/reactivity";
++import { runAtomCommand, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
++import { environmentCatalog } from "../../connection/catalog";
++import { appAtomRegistry } from "../../rpc/atomRegistry";
++import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
++import { createPrimaryOidcConnectionRecovery } from "../../environments/primary/oidcConnectionRecovery";
+ import {
+   primaryOidcRefreshDelay,
+   isPrimaryOidcSignInRequiredError,
+@@ -7,7 +14,42 @@ import {
+   PRIMARY_OIDC_EXPIRY_KEY,
+ } from "../../environments/primary/oidc";
+ 
++const primaryConnectionAtom = Atom.make((get) => {
++  const environmentId = get(primaryEnvironmentIdAtom);
++  return environmentId === null
++    ? null
++    : {
++        environmentId,
++        state: AsyncResult.getOrElse(get(environmentCatalog.stateAtom(environmentId)), () => null),
++      };
++});
++
++function handleRecoveryFailure(error: unknown): void {
++  if (isPrimaryOidcSignInRequiredError(error)) window.location.replace("/pair");
++}
++
+ export function OidcSessionCoordinator() {
++  const primary = useAtomValue(primaryConnectionAtom);
++  const [recovery] = useState(() =>
++    createPrimaryOidcConnectionRecovery({
++      refresh: refreshPrimaryOidcSession,
++      retry: async (environmentId) => {
++        const result = await runAtomCommand(
++          appAtomRegistry,
++          environmentCatalog.retryNow,
++          environmentId,
++          { reportFailure: false },
++        );
++        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
++      },
++    }),
++  );
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reconciles a failed primary connection with the browser credential after callback and refresh completion
++  useEffect(() => {
++    void recovery
++      .observe(primary?.environmentId ?? null, primary?.state ?? null)
++      .catch(handleRecoveryFailure);
++  }, [primary, recovery]);
+   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- renews the same-origin HttpOnly session and recovers after browser suspension
+   useEffect(() => {
+     let disposed = false;
+@@ -19,6 +61,7 @@ export function OidcSessionCoordinator() {
+       let retryIn = 30_000;
+       try {
+         await refreshPrimaryOidcSession();
++        await recovery.recover();
+         retryIn = Math.max(5_000, primaryOidcRefreshDelay());
+       } catch (error) {
+         if (isPrimaryOidcSignInRequiredError(error)) {
+@@ -36,7 +79,9 @@ export function OidcSessionCoordinator() {
+         window.location.replace("/pair");
+     };
+     void readPrimaryOidcConfig().then((config) => {
++      if (disposed) return;
+       enabled = config.enabled;
++      void recovery.setEnabled(enabled).catch(handleRecoveryFailure);
+       void renew();
+     });
+     window.addEventListener("online", wake);
+@@ -45,12 +90,13 @@ export function OidcSessionCoordinator() {
+     document.addEventListener("visibilitychange", wake);
+     return () => {
+       disposed = true;
++      void recovery.setEnabled(false);
+       clearTimeout(timer);
+       window.removeEventListener("online", wake);
+       window.removeEventListener("storage", storage);
+       window.removeEventListener("focus", wake);
+       document.removeEventListener("visibilitychange", wake);
+     };
+-  }, []);
++  }, [recovery]);
+   return null;
+ }
+diff --git a/apps/web/src/environments/primary/oidcConnectionRecovery.test.ts b/apps/web/src/environments/primary/oidcConnectionRecovery.test.ts
+new file mode 100644
+index 00000000..926d07bd
+--- /dev/null
++++ b/apps/web/src/environments/primary/oidcConnectionRecovery.test.ts
+@@ -0,0 +1,218 @@
++import { expect, it } from "@effect/vitest";
++import { EnvironmentId } from "@t3tools/contracts";
++import {
++  ConnectionBlockedError,
++  PrimaryConnectionTarget,
++  Connectivity,
++  Wakeups,
++} from "@t3tools/client-runtime/connection";
++import { ConnectionDriver as Driver } from "@t3tools/client-runtime/connection";
++import { EnvironmentSupervisor as Supervisor } from "@t3tools/client-runtime/connection";
++import type { RpcSession } from "@t3tools/client-runtime/rpc";
++import * as Deferred from "effect/Deferred";
++import * as Effect from "effect/Effect";
++import * as Fiber from "effect/Fiber";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as Ref from "effect/Ref";
++import * as Queue from "effect/Queue";
++import * as Stream from "effect/Stream";
++import * as SubscriptionRef from "effect/SubscriptionRef";
++import { createPrimaryOidcConnectionRecovery } from "./oidcConnectionRecovery";
++
++const target = new PrimaryConnectionTarget({
++  environmentId: EnvironmentId.make("primary"),
++  label: "Server",
++  httpBaseUrl: "https://server.example.test",
++  wsBaseUrl: "wss://server.example.test",
++});
++const denied = () =>
++  new ConnectionBlockedError({
++    reason: "authentication",
++    detail: "The prior browser credential was rejected.",
++  });
++const harness = Effect.fn("OidcRecoveryTest.harness")(function* (lateFailure = false) {
++  let cookieAccepted = false;
++  const attempts = yield* Ref.make(0);
++  const staleAttempt = yield* Deferred.make<void>();
++  const started = yield* Deferred.make<void>();
++  const closedSessions = yield* Ref.make<Array<Deferred.Deferred<never, ConnectionBlockedError>>>(
++    [],
++  );
++  const supervisor = yield* Supervisor.make(
++    { target, profile: Option.none(), enabled: true },
++    { initiallyDesired: true },
++  ).pipe(
++    Effect.provide(
++      Layer.mergeAll(
++        Layer.succeed(Connectivity.Connectivity, {
++          status: Effect.succeed("online" as const),
++          changes: Stream.never,
++        }),
++        Wakeups.layer({ changes: Stream.never }),
++        Layer.succeed(Driver.ConnectionDriver, {
++          connect: Effect.fn("OidcRecoveryTest.connect")(function* () {
++            const attempt = yield* Ref.updateAndGet(attempts, (value) => value + 1);
++            const acceptedAtStart = cookieAccepted;
++            yield* Deferred.succeed(started, undefined);
++            if (lateFailure && attempt === 1) yield* Deferred.await(staleAttempt);
++            if (!acceptedAtStart) return yield* denied();
++            const closed = yield* Deferred.make<never, ConnectionBlockedError>();
++            yield* Ref.update(closedSessions, (sessions) => [...sessions, closed]);
++            return {
++              prepared: {
++                environmentId: target.environmentId,
++                label: target.label,
++                target,
++                httpBaseUrl: target.httpBaseUrl,
++                socketUrl: `${target.wsBaseUrl}/ws`,
++                httpAuthorization: null,
++              },
++              session: {
++                client: {} as RpcSession["client"],
++                initialConfig: Effect.never,
++                subscribeServerConfig: () => Stream.never,
++                ready: Effect.void,
++                probe: Effect.void,
++                inboundFrames: Effect.succeed(0),
++                closed: Deferred.await(closed),
++              },
++            };
++          }),
++          preflight: () => Effect.succeed("unchecked"),
++          checkHost: () => Effect.succeed("unchecked"),
++        }),
++      ),
++    ),
++  );
++  const state = (phase: string) =>
++    SubscriptionRef.changes(supervisor.state).pipe(
++      Stream.filter((value) => value.phase === phase),
++      Stream.runHead,
++      Effect.map(Option.getOrThrow),
++    );
++  const retryRequests = yield* Queue.unbounded<() => void>();
++  yield* Queue.take(retryRequests).pipe(
++    Effect.flatMap((complete) => supervisor.retryNow.pipe(Effect.andThen(Effect.sync(complete)))),
++    Effect.forever,
++    Effect.forkScoped,
++  );
++  let refreshes = 0;
++  const recovery = createPrimaryOidcConnectionRecovery({
++    refresh: async () => {
++      refreshes += 1;
++      cookieAccepted = true;
++    },
++    retry: () =>
++      new Promise<void>((resolve) => {
++        Queue.offerUnsafe(retryRequests, resolve);
++      }),
++  });
++  yield* SubscriptionRef.changes(supervisor.state).pipe(
++    Stream.runForEach((value) =>
++      Effect.promise(() => recovery.observe(target.environmentId, value)),
++    ),
++    Effect.forkScoped,
++  );
++  return {
++    supervisor,
++    state,
++    attempts,
++    started,
++    staleAttempt,
++    recovery,
++    expireSession: Ref.get(closedSessions).pipe(
++      Effect.flatMap((sessions) => Deferred.fail(sessions.at(-1)!, denied())),
++    ),
++    acceptCookie: () => {
++      cookieAccepted = true;
++    },
++    refreshes: () => refreshes,
++  };
++});
++
++it.effect("recovers the existing auth-blocked supervisor when the sign-in callback completes", () =>
++  Effect.gen(function* () {
++    const h = yield* harness();
++    yield* h.state("blocked");
++    expect(yield* Ref.get(h.attempts)).toBe(1);
++    h.acceptCookie();
++    yield* Effect.promise(() => h.recovery.setEnabled(true));
++    yield* h.state("connected");
++    expect(yield* Ref.get(h.attempts)).toBe(2);
++  }).pipe(Effect.scoped),
++);
++
++it.effect(
++  "recovers when callback success precedes a late rejection of the old in-flight credential",
++  () =>
++    Effect.gen(function* () {
++      const h = yield* harness(true);
++      yield* Deferred.await(h.started);
++      h.acceptCookie();
++      yield* Effect.promise(() => h.recovery.setEnabled(true));
++      yield* Deferred.succeed(h.staleAttempt, undefined);
++      yield* h.state("connected");
++      expect(yield* Ref.get(h.attempts)).toBe(2);
++    }).pipe(Effect.scoped),
++);
++
++it("bounds retries until a connection succeeds and ignores unrelated failures and healthy sockets", async () => {
++  let retries = 0;
++  const recovery = createPrimaryOidcConnectionRecovery({
++    refresh: async () => {},
++    retry: async () => {
++      retries += 1;
++    },
++  });
++  const base = {
++    desired: true,
++    network: "online" as const,
++    phase: "blocked" as const,
++    stage: null,
++    attempt: 1,
++    generation: 0,
++    retryAt: null,
++    lastFailure: denied(),
++  };
++  await recovery.setEnabled(true);
++  await recovery.observe(target.environmentId, {
++    ...base,
++    lastFailure: new ConnectionBlockedError({ reason: "permission", detail: "Forbidden." }),
++  });
++  expect(retries).toBe(0);
++  await recovery.observe(target.environmentId, base);
++  await recovery.recover();
++  await recovery.observe(target.environmentId, { ...base, attempt: 2 });
++  expect(retries).toBe(1);
++  await recovery.observe(target.environmentId, {
++    ...base,
++    phase: "connected",
++    stage: null,
++    lastFailure: null,
++  });
++  await recovery.recover();
++  expect(retries).toBe(1);
++  await recovery.observe(target.environmentId, base);
++  expect(retries).toBe(2);
++});
++
++it.effect(
++  "recovers after refresh revokes an established socket without disturbing a healthy connection",
++  () =>
++    Effect.gen(function* () {
++      const h = yield* harness();
++      yield* h.state("blocked");
++      yield* Effect.promise(() => h.recovery.setEnabled(true));
++      const connected = yield* h.state("connected");
++      yield* Effect.promise(() => h.recovery.observe(target.environmentId, connected));
++      yield* Effect.promise(() => h.recovery.recover());
++      expect(yield* Ref.get(h.attempts)).toBe(2);
++      const reconnected = yield* h
++        .state("blocked")
++        .pipe(Effect.andThen(h.state("connected")), Effect.forkChild);
++      yield* h.expireSession;
++      yield* Fiber.join(reconnected);
++      expect(yield* Ref.get(h.attempts)).toBe(3);
++    }).pipe(Effect.scoped),
++);
+diff --git a/apps/web/src/environments/primary/oidcConnectionRecovery.ts b/apps/web/src/environments/primary/oidcConnectionRecovery.ts
+new file mode 100644
+index 00000000..7812e649
+--- /dev/null
++++ b/apps/web/src/environments/primary/oidcConnectionRecovery.ts
+@@ -0,0 +1,50 @@
++import type { EnvironmentId } from "@t3tools/contracts";
++import type { SupervisorConnectionState } from "@t3tools/client-runtime/connection";
++
++export function createPrimaryOidcConnectionRecovery(input: {
++  readonly refresh: () => Promise<void>;
++  readonly retry: (environmentId: EnvironmentId) => Promise<void>;
++}) {
++  let enabled = false;
++  let currentId: EnvironmentId | null = null;
++  let currentState: SupervisorConnectionState | null = null;
++  let epoch = 0;
++  let attempted = false;
++  const blockedByAuthentication = () =>
++    currentState?.phase === "blocked" &&
++    currentState.lastFailure?._tag === "ConnectionBlockedError" &&
++    currentState.lastFailure.reason === "authentication";
++  const recover = async () => {
++    if (!enabled || currentId === null || attempted || !blockedByAuthentication()) return;
++    const id = currentId;
++    const attemptEpoch = epoch;
++    attempted = true;
++    try {
++      await input.refresh();
++      if (enabled && epoch === attemptEpoch && currentId === id && blockedByAuthentication())
++        await input.retry(id);
++    } catch (error) {
++      if (epoch === attemptEpoch) attempted = false;
++      throw error;
++    }
++  };
++  return {
++    recover,
++    setEnabled: async (value: boolean) => {
++      enabled = value;
++      await recover();
++    },
++    observe: async (id: EnvironmentId | null, state: SupervisorConnectionState | null) => {
++      if (
++        id !== currentId ||
++        (state?.phase === "connected" && currentState?.phase !== "connected")
++      ) {
++        epoch += 1;
++        attempted = false;
++      }
++      currentId = id;
++      currentState = state;
++      await recover();
++    },
++  };
++}
+diff --git a/packages/client-runtime/src/connection/index.ts b/packages/client-runtime/src/connection/index.ts
+index 02a30adb..0b42805f 100644
+--- a/packages/client-runtime/src/connection/index.ts
++++ b/packages/client-runtime/src/connection/index.ts
+@@ -1,6 +1,7 @@
+ export * from "./catalog.ts";
+ export * from "./diagnosis.ts";
+ export * as Connectivity from "./connectivity.ts";
++export * as ConnectionDriver from "./driver.ts";
+ export * as CredentialStore from "./credentialStore.ts";
+ export { type ConnectionDriverProgress, type EnvironmentConnectionLease } from "./driver.ts";
+ export * from "./errors.ts";
+-- 
+2.47.3
+
