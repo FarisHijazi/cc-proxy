@@ -1,12 +1,14 @@
 # Self-hosted T3 authentication
 
-The five-patch [T3 series](../patches/t3/README.md) adds Authentik sign-in to the existing
+The eight-patch [T3 series](../patches/t3/README.md) adds Authentik sign-in to the existing
 T3 environment. Open its HTTPS address in a desktop browser or iPhone Safari and
 sign in with an allowed identity. Safari's **Add to Home Screen** uses the same
 served application; no custom iPhone app is required. Devices see the same
 server-side projects and fleet conversations and renew their own sessions.
 Completing sign-in or renewal recovers the existing browser connection without
-requiring a manual reload.
+requiring a manual reload. During an asynchronous callback, the root layout
+follows the displayed route matches so an open Settings dialog retains its
+sidebar provider until navigation completes.
 There are no user-facing pairing codes, QR links, Clerk account or T3 Connect relay
 in this sign-in path.
 
@@ -16,6 +18,9 @@ support from a server upgrade: their direct-connection credentials lack this
 renewal flow, and production mobile does not accept automatic pairing deep-link
 prefill. Use the served web application when a custom native build is unwanted.
 Native source support is not proof that a signed app has been built or installed.
+A remote-only desktop manages fleet under **Settings → Connections → Session
+connections**, using the existing environment selector. Its saved server remains
+configurable with the local backend disabled.
 
 ## Authentik provider
 
@@ -102,13 +107,16 @@ The packaged upstream CORS policy permits cross-origin bearer clients without
 allowing browser credentials. Browser token and logout operations additionally
 require the exact public Origin; missing, foreign and `null` Origins are rejected.
 Browser refresh secrets remain in Secure, HttpOnly cookies. Native builds use the
-existing platform credential stores. No proxy identity header substitutes for a
-validated session.
+existing platform credential stores. The desktop catalog encrypts saved secrets
+through Electron `safeStorage`. Server-side provider refresh credentials and
+rotation receipts use the existing `ServerSecretStore`: private files with mode
+`0600` in its `0700` directory, without an additional encryption layer. No proxy
+identity header substitutes for a validated session.
 
 ## Build the macOS desktop client
 
 Use a clean arm64 Mac packaging worktree at the maintained source in the
-[patch README](../patches/t3/README.md), with its five patches already applied.
+[patch README](../patches/t3/README.md), with its eight patches already applied.
 Follow T3's `docs/operations/development.md` for tooling. The verified build used
 Node `26.13.1`, pnpm `12.14.0`, Vite+ `1.4.0`, Rust `1.98.1` and Xcode `27.2`;
 the pinned T3 manifests remain the toolchain authority when updating. Select the
@@ -121,7 +129,7 @@ hosted Clerk/relay configuration and both update-feed selectors,
 self-hosted HTTPS origin and use the release version from the patch README:
 
 ```sh
-T3_DESKTOP_VERSION=0.1.10-ccfleet.20261117.3
+T3_DESKTOP_VERSION=0.1.10-ccfleet.20261117.6
 env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
   VITE_SELF_HOSTED_SERVER_URL=https://t3.example.com \
   vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 \
@@ -189,6 +197,16 @@ temporary provider failures preserve it for retry. Logout revokes the local
 grant/session, removes the stored provider credential and requests upstream
 revocation. Provider revocation takes effect when Authentik rejects the next
 renewal; it is not pushed instantly into an already issued access session.
+
+A successful rotation retains its response for 60 seconds in the existing server
+secret store. If delivery was lost, the exact preceding refresh token can retrieve
+that same response while the matching grant and access session remain valid,
+including after a service restart. This does not rotate again or extend the
+access session's expiry. Reusing the preceding token outside this recovery
+window revokes the grant; unrelated invalid tokens are rejected. Logout/revocation
+removes the receipt with the provider credential.
+The retry path covers the client's request deadline and reconnect delay without
+adding another renewal loop or credential writer.
 
 The implementation extends the existing EnvironmentAuth, SessionStore,
 AuthSessionRepository and ServerSecretStore owners. It does not create another

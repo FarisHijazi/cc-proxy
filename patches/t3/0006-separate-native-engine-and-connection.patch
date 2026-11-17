@@ -1,0 +1,3024 @@
+From fd7572e7cd19220e337eec834f8815690713293b Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 17 Nov 2026 20:03:42 +0000
+Subject: [PATCH] Separate native session providers from fleet connections
+
+---
+ CLAUDE.md                                     |   8 +
+ .../Adapters/AcpRegistryAdapterV2.test.ts     |  59 ++++-
+ .../orchestration-v2/ProjectionStore.test.ts  |  54 +++++
+ .../src/orchestration-v2/ProjectionStore.ts   |  29 ++-
+ .../ProviderEventIngestor.test.ts             |  44 ++++
+ .../orchestration-v2/ProviderEventIngestor.ts |   3 +
+ .../ProviderSessionManager.ts                 |   5 +-
+ .../ThreadLaunchService.test.ts               |  29 +++
+ .../orchestration-v2/ThreadLaunchService.ts   |  14 ++
+ .../persistence/OrchestrationEventStore.ts    |   4 +
+ .../src/provider/AcpRegistrySessions.test.ts  | 110 ++++++++++
+ .../src/provider/AcpRegistrySessions.ts       |  86 +++++++-
+ apps/server/src/server.ts                     |   6 +-
+ apps/server/src/ws.test.ts                    |  11 +-
+ .../web/src/components/ChatView.logic.test.ts |  40 +++-
+ apps/web/src/components/ChatView.logic.ts     |  12 +-
+ apps/web/src/components/ChatView.tsx          |  63 ++++--
+ apps/web/src/components/CommandPalette.tsx    |   9 +-
+ .../components/CommandPaletteThreadItems.tsx  |  12 +-
+ apps/web/src/components/Sidebar.tsx           |   1 +
+ apps/web/src/components/chat/ChatComposer.tsx |  36 ++-
+ .../components/chat/ComposerControlsBar.tsx   |  33 ++-
+ .../components/chat/ProviderStatusBanner.tsx  |   6 +-
+ .../components/chat/ProviderSubagentBar.tsx   |  24 +-
+ .../chat/SubagentTooltipContent.tsx           |  25 ++-
+ .../chat/ThreadRelationshipIcon.tsx           |  16 +-
+ .../chat/ThreadRelationshipsControl.tsx       |   1 +
+ .../chat/composerSubmission.test.ts           |   6 +
+ .../src/components/chat/composerSubmission.ts |   5 +-
+ .../chat/useComposerProviderModel.ts          |   4 +-
+ .../useComposerSelection.browser.test.tsx     |  29 ++-
+ .../components/chat/useComposerSelection.ts   |  17 +-
+ .../settings/AcpSessionManagementSection.tsx  |   8 +
+ .../settings/ConnectionsSettings.tsx          |   8 +
+ .../settings/ProviderInstanceCard.tsx         |   2 +-
+ .../settings/ProviderSettingsPanel.tsx        | 206 ++++++++++--------
+ .../components/sidebar/SidebarThreadRow.tsx   |  67 ++++--
+ .../src/externalSessionPresentation.test.ts   |  55 +++++
+ apps/web/src/externalSessionPresentation.ts   |  37 ++++
+ apps/web/src/providerInstances.test.ts        |  18 ++
+ apps/web/src/providerInstances.ts             |  13 +-
+ packages/client-runtime/src/state/models.ts   |   2 +
+ packages/contracts/src/acpRegistry.ts         |   3 +
+ packages/contracts/src/externalSession.ts     |  26 +++
+ packages/contracts/src/index.ts               |   1 +
+ packages/contracts/src/orchestrationV2.ts     |   5 +
+ packages/contracts/src/server.ts              |   1 +
+ .../src/server/driver.test.ts                 |   2 +
+ .../src/server/driver.ts                      |   3 +
+ .../provider-acp-registry/src/server/probe.ts |  13 +-
+ packages/provider-acp/src/server/adapter.ts   |  79 +++++--
+ .../src/server/externalSession.test.ts        |  73 +++++++
+ .../src/server/externalSession.ts             |  42 ++++
+ .../src/server/ProviderAdapter.ts             |   1 +
+ 54 files changed, 1274 insertions(+), 192 deletions(-)
+ create mode 100644 apps/web/src/externalSessionPresentation.test.ts
+ create mode 100644 apps/web/src/externalSessionPresentation.ts
+ create mode 100644 packages/contracts/src/externalSession.ts
+ create mode 100644 packages/provider-acp/src/server/externalSession.test.ts
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 43c994c2..c2e371cc 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -1 +1,9 @@
+ @AGENTS.md
++
++External fleet sessions retain their existing ACP routing binding. Their typed
++`externalSession` metadata identifies the native Claude Code or Codex engine,
++separately from the discovery connection. Never move an imported conversation to
++a driver that starts a replacement worker. Metadata-only enrichment uses the
++existing event/persistence owners and must preserve conversation activity times.
++Discovery connections belong in Connections settings, not new-session provider
++selection; existing bindings remain usable while their metadata is loading.
+diff --git a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+index faaf9af3..dcc916fc 100644
+--- a/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/AcpRegistryAdapterV2.test.ts
+@@ -1008,6 +1008,20 @@ describe("AcpRegistryAdapterV2", () => {
+     "projects external history and original-session Stop without a local turn (%o)",
+     ({ activation, protocolVersion }) =>
+       Effect.gen(function* () {
++        const identity = {
++          version: 1 as const,
++          engine: "claude-code" as const,
++          connection: { kind: "fleet" as const, host: "worker", transport: "tmux" as const },
++          model: "observed-model",
++          capabilities: {
++            send: true,
++            interrupt: true,
++            respond: false,
++            setModel: false,
++            setPermissionMode: false,
++            terminal: false,
++          },
++        };
+         const importedSession = "existing-fleet-session";
+         const gate = makeProviderReplayGate(["external-output"]);
+         const message = (role: "user" | "agent", messageId: string, text: string) =>
+@@ -1079,7 +1093,7 @@ describe("AcpRegistryAdapterV2", () => {
+               frame: {
+                 kind: "response",
+                 method: protocolVersion === 1 ? "session/load" : "session/resume",
+-                result: {},
++                result: { _meta: { "t3.codes/externalSessionIdentity": identity } },
+               },
+             },
+             marker("history loaded"),
+@@ -1103,6 +1117,28 @@ describe("AcpRegistryAdapterV2", () => {
+             },
+             message("agent", "next-answer", "Another answer"),
+             state("idle"),
++            claudeFrames.update(importedSession, {
++              sessionUpdate: "session_info_update",
++              _meta: {
++                "t3.codes/externalSessionState": { version: 1, state: "idle" },
++                "t3.codes/externalSessionIdentity": {
++                  ...identity,
++                  model: "changed-model",
++                  capabilities: { ...identity.capabilities, send: false },
++                },
++              },
++            }),
++            claudeFrames.update(importedSession, {
++              sessionUpdate: "session_info_update",
++              _meta: {
++                "t3.codes/externalSessionState": { version: 1, state: "idle" },
++                "t3.codes/externalSessionIdentity": {
++                  ...identity,
++                  model: "changed-model",
++                  capabilities: { ...identity.capabilities, send: false },
++                },
++              },
++            }),
+             marker("external output received"),
+             {
+               type: "expect_outbound",
+@@ -1132,6 +1168,8 @@ describe("AcpRegistryAdapterV2", () => {
+             ? session.providerThread
+             : yield* session.runtime.resumeThread({ providerThread: importedThread });
+         assert.equal(attachedThread.status, "active");
++        assert.deepEqual(attachedThread.nativeMetadata?.externalSession, identity);
++        assert.equal(attachedThread.driver, ACP_REGISTRY_PROVIDER);
+         const loaded = yield* session.throughMarker("history loaded");
+         const loadedMessages = loaded.flatMap((event) =>
+           event.type === "message.updated" ? [event.message] : [],
+@@ -1181,6 +1219,25 @@ describe("AcpRegistryAdapterV2", () => {
+         );
+         assert.isFalse([...loaded, ...live].some((event) => event.type === "turn.terminal"));
+         assert.deepEqual(session.offers, []);
++        const identityUpdates = live.filter(
++          (event) =>
++            event.type === "provider_thread.updated" &&
++            event.providerThread.nativeMetadata?.externalSession?.model === "changed-model",
++        );
++        assert.equal(
++          identityUpdates.length,
++          activation === "initial" ? 2 : 1,
++          "duplicate identity/state reports are idempotent; only the initial-session marker also updates its title",
++        );
++        assert.isTrue(
++          identityUpdates.every(
++            (event) =>
++              event.type === "provider_thread.updated" &&
++              event.metadataOnly === true &&
++              event.providerThread.nativeMetadata?.externalSession?.capabilities.send === false,
++          ),
++        );
++
+         assert.isTrue(
+           live.some(
+             (event) =>
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+index b961ef1e..d1d4546f 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+@@ -2521,6 +2521,60 @@ const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {
+     },
+   });
+   const pinned = yield* readActivity;
++  const externalSession = {
++    version: 1 as const,
++    engine: "codex" as const,
++    connection: { kind: "fleet" as const, host: "worker", transport: "codex" as const },
++    capabilities: {
++      send: false,
++      interrupt: false,
++      respond: false,
++      setModel: false,
++      setPermissionMode: false,
++      terminal: false,
++    },
++  };
++  const providerThread = {
++    id: ProviderThreadId.make("background-provider"),
++    appThreadId: threadId,
++    driver,
++    providerInstanceId,
++    providerSessionId: null,
++    ownerNodeId: null,
++    nativeThreadRef: { driver, nativeId: "opaque-route", strength: "strong" as const },
++    nativeConversationHeadRef: null,
++    lastRunOrdinal: null,
++    handoffIds: [],
++    forkedFrom: null,
++    status: "not_loaded" as const,
++    firstRunOrdinal: 1,
++    createdAt,
++    updatedAt: createdAt,
++  };
++  yield* store.apply({
++    id: EventId.make("event:background-provider"),
++    type: "provider-thread.updated",
++    threadId,
++    occurredAt: createdAt,
++    payload: providerThread,
++  });
++  yield* store.apply({
++    id: EventId.make("event:background-provider:identity"),
++    type: "provider-thread.updated",
++    metadataOnly: true,
++    threadId,
++    occurredAt: DateTime.add(createdAt, { hours: 1 }),
++    payload: { ...providerThread, nativeMetadata: { externalSession } },
++  });
++  const enriched = yield* readActivity;
++  assert.equal(enriched.thread.activeProviderThreadId, providerThread.id);
++  for (const shell of [
++    yield* store.getThreadShell(threadId),
++    (yield* store.getShellSnapshot()).threads.find((entry) => entry.id === threadId),
++  ])
++    assert.deepEqual(shell?.externalSession, externalSession);
++  assert.deepEqual(enriched.runs, []);
++
+   yield* assertShellIndexCoversShells();
+ 
+   // An already-unpinned thread keeps its activity time even when replay's envelope advances.
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index f9c7f739..6bd11d5d 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -917,13 +917,14 @@ export function applyToProjection(
+   projection: OrchestrationV2ThreadProjection,
+   event: OrchestrationV2DomainEvent,
+ ): OrchestrationV2ThreadProjection {
++  const metadataOnly = event.type === "provider-thread.updated" && event.metadataOnly === true;
+   const base = {
+     ...projection,
+     thread: {
+       ...projection.thread,
+-      updatedAt: event.occurredAt,
++      updatedAt: metadataOnly ? projection.thread.updatedAt : event.occurredAt,
+     },
+-    updatedAt: event.occurredAt,
++    updatedAt: metadataOnly ? projection.updatedAt : event.occurredAt,
+   };
+ 
+   switch (event.type) {
+@@ -1037,6 +1038,7 @@ export function applyToProjection(
+       return {
+         ...base,
+         thread:
++          event.metadataOnly !== true &&
+           event.payload.appThreadId === base.thread.id &&
+           !isQueuedProviderThreadPlaceholder(event.payload)
+             ? {
+@@ -1793,6 +1795,10 @@ export function threadShellFromProjection(
+     id: projection.thread.id,
+     projectId: projection.thread.projectId,
+     title: projection.thread.title,
++    ...externalSessionForShell(
++      projection.providerThreads,
++      projection.thread.activeProviderThreadId,
++    ),
+     providerInstanceId: projection.thread.providerInstanceId,
+     modelSelection: projection.thread.modelSelection,
+     runtimeMode: projection.thread.runtimeMode,
+@@ -1906,6 +1912,15 @@ function providerInstanceHistoryForShell(input: {
+   return history;
+ }
+ 
++function externalSessionForShell(
++  providerThreads: OrchestrationV2ThreadProjection["providerThreads"],
++  activeProviderThreadId: OrchestrationV2ThreadProjection["thread"]["activeProviderThreadId"],
++): Pick<OrchestrationV2ThreadShell, "externalSession"> {
++  const externalSession = providerThreads.find((thread) => thread.id === activeProviderThreadId)
++    ?.nativeMetadata?.externalSession;
++  return externalSession === undefined ? {} : { externalSession };
++}
++
+ function activeProviderGoalForShell(
+   providerThreads: ReadonlyArray<OrchestrationV2ThreadProjection["providerThreads"][number]>,
+   activeProviderThreadId: OrchestrationV2ThreadProjection["thread"]["activeProviderThreadId"],
+@@ -1984,6 +1999,7 @@ type ShellThreadState = {
+   readonly hasActionableProposedPlan: boolean;
+   readonly pendingBackgroundTasks: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
+   readonly providerInstanceHistory: OrchestrationV2ThreadShell["providerInstanceHistory"];
++  readonly externalSession?: OrchestrationV2ThreadShell["externalSession"];
+   readonly goal: OrchestrationV2ThreadShell["goal"];
+   readonly itemCount: number;
+   readonly runlessItemCount: number;
+@@ -2106,6 +2122,9 @@ function shellFromState(input: {
+     id: input.state.thread.id,
+     projectId: input.state.thread.projectId,
+     title: input.state.thread.title,
++    ...(input.state.externalSession === undefined
++      ? {}
++      : { externalSession: input.state.externalSession }),
+     providerInstanceId: input.state.thread.providerInstanceId,
+     modelSelection: input.state.thread.modelSelection,
+     runtimeMode: input.state.thread.runtimeMode,
+@@ -2737,6 +2756,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+                 payload_json = excluded.payload_json
+             `;
+               if (
++                event.metadataOnly !== true &&
+                 event.payload.appThreadId !== null &&
+                 !isQueuedProviderThreadPlaceholder(event.payload)
+               ) {
+@@ -3153,6 +3173,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+           }
+ 
+           if (
++            !(event.type === "provider-thread.updated" && event.metadataOnly === true) &&
+             event.type !== "thread.created" &&
+             event.type !== "thread.archived" &&
+             event.type !== "thread.unarchived" &&
+@@ -8671,6 +8692,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+             threadId: thread.id,
+             providerThreads: providerThreadsByThreadId.get(thread.id) ?? [],
+           }),
++          ...externalSessionForShell(
++            providerThreadsByThreadId.get(thread.id) ?? [],
++            thread.activeProviderThreadId,
++          ),
+           goal: activeProviderGoalForShell(
+             providerThreadsByThreadId.get(thread.id) ?? [],
+             thread.activeProviderThreadId,
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
+index f4c51bec..65cf3db7 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
+@@ -27,6 +27,7 @@ import {
+ } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
+ import * as DateTime from "effect/DateTime";
++import * as TestClock from "effect/testing/TestClock";
+ import * as Deferred from "effect/Deferred";
+ import * as Fiber from "effect/Fiber";
+ import * as Effect from "effect/Effect";
+@@ -779,6 +780,49 @@ layer("ProviderEventIngestorV2", (it) => {
+         ["provider-thread.updated"],
+       );
+       assert.equal(latestThreadSequence, 2);
++      const externalSession = {
++        version: 1 as const,
++        engine: "codex" as const,
++        connection: { kind: "fleet" as const, host: "worker", transport: "codex" as const },
++        capabilities: {
++          send: false,
++          interrupt: false,
++          respond: false,
++          setModel: false,
++          setPermissionMode: false,
++          terminal: false,
++        },
++      };
++      yield* TestClock.adjust("1 hour");
++      const updated = yield* ingestor.ingestNormalized({
++        providerSessionId,
++        providerInstanceId: modelSelection.instanceId,
++        threadId: threadEvent.threadId,
++        event: {
++          type: "provider_thread.updated",
++          driver: CODEX_DRIVER,
++          metadataOnly: true,
++          providerThread: {
++            ...providerThread,
++            updatedAt: DateTime.add(now, { hours: 1 }),
++            nativeMetadata: { externalSession },
++          },
++        },
++      });
++      const persisted = yield* projectionStore.getThreadProjection(threadEvent.threadId);
++      assert.deepEqual(persisted.thread.updatedAt, projection.thread.updatedAt);
++      assert.equal(
++        persisted.thread.activeProviderThreadId,
++        projection.thread.activeProviderThreadId,
++      );
++      assert.deepEqual(
++        (yield* projectionStore.getThreadShell(threadEvent.threadId))?.externalSession,
++        externalSession,
++      );
++      assert.isTrue(
++        updated[0]?.event.type === "provider-thread.updated" &&
++          updated[0].event.metadataOnly === true,
++      );
+     }),
+   );
+ 
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+index 44d21e8b..3c4b8b16 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+@@ -273,6 +273,7 @@ export const layer: Layer.Layer<
+           readonly runId?: RunId | null;
+           readonly nodeId?: NodeId | null;
+           readonly occurredAt?: DateTime.Utc;
++          readonly metadataOnly?: true;
+         },
+       ) {
+         const threadId = payloadInput.threadId ?? input.threadId;
+@@ -285,6 +286,7 @@ export const layer: Layer.Layer<
+           compactUndefined({
+             id: eventId,
+             type: payloadInput.type,
++            metadataOnly: payloadInput.metadataOnly,
+             threadId,
+             runId: payloadInput.runId ?? input.runId,
+             nodeId: payloadInput.nodeId ?? input.nodeId,
+@@ -524,6 +526,7 @@ export const layer: Layer.Layer<
+               const threadId = input.event.providerThread.appThreadId ?? input.threadId;
+               const updated = yield* makeDomainEvent(input, {
+                 type: "provider-thread.updated",
++                ...(input.event.metadataOnly === true ? { metadataOnly: true } : {}),
+                 threadId,
+                 payload: input.event.providerThread,
+               });
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index b68e2c25..a88cc8dd 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -2809,8 +2809,9 @@ export const layerWithOptions = (
+                 : Effect.void;
+             // Metadata can change while idle without extending the runtime's lifetime.
+             const metadataOnly =
+-              event.type === "provider_session.updated" &&
+-              event.providerSession.status === lastSessionStatus;
++              (event.type === "provider_thread.updated" && event.metadataOnly === true) ||
++              (event.type === "provider_session.updated" &&
++                event.providerSession.status === lastSessionStatus);
+             if (event.type === "provider_session.updated") {
+               lastSessionStatus = event.providerSession.status;
+               if (lastSessionStatus === "stopped") stoppedByProvider = true;
+diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
+index c3a6ad0a..d0edb0a1 100644
+--- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
++++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
+@@ -3215,3 +3215,32 @@ it.effect("replays an accepted send after the project disables the instance", ()
+     }
+   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+ });
++
++it.effect("discovery connections only bind existing native sessions", () => {
++  const harness = makeHarness({
++    providers: [
++      { instanceId: modelSelection.instanceId, connectionRole: "discovery" } as ServerProvider,
++    ],
++  });
++  return Effect.gen(function* () {
++    const launches = yield* ThreadLaunch.ThreadLaunchService;
++    const blocked = yield* Effect.result(
++      launches.launch(launchInput({ command: "discovery-new", thread: "discovery-new" })),
++    );
++    assert.isTrue(Result.isFailure(blocked));
++    const imported = yield* launches.launch({
++      ...launchInput({ command: "discovery-import", thread: "discovery-import" }),
++      importedNativeThread: {
++        ref: { driver: adapter.driver, nativeId: "opaque-native-route", strength: "strong" },
++        metadata: { itemIdentityVersion: 2 },
++      },
++    });
++    assert.equal(imported.threadId, "discovery-import");
++    const reused = yield* launches.launch({
++      ...launchInput({ command: "discovery-reuse", thread: "discovery-import" }),
++      reuseExistingThread: true,
++    });
++    assert.equal(reused.threadId, imported.threadId);
++    assert.equal(harness.createWorktree.mock.calls.length, 0);
++  }).pipe(Effect.provide(harness.layer));
++});
+diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
+index d46f5e2d..954331fb 100644
+--- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
++++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
+@@ -1194,6 +1194,20 @@ const make = Effect.gen(function* () {
+         commandId: input.commandId,
+         instanceId: input.modelSelection.instanceId,
+       });
++      if (
++        input.importedNativeThread === undefined &&
++        input.reuseExistingThread !== true &&
++        (yield* providerRegistry.getProviders).some(
++          (provider) =>
++            provider.instanceId === input.modelSelection.instanceId &&
++            provider.connectionRole === "discovery",
++        )
++      ) {
++        return yield* mapError(
++          input,
++          "create-thread",
++        )("This connection discovers existing sessions. Choose a provider to start a new thread.");
++      }
+       return yield* Effect.gen(function* () {
+         // Recover ids from accepted launch receipts before allocating; retries have no client id and new ids collide with receipts.
+         const reusableLaunchReceipt =
+diff --git a/apps/server/src/persistence/OrchestrationEventStore.ts b/apps/server/src/persistence/OrchestrationEventStore.ts
+index e55d8271..87c3720f 100644
+--- a/apps/server/src/persistence/OrchestrationEventStore.ts
++++ b/apps/server/src/persistence/OrchestrationEventStore.ts
+@@ -193,6 +193,9 @@ function metadataForV2Event(event: OrchestrationV2DomainEvent): Record<string, u
+       ? {}
+       : { providerInstanceId: event.providerInstanceId }),
+     ...(event.rawEventId === undefined ? {} : { rawEventId: event.rawEventId }),
++    ...(event.type === "provider-thread.updated" && event.metadataOnly === true
++      ? { metadataOnly: true }
++      : {}),
+   };
+ }
+ 
+@@ -216,6 +219,7 @@ const rowToV2StoredEvent = Effect.fn("OrchestrationEventStore.rowToV2StoredEvent
+       ? {}
+       : { providerInstanceId: values.providerInstanceId }),
+     ...(values.rawEventId === undefined ? {} : { rawEventId: values.rawEventId }),
++    ...(values.metadataOnly === true ? { metadataOnly: true } : {}),
+   });
+   return yield* decodeV2StoredEvent({
+     sequence: row.sequence,
+diff --git a/apps/server/src/provider/AcpRegistrySessions.test.ts b/apps/server/src/provider/AcpRegistrySessions.test.ts
+index e5fb1026..134b3d44 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.test.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.test.ts
+@@ -6,6 +6,8 @@ import {
+   ProviderDriverKind,
+   ProviderInstanceId,
+   type AcpRegistryListSessionsResult,
++  type OrchestrationV2ProviderThread,
++  type OrchestrationV2DomainEvent,
+   type OrchestrationV2ThreadProjection,
+   type OrchestrationV2ThreadShell,
+   ProviderThreadId,
+@@ -14,12 +16,15 @@ import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/s
+ import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+ import * as Context from "effect/Context";
+ import * as Deferred from "effect/Deferred";
++import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
+ import * as SqlClient from "effect/sql/SqlClient";
+ import * as TestClock from "effect/testing/TestClock";
+ 
++import * as EventSink from "../orchestration-v2/EventSink.ts";
++import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+ import * as SqlitePersistence from "../persistence/Sqlite.ts";
+@@ -59,6 +64,8 @@ const fixture = Effect.fn(function* () {
+     Parameters<AgentSessionImporter.AgentSessionImporter["Service"]["importNativeHistory"]>[0]
+   > = [];
+   let shell: OrchestrationV2ThreadShell | null = null;
++  let identityRecord: OrchestrationV2ThreadProjection | undefined;
++  const metadataEvents: OrchestrationV2DomainEvent[] = [];
+   let enabled = true;
+   let optedIn = true;
+   let observable = true;
+@@ -107,6 +114,19 @@ const fixture = Effect.fn(function* () {
+   const services = AcpRegistrySessions.layer.pipe(
+     Layer.provide(
+       Layer.mergeAll(
++        Layer.mock(ProjectionStore.ProjectionStoreV2)({
++          getThreadRecords: () => Effect.sync(() => identityRecord!),
++        }),
++        Layer.mock(EventSink.EventSinkV2)({
++          writeIfProviderThreadUnchanged: ({ events }) =>
++            Effect.sync(() => {
++              metadataEvents.push(...events);
++              const event = events[0];
++              if (event?.type === "provider-thread.updated")
++                identityRecord = { ...identityRecord!, providerThreads: [event.payload] };
++              return { committed: true, storedEvents: [] };
++            }),
++        }),
+         Layer.mock(ProjectService.ProjectService)({
+           getById: () =>
+             Effect.sync(() =>
+@@ -170,6 +190,17 @@ const fixture = Effect.fn(function* () {
+   const sessions = Context.get(context, AcpRegistrySessions.AcpRegistrySessions);
+   return {
+     sessions,
++    metadataEvents,
++    setIdentityRecord: (providerThread: OrchestrationV2ProviderThread, deleted = false) => {
++      identityRecord = {
++        thread: {
++          id: providerThread.appThreadId!,
++          activeProviderThreadId: providerThread.id,
++          deletedAt: deleted ? providerThread.createdAt : null,
++        },
++        providerThreads: [providerThread],
++      } as unknown as OrchestrationV2ThreadProjection;
++    },
+     historyLoads,
+     setPendingShell: (id: OrchestrationV2ThreadShell["id"]) => {
+       shell = {
+@@ -358,3 +389,82 @@ it.effect("loads a selected deferred thread through the history owner only once"
+     assert.deepEqual(f.launched, []);
+   }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+ );
++
++it.effect(
++  "enriches existing transport bindings once without loading history or changing activity",
++  () =>
++    Effect.gen(function* () {
++      const f = yield* fixture();
++      const identity = {
++        version: 1 as const,
++        engine: "claude-code" as const,
++        connection: { kind: "fleet" as const, host: "worker", transport: "native" as const },
++        capabilities: {
++          send: false,
++          interrupt: false,
++          respond: false,
++          setModel: false,
++          setPermissionMode: false,
++          terminal: false,
++        },
++      };
++      const id = threadId("existing");
++      yield* f.seed(id);
++      const at = DateTime.makeUnsafe(timestamp);
++      const owner = {
++        id: ProviderThreadId.make("existing-provider"),
++        appThreadId: id,
++        driver,
++        providerInstanceId: instanceId,
++        providerSessionId: null,
++        ownerNodeId: null,
++        nativeThreadRef: { driver, nativeId: "existing", strength: "strong" as const },
++        nativeConversationHeadRef: null,
++        lastRunOrdinal: null,
++        handoffIds: [],
++        forkedFrom: null,
++        status: "idle" as const,
++        firstRunOrdinal: 1,
++        createdAt: at,
++        updatedAt: at,
++      };
++      f.setIdentityRecord(owner);
++      f.setResult(() =>
++        Effect.succeed({
++          ...page(["existing"]),
++          sessions: page(["existing"]).sessions.map((session) => ({
++            ...session,
++            externalSession: identity,
++          })),
++        }),
++      );
++      yield* f.sessions.reconcile;
++      yield* f.sessions.reconcile;
++      assert.equal(f.metadataEvents.length, 1);
++      const event = f.metadataEvents[0];
++      assert.equal(event?.type, "provider-thread.updated");
++      if (event?.type !== "provider-thread.updated") return;
++      assert.isTrue(event.metadataOnly);
++      assert.deepEqual(event.payload.updatedAt, at);
++      assert.equal(event.payload.id, owner.id);
++      assert.deepEqual(event.payload.nativeThreadRef, owner.nativeThreadRef);
++      assert.deepEqual(event.payload.nativeMetadata?.externalSession, identity);
++      f.setIdentityRecord({
++        ...event.payload,
++        nativeMetadata: {
++          externalSession: {
++            ...identity,
++            model: "observed",
++            capabilities: { ...identity.capabilities, send: true },
++          },
++        },
++      });
++      yield* f.sessions.reconcile;
++      assert.equal(f.metadataEvents.length, 1);
++      f.setIdentityRecord(owner, true);
++      yield* f.sessions.reconcile;
++      assert.equal(f.metadataEvents.length, 1);
++      assert.deepEqual(f.launched, []);
++      assert.deepEqual(f.historyLoads, []);
++    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
+diff --git a/apps/server/src/provider/AcpRegistrySessions.ts b/apps/server/src/provider/AcpRegistrySessions.ts
+index 4a688c86..9b1e46a1 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.ts
+@@ -1,6 +1,8 @@
+ import {
+   AcpRegistryOperationError,
+   CommandId,
++  EventId,
++  ExternalSessionIdentity,
+   ThreadId,
+   type AcpRegistryImportSessionInput,
+   type AcpRegistryImportSessionResult,
+@@ -13,6 +15,8 @@ import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/s
+ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+ import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+ import * as Context from "effect/Context";
++import * as DateTime from "effect/DateTime";
++import * as Schema from "effect/Schema";
+ import * as SecureRandom from "effect/crypto/SecureRandom";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+@@ -20,6 +24,8 @@ import * as Result from "effect/Result";
+ import * as Schedule from "effect/Schedule";
+ import * as SqlClient from "effect/sql/SqlClient";
+ 
++import * as EventSink from "../orchestration-v2/EventSink.ts";
++import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+ import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
+@@ -28,6 +34,8 @@ import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
+ import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
+ import * as ProviderRegistry from "./ProviderRegistry.ts";
+ 
++const equivalentExternalSession = Schema.toEquivalence(ExternalSessionIdentity);
++
+ export const importedThreadId = (input: {
+   readonly driver: ProviderDriverKind;
+   readonly instanceId: ProviderInstanceId;
+@@ -61,7 +69,10 @@ export class AcpRegistrySessions extends Context.Service<
+      */
+     readonly importSession: (
+       input: AcpRegistryImportSessionInput,
+-      options?: { readonly deferHistory: boolean },
++      options?: {
++        readonly deferHistory: boolean;
++        readonly externalSession?: ExternalSessionIdentity;
++      },
+     ) => Effect.Effect<AcpRegistryImportSessionResult, AcpRegistryOperationError>;
+     readonly reconcile: Effect.Effect<void>;
+     readonly importPendingHistory: (
+@@ -81,6 +92,56 @@ const make = Effect.gen(function* () {
+   const agentSessionImporter = yield* AgentSessionImporter.AgentSessionImporter;
+   const random = yield* SecureRandom.SecureRandom;
+   const sql = yield* SqlClient.SqlClient;
++  const projections = yield* ProjectionStore.ProjectionStoreV2;
++  const eventSink = yield* EventSink.EventSinkV2;
++
++  const enrichExternalIdentity = Effect.fn("AcpRegistrySessions.enrichExternalIdentity")(
++    function* (
++      threadId: ThreadId,
++      input: AcpRegistryImportSessionInput,
++      identity: ExternalSessionIdentity,
++    ) {
++      const records = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
++      if (records.thread.deletedAt !== null) return;
++      const owner = records.providerThreads.find(
++        (candidate) =>
++          candidate.id === records.thread.activeProviderThreadId &&
++          candidate.providerInstanceId === input.instanceId &&
++          candidate.nativeThreadRef?.nativeId === input.sessionId,
++      );
++      if (owner === undefined) return;
++      // Discovery seeds metadata; an observed session owns its richer model and capabilities.
++      const existing = owner.nativeMetadata?.externalSession;
++      const externalSession =
++        existing === undefined
++          ? identity
++          : { ...identity, ...existing, connection: identity.connection };
++      if (existing !== undefined && equivalentExternalSession(existing, externalSession)) return;
++      yield* eventSink.writeIfProviderThreadUnchanged({
++        expected: owner,
++        events: [
++          {
++            id: EventId.make(yield* random.uuidV4()),
++            type: "provider-thread.updated",
++            metadataOnly: true,
++            threadId,
++            driver: owner.driver,
++            providerInstanceId: owner.providerInstanceId,
++            occurredAt: yield* DateTime.now,
++            payload: { ...owner, nativeMetadata: { ...owner.nativeMetadata, externalSession } },
++          },
++        ],
++      });
++    },
++    Effect.mapError(
++      (cause) =>
++        new AcpRegistryOperationError({
++          reason: "session_import_failed",
++          message: "Could not enrich external session identity.",
++          cause,
++        }),
++    ),
++  );
+ 
+   const findOwner = Effect.fn("AcpRegistrySessions.findOwner")(function* (input: {
+     readonly driver: ProviderDriverKind;
+@@ -152,7 +213,10 @@ const make = Effect.gen(function* () {
+ 
+   const importSession = Effect.fn("AcpRegistrySessions.importSession")(function* (
+     input: AcpRegistryImportSessionInput,
+-    options?: { readonly deferHistory: boolean },
++    options?: {
++      readonly deferHistory: boolean;
++      readonly externalSession?: ExternalSessionIdentity;
++    },
+   ) {
+     const { workspaceRoot } = yield* project(input.projectId);
+     const { instance } = yield* sessionManager(input.instanceId);
+@@ -191,8 +255,12 @@ const make = Effect.gen(function* () {
+             }),
+         ),
+       );
+-      if (persisted[0])
+-        return { threadId: ThreadId.make(persisted[0].thread_id), imported: false } as const;
++      if (persisted[0]) {
++        const existingThreadId = ThreadId.make(persisted[0].thread_id);
++        if (options.externalSession !== undefined)
++          yield* enrichExternalIdentity(existingThreadId, input, options.externalSession);
++        return { threadId: existingThreadId, imported: false } as const;
++      }
+     }
+     const owner = yield* findOwner({
+       driver: instance.driverKind,
+@@ -261,6 +329,9 @@ const make = Effect.gen(function* () {
+             },
+             metadata: {
+               itemIdentityVersion: 2,
++              ...(options?.externalSession === undefined
++                ? {}
++                : { externalSession: options.externalSession }),
+               ...(input.title === undefined ? {} : { title: input.title }),
+               ...(input.updatedAt === undefined ? {} : { updatedAt: input.updatedAt }),
+             },
+@@ -411,7 +482,12 @@ const make = Effect.gen(function* () {
+                     ...(session.title === null ? {} : { title: session.title }),
+                     ...(session.updatedAt === null ? {} : { updatedAt: session.updatedAt }),
+                   },
+-                  { deferHistory: true },
++                  {
++                    deferHistory: true,
++                    ...(session.externalSession === undefined
++                      ? {}
++                      : { externalSession: session.externalSession }),
++                  },
+                 ).pipe(
+                   Effect.catch((cause) =>
+                     Effect.logWarning("Could not discover external session", {
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index ecd2b706..d5e00e73 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -866,7 +866,11 @@ const layerMakeRoutes = Layer.mergeAll(
+     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),
+   ),
+ ).pipe(
+-  Layer.provide(AcpRegistrySessions.layer),
++  Layer.provide(
++    AcpRegistrySessions.layer.pipe(
++      Layer.provide(Layer.merge(RuntimeLayer.layerEventSink, ProjectionStoreV2.layer)),
++    ),
++  ),
+   Layer.provide(
+     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
+   ),
+diff --git a/apps/server/src/ws.test.ts b/apps/server/src/ws.test.ts
+index f8ad4d32..4173650b 100644
+--- a/apps/server/src/ws.test.ts
++++ b/apps/server/src/ws.test.ts
+@@ -2461,6 +2461,7 @@ it.effect("ACP session RPCs list a thread missing its history and repair it on i
+   Effect.gen(function* () {
+     const projections = yield* ProjectionStore.ProjectionStoreV2;
+     const sql = yield* SqlClient.SqlClient;
++    const sink = yield* EventSink.EventSinkV2;
+     const pending = yield* seedAcpThread("pending", { imported: false, ran: false });
+     const complete = yield* seedAcpThread("complete", { imported: true, ran: false });
+     const ran = yield* seedAcpThread("ran", { imported: false, ran: true });
+@@ -2548,7 +2549,15 @@ it.effect("ACP session RPCs list a thread missing its history and repair it on i
+       }),
+       Layer.succeed(SqlClient.SqlClient, sql),
+     );
+-    const services = AcpRegistrySessions.layer.pipe(Layer.provideMerge(dependencies));
++    const services = AcpRegistrySessions.layer.pipe(
++      Layer.provideMerge(dependencies),
++      Layer.provideMerge(
++        Layer.mergeAll(
++          Layer.succeed(ProjectionStore.ProjectionStoreV2, projections),
++          Layer.succeed(EventSink.EventSinkV2, sink),
++        ),
++      ),
++    );
+     const client = yield* RpcTest.makeClient(acpSessionRpcs).pipe(
+       Effect.provide(
+         layerWsRpc(
+diff --git a/apps/web/src/components/ChatView.logic.test.ts b/apps/web/src/components/ChatView.logic.test.ts
+index dbbb445a..13953b1d 100644
+--- a/apps/web/src/components/ChatView.logic.test.ts
++++ b/apps/web/src/components/ChatView.logic.test.ts
+@@ -646,8 +646,13 @@ describe("resolveComposerProviderSelection", () => {
+     ["claudeAgent", "claude_work"],
+     ["codex", "codex_work"],
+     ["ollama", "local_models"],
++    ["acpRegistry", "cc_fleet"],
+   ])("keeps imported %s history selectable through its custom instance", (driver, instanceId) => {
+-    const importedEntry = entry(driver, instanceId);
++    const importedEntry = entry(
++      driver,
++      instanceId,
++      driver === "acpRegistry" ? { connectionRole: "discovery" } : {},
++    );
+     const entries = [entry(driver === "codex" ? "claudeAgent" : "codex"), importedEntry];
+     const thread = importedThread(importedEntry.instanceId);
+     const lockedProvider = deriveLockedProvider({
+@@ -663,12 +668,45 @@ describe("resolveComposerProviderSelection", () => {
+       resolveComposerProviderSelection({
+         entries,
+         candidateInstanceIds: [thread.modelSelection.instanceId],
++        boundInstanceId: thread.modelSelection.instanceId,
+         lockedProvider,
+         lockedInstanceId: thread.modelSelection.instanceId,
+       }).selectedProviderEntry?.instanceId,
+     ).toBe(importedEntry.instanceId);
+   });
+ 
++  it("keeps an empty imported connection bound before identity loads", () => {
++    const connection = entry("acpRegistry", "cc_fleet", { connectionRole: "discovery" });
++    const local = entry("codex");
++    const thread = makeThread({
++      modelSelection: { instanceId: connection.instanceId, model: "keep" },
++      itemCount: 0,
++      latestRun: null,
++      runtime: null,
++    });
++    const input = {
++      entries: [local, connection],
++      candidateInstanceIds: [local.instanceId, connection.instanceId],
++      lockedProvider: null,
++      lockedInstanceId: connection.instanceId,
++      boundInstanceId: thread.modelSelection.instanceId,
++    };
++    expect(thread.externalSession).toBeUndefined();
++    expect(resolveComposerProviderSelection(input).selectedProviderEntry?.instanceId).toBe(
++      connection.instanceId,
++    );
++    expect(
++      resolveComposerProviderSelection({
++        ...input,
++        entries: [local, { ...connection, isAvailable: false }],
++      }).selectedProviderEntry,
++    ).toBeUndefined();
++    expect(
++      resolveComposerProviderSelection({ ...input, boundInstanceId: null }).selectedProviderEntry
++        ?.instanceId,
++    ).toBe(local.instanceId);
++  });
++
+   it("keeps the session driver authoritative over instance and draft selections", () => {
+     const selected = entry("claudeAgent", "claude_work");
+     const sessionEntry = entry("ollama", "local_models");
+diff --git a/apps/web/src/components/ChatView.logic.ts b/apps/web/src/components/ChatView.logic.ts
+index e528246e..010809e9 100644
+--- a/apps/web/src/components/ChatView.logic.ts
++++ b/apps/web/src/components/ChatView.logic.ts
+@@ -475,13 +475,19 @@ export function buildLocalDraftThread(
+ export function resolveComposerProviderSelection(input: {
+   entries: ReadonlyArray<ProviderInstanceEntry>;
+   candidateInstanceIds: ReadonlyArray<ProviderInstanceId | null | undefined>;
++  boundInstanceId?: ProviderInstanceId | null | undefined;
+   lockedProvider: ProviderDriverKind | null;
+   lockedInstanceId: ProviderInstanceId | null | undefined;
+ }) {
+-  const requestedInstanceId = input.candidateInstanceIds.find(
++  const boundConnection = input.entries.find(
++    (entry) => entry.instanceId === input.boundInstanceId && entry.connectionRole === "discovery",
++  );
++  const candidates = [boundConnection?.instanceId, ...input.candidateInstanceIds];
++  const requestedInstanceId = candidates.find(
+     (candidate) => candidate != null && candidate !== NO_PROVIDER_MODEL_SELECTION.instanceId,
+   );
+   const requestedDriverKind =
++    boundConnection?.driverKind ??
+     input.lockedProvider ??
+     input.entries.find((entry) => entry.instanceId === requestedInstanceId)?.driverKind ??
+     input.entries[0]?.driverKind ??
+@@ -497,12 +503,14 @@ export function resolveComposerProviderSelection(input: {
+     lockedContinuationGroupKey === null;
+   const compatibleEntries = input.entries.filter(
+     (entry) =>
++      (entry.connectionRole !== "discovery" || entry.instanceId === boundConnection?.instanceId) &&
++      (!boundConnection || entry.instanceId === boundConnection.instanceId) &&
+       (!input.lockedProvider || entry.driverKind === input.lockedProvider) &&
+       (!lockedContinuationGroupKey || entry.continuationGroupKey === lockedContinuationGroupKey) &&
+       (!requiresExactInstance || entry.instanceId === input.lockedInstanceId),
+   );
+   const selectedProviderEntry =
+-    input.candidateInstanceIds
++    candidates
+       .map((candidate) =>
+         compatibleEntries.find(
+           (entry) => entry.instanceId === candidate && entry.enabled && entry.isAvailable,
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index fbec5620..8e07cb38 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionSendDisabledReason } from "../externalSessionPresentation";
+ import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
+ import { workspaceAreaProps } from "../lib/workspaceFocus";
+ import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+@@ -848,7 +849,6 @@ export default function ChatView(props: ChatViewProps) {
+     serverProjection === null ? null : deriveProviderSubagentStatus(serverProjection);
+   const isProviderSubagent =
+     serverThread !== null && isProviderNativeSubagentThread(serverThread.source);
+-  const supportsProviderSwitchingViaHandoff = threadSupportsProviderHandoff(serverProjection);
+   const activeLatestRun = isServerThread ? serverLatestRun : (activeThread?.latestRun ?? null);
+   const activeActivityRun = isServerThread ? serverActivityRun : (activeThread?.latestRun ?? null);
+   const activeRuntime = isServerThread ? serverRuntime : (activeThread?.runtime ?? null);
+@@ -1273,6 +1273,14 @@ export default function ChatView(props: ChatViewProps) {
+       : providersByEnvironment.get(providerEnvironmentId)) ?? EMPTY_PROVIDERS,
+     gitCwd,
+   );
++  const isExternalSessionConnection =
++    Boolean(activeThread?.externalSession) ||
++    (isServerThread &&
++      providerStatuses.find(
++        (provider) => provider.instanceId === activeThread?.modelSelection.instanceId,
++      )?.connectionRole === "discovery");
++  const supportsProviderSwitchingViaHandoff =
++    !isExternalSessionConnection && threadSupportsProviderHandoff(serverProjection);
+   const composerModelSelectionApplies = draftModelSelectionApplies(
+     { modelSelectionExplicit: composerModelSelectionExplicit },
+     threadHasStarted(activeThread),
+@@ -1353,6 +1361,7 @@ export default function ChatView(props: ChatViewProps) {
+   const activeThreadModelInstanceId = activeThread?.modelSelection.instanceId;
+   const { selectedProviderEntry, requestedDriverKind } = resolveComposerProviderSelection({
+     entries: providerInstanceEntries,
++    boundInstanceId: isServerThread ? activeThread?.modelSelection.instanceId : null,
+     candidateInstanceIds: [
+       selectedProviderByThreadId,
+       activeRuntime?.providerInstanceId,
+@@ -1370,6 +1379,7 @@ export default function ChatView(props: ChatViewProps) {
+     activeProviderStatus;
+   const supportsConversationRollback =
+     canOperateThread &&
++    !isExternalSessionConnection &&
+     conversationProviderStatus !== null &&
+     conversationProviderStatus.supportsConversationRollback !== false;
+   const phase = derivePhase(activeRuntime);
+@@ -1857,10 +1867,15 @@ export default function ChatView(props: ChatViewProps) {
+   const { focusComposer: focusComposerStable, scheduleComposerFocus: scheduleComposerFocusStable } =
+     useComposerFocus(composerRef);
+   const canInterruptRunningThread =
+-    canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
++    canOperateThread &&
++    (!isExternalSessionConnection ||
++      activeThread?.externalSession?.capabilities.interrupt === true) &&
++    deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
+   const onInterrupt = async () => {
+     if (
+       !activeThread ||
++      (isExternalSessionConnection &&
++        activeThread.externalSession?.capabilities.interrupt !== true) ||
+       !readEnvironmentScope(activeThread.environmentId, AuthOrchestrationOperateScope)
+     )
+       return;
+@@ -2559,7 +2574,9 @@ export default function ChatView(props: ChatViewProps) {
+     });
+   };
+   const freshSessionAvailable =
+-    activeMessageCount > 0 && serverConfig?.environment.capabilities.freshContext === true;
++    !isExternalSessionConnection &&
++    activeMessageCount > 0 &&
++    serverConfig?.environment.capabilities.freshContext === true;
+   // While a question or approval owns the composer, its text answers that, not the agent.
+   const freshSessionCommandAvailable =
+     freshSessionAvailable && activePendingApproval === null && pendingUserInputs.length === 0;
+@@ -2817,6 +2834,7 @@ export default function ChatView(props: ChatViewProps) {
+   const sideChatsOffered =
+     !embedded &&
+     canOperateThread &&
++    !isExternalSessionConnection &&
+     activeThread?.lineage.sideChat !== true &&
+     !isSubagentThread &&
+     serverConfig?.environment.capabilities.sideChats === true;
+@@ -3604,6 +3622,7 @@ export default function ChatView(props: ChatViewProps) {
+                           <div className="relative z-10">
+                             {showProviderSubagentBar ? (
+                               <ProviderSubagentBar
++                                externalSession={activeThread?.externalSession}
+                                 provider={selectedProviderEntry ?? null}
+                                 showInstanceBadge={
+                                   selectedProviderEntry !== undefined &&
+@@ -3628,7 +3647,13 @@ export default function ChatView(props: ChatViewProps) {
+                             ) : null}
+                             {!composerMounted ? null : (
+                               <ChatComposer
+-                                canOperateThread={canOperateThread}
++                                canOperateThread={
++                                  canOperateThread &&
++                                  ((activePendingApproval === null &&
++                                    activePendingUserInput === null) ||
++                                    !isExternalSessionConnection ||
++                                    activeThread?.externalSession?.capabilities.respond === true)
++                                }
+                                 reportedModelSelection={reportedModelSelection}
+                                 multipleModelSelections={multipleModelSelections}
+                                 supportsMultipleModels={
+@@ -3657,7 +3682,7 @@ export default function ChatView(props: ChatViewProps) {
+                                   isLocalDraftThread && activeProject === null
+                                 }
+                                 phase={phase}
+-                                canSteer={!compactionBlocksSteer}
++                                canSteer={!isExternalSessionConnection && !compactionBlocksSteer}
+                                 canInterrupt={canInterruptRunningThread}
+                                 isSendBusy={
+                                   (isSendBusy && !sendQueuesBehindSetup) ||
+@@ -3671,17 +3696,23 @@ export default function ChatView(props: ChatViewProps) {
+                                 sendDisabledReason={
+                                   !canOperateThread
+                                     ? "This connection cannot change threads."
+-                                    : isEnvironmentChanging
+-                                      ? "Preparing machine"
+-                                      : isRevertingCheckpoint
+-                                        ? "Rewinding conversation"
+-                                        : feedbackUploading
+-                                          ? "Sending feedback"
+-                                          : threadDetailLoading
+-                                            ? "Messages loading"
+-                                            : worktreeSetupBlocksSend
+-                                              ? "Preparing worktree"
+-                                              : projectCloneSendBlockReason
++                                    : (externalSessionSendDisabledReason(
++                                        activeThread?.externalSession,
++                                        isExternalSessionConnection ? "discovery" : undefined,
++                                        activePendingApproval !== null ||
++                                          activePendingUserInput !== null,
++                                      ) ??
++                                      (isEnvironmentChanging
++                                        ? "Preparing machine"
++                                        : isRevertingCheckpoint
++                                          ? "Rewinding conversation"
++                                          : feedbackUploading
++                                            ? "Sending feedback"
++                                            : threadDetailLoading
++                                              ? "Messages loading"
++                                              : worktreeSetupBlocksSend
++                                                ? "Preparing worktree"
++                                                : projectCloneSendBlockReason))
+                                 }
+                                 isPreparingWorktree={isPreparingWorktree && !sendQueuesBehindSetup}
+                                 bannerItems={
+diff --git a/apps/web/src/components/CommandPalette.tsx b/apps/web/src/components/CommandPalette.tsx
+index ec739342..5ea14654 100644
+--- a/apps/web/src/components/CommandPalette.tsx
++++ b/apps/web/src/components/CommandPalette.tsx
+@@ -1503,7 +1503,14 @@ function OpenCommandPaletteDialog(props: {
+     });
+   }
+ 
+-  if (activeThread !== null) {
++  if (
++    activeThread !== null &&
++    !activeThread.externalSession &&
++    providersByEnvironment
++      .get(activeThread.environmentId)
++      ?.find((provider) => provider.instanceId === activeThread.modelSelection.instanceId)
++      ?.connectionRole !== "discovery"
++  ) {
+     const thread = activeThread;
+     actionItems.push({
+       kind: "action",
+diff --git a/apps/web/src/components/CommandPaletteThreadItems.tsx b/apps/web/src/components/CommandPaletteThreadItems.tsx
+index 12a42e25..41891593 100644
+--- a/apps/web/src/components/CommandPaletteThreadItems.tsx
++++ b/apps/web/src/components/CommandPaletteThreadItems.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionPresentation } from "../externalSessionPresentation";
+ import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
+ import { findForMessageMatch, openThreadFindOnQuery } from "./chat/threadFindStore";
+ import {
+@@ -139,6 +140,10 @@ export function useCommandPaletteThreadItems(input: {
+       const providerEntry =
+         providerEntryByEnvironmentAndInstanceId.get(`${thread.environmentId}:${modelInstanceId}`) ??
+         null;
++      const external = externalSessionPresentation(
++        thread.externalSession,
++        providerEntry?.connectionRole,
++      );
+       return (
+         <ThreadCommandSubtitle
+           project={projectByKey.get(`${thread.environmentId}:${thread.projectId}`) ?? null}
+@@ -151,9 +156,12 @@ export function useCommandPaletteThreadItems(input: {
+           isCurrent={
+             thread.id === activeThread?.id && thread.environmentId === activeThread.environmentId
+           }
+-          driverKind={providerEntry?.driverKind ?? null}
++          driverKind={external?.driverKind ?? providerEntry?.driverKind ?? null}
+           providerDisplayName={
+-            thread.runtime?.providerName ?? providerEntry?.displayName ?? modelInstanceId
++            external?.displayName ??
++            thread.runtime?.providerName ??
++            providerEntry?.displayName ??
++            modelInstanceId
+           }
+           acpRegistryAgentId={providerEntry?.acpRegistryAgentId}
+           acpRegistryIconUrl={providerEntry?.acpRegistryIconUrl}
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index 58cb50ae..738e0b7d 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -288,6 +288,7 @@ function sameSidebarProviderEntries(
+     if (
+       other === undefined ||
+       other.driverKind !== entry.driverKind ||
++      other.connectionRole !== entry.connectionRole ||
+       other.enabled !== entry.enabled ||
+       other.displayName !== entry.displayName ||
+       other.accentColor !== entry.accentColor ||
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 83bd2f63..1243b76e 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionSendDisabledReason } from "../../externalSessionPresentation";
+ import { VoiceInputSetup } from "./VoiceInputSetup";
+ import { useComposerTypingGuard } from "./useComposerTypingGuard";
+ import { insertAttachmentReferencesForDraft } from "./composerAttachmentReferences";
+@@ -885,6 +886,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     projectModelSelection: activeProjectDefaultModelSelection,
+     promptInjectionState: getComposerPromptInjectionState(prompt),
+     threadStarted: threadHasStarted(activeThread),
++    boundInstanceId: routeKind === "server" ? activeThread?.modelSelection.instanceId : null,
+     candidateInstanceIds: [
+       activeThread?.runtime?.providerInstanceId,
+       activeThreadModelSelection?.instanceId,
+@@ -894,6 +896,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     lockedInstanceId:
+       activeThread?.runtime?.providerInstanceId ?? activeThreadModelSelection?.instanceId,
+   });
++  const connectionRole = activeThread?.externalSession
++    ? "discovery"
++    : routeKind === "server"
++      ? providerStatuses.find(
++          (provider) => provider.instanceId === activeThread?.modelSelection.instanceId,
++        )?.connectionRole
++      : selectedProviderEntry?.connectionRole;
+   const noProviderAvailable =
+     selectedProviderEntry === undefined && multipleModelSelections === null;
+   const providerCatalogPending = noProviderAvailable && !providerCatalogKnown;
+@@ -1848,17 +1857,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   // A compact footer gives the dictation capsule the whole row beside the send button.
+   const dictationTakesFooter = isComposerFooterCompact && speechInput.state.phase !== "idle";
+   const submissionTarget = activePendingProgress ? "pending-user-input" : "provider-turn";
++  const responseDisabledReason = externalSessionSendDisabledReason(
++    activeThread?.externalSession,
++    connectionRole,
++    true,
++  );
+   const submissionBlocked = isComposerSubmissionBlocked({
+     submissionTarget,
+     noProviderAvailable,
+     sendDisabledReason,
++    responseDisabledReason,
+     attachmentBlockReason,
+     environmentUnavailable: environmentUnavailable !== null,
+   });
+   // The pending Submit button follows the answer's own blockers, matching submitComposer.
+   const primaryActionSendDisabledReason =
+-    (activePendingProgress ? attachmentBlockReason : sendDisabledReason) ??
+-    (speechInput.preparing ? "Preparing voice input" : null);
++    (activePendingProgress
++      ? (responseDisabledReason ?? attachmentBlockReason)
++      : sendDisabledReason) ?? (speechInput.preparing ? "Preparing voice input" : null);
+   const primaryActionEnvironmentUnavailable =
+     environmentUnavailable !== null ||
+     (!activePendingProgress && (noProviderAvailable || projectSelectionRequired));
+@@ -2129,7 +2145,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       submitAfterDictation(() => submitComposerRef.current(dispatchMode, submissionIntent));
+       return false;
+     }
+-    if (submissionBlocked || !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) {
++    if (
++      !canOperateThread ||
++      submissionBlocked ||
++      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
++    ) {
+       event?.preventDefault();
+       return false;
+     }
+@@ -2439,6 +2459,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       : expandedControlsIconOnlyBlockCount;
+   const composerControls = (
+     <ComposerControlsBar
++      externalSession={activeThread?.externalSession}
++      connectionRole={connectionRole}
+       environmentId={environmentId}
+       workspaceCwd={gitCwd}
+       routeKind={routeKind}
+@@ -2991,6 +3013,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   }, []);
+ 
+   const openModelPicker = () => {
++    if (connectionRole === "discovery") return;
+     if (composerControlsHidden) {
+       if (composerBlurFrameRef.current !== null) {
+         window.cancelAnimationFrame(composerBlurFrameRef.current);
+@@ -3051,7 +3074,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       },
+       openModelPicker: openModelPickerStable,
+       stepReasoningEffort: (direction) => {
+-        if (noProviderAvailable || pendingUserInputs.length > 0 || isEditingQueuedMessage) {
++        if (
++          connectionRole === "discovery" ||
++          noProviderAvailable ||
++          pendingUserInputs.length > 0 ||
++          isEditingQueuedMessage
++        ) {
+           return;
+         }
+         const change = getComposerReasoningStep({
+diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
+index 302330f2..03d69bfb 100644
+--- a/apps/web/src/components/chat/ComposerControlsBar.tsx
++++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
+@@ -4,6 +4,7 @@ import type { ProviderInstanceEntry } from "../../providerInstances";
+ import { type AppModelOption } from "../../modelSelection";
+ import { CircleAlertIcon } from "lucide-react";
+ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
++import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
+ import { ComposerControl } from "./ComposerControl";
+ import {
+   ComposerFooterModeControls,
+@@ -11,6 +12,7 @@ import {
+   type RuntimeModeOption,
+ } from "./ComposerFooterControls";
+ import {
++  type ExternalSessionIdentity,
+   type EnvironmentId,
+   type ModelSelection,
+   type ProviderDriverKind,
+@@ -29,6 +31,8 @@ import {
+   describeComposerEffort,
+ } from "./ComposerModelEffort";
+ import type { useComposerProviderModel } from "./useComposerProviderModel";
++import { externalSessionPresentation } from "../../externalSessionPresentation";
++import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+ import { resolveComposerControlsOwnership } from "./composerControlsOwnership";
+ 
+ /**
+@@ -41,6 +45,8 @@ const MODEL_TRIGGER_STATES = "data-popup-open:bg-accent data-popup-open:text-for
+ 
+ export function ComposerControlsBar(props: {
+   environmentId: EnvironmentId;
++  externalSession?: ExternalSessionIdentity | undefined;
++  connectionRole?: "discovery" | undefined;
+   workspaceCwd: string | null;
+   routeKind: ChatComposerProps["routeKind"];
+   routeThreadRef: ChatComposerProps["routeThreadRef"];
+@@ -245,7 +251,32 @@ export function ComposerControlsBar(props: {
+       onOpenProviderSetup={onOpenProviderSetup}
+     />
+   );
+-  return showProviderUnavailable ? (
++  const external = externalSessionPresentation(props.externalSession, props.connectionRole);
++  return external ? (
++    <Tooltip>
++      <TooltipTrigger
++        render={
++          <div
++            className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
++            data-external-session-provider
++          />
++        }
++      >
++        <ProviderInstanceIcon
++          driverKind={external.driverKind}
++          displayName={external.displayName}
++          iconClassName="size-4"
++        />
++        <span className="truncate">
++          {external.displayName} · {external.modelLabel}
++        </span>
++        <span className="truncate text-muted-foreground/70">
++          {props.externalSession?.connection.host}
++        </span>
++      </TooltipTrigger>
++      <TooltipPopup>{external.connectionLabel}</TooltipPopup>
++    </Tooltip>
++  ) : showProviderUnavailable ? (
+     <ComposerControl
+       type="button"
+       disabled={!providerSetupInstanceId}
+diff --git a/apps/web/src/components/chat/ProviderStatusBanner.tsx b/apps/web/src/components/chat/ProviderStatusBanner.tsx
+index 04f8a8a8..59850379 100644
+--- a/apps/web/src/components/chat/ProviderStatusBanner.tsx
++++ b/apps/web/src/components/chat/ProviderStatusBanner.tsx
+@@ -122,8 +122,8 @@ export function getProviderStatusMessage(status: ServerProvider): string {
+   return status.status === "ready"
+     ? "No models are available for this provider."
+     : status.status === "error"
+-      ? `${providerName} provider is unavailable.`
+-      : `${providerName} provider has limited availability.`;
++      ? `${providerName} ${status.connectionRole === "discovery" ? "connection" : "provider"} is unavailable.`
++      : `${providerName} ${status.connectionRole === "discovery" ? "connection" : "provider"} has limited availability.`;
+ }
+ 
+ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
+@@ -167,7 +167,7 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
+     ? `${providerName} is unauthenticated`
+     : incompatible
+       ? `${providerName} ${status.version ?? ""} is ${incompatible.status === "broken" ? "known to be broken" : "unsupported"}`
+-      : `${providerName} provider status`;
++      : `${providerName} ${status.connectionRole === "discovery" ? "connection" : "provider"} status`;
+   const message = incompatible?.message ?? getProviderStatusMessage(status);
+   const isWarning =
+     incompatible?.status !== "broken" && (status.status === "warning" || incompatible !== null);
+diff --git a/apps/web/src/components/chat/ProviderSubagentBar.tsx b/apps/web/src/components/chat/ProviderSubagentBar.tsx
+index 1b74e432..2d25f06f 100644
+--- a/apps/web/src/components/chat/ProviderSubagentBar.tsx
++++ b/apps/web/src/components/chat/ProviderSubagentBar.tsx
+@@ -1,3 +1,5 @@
++import { externalSessionPresentation } from "../../externalSessionPresentation";
++import type { ExternalSessionIdentity } from "@t3tools/contracts";
+ import {
+   formatProviderSubagentStatus,
+   type ProviderSubagentStatus,
+@@ -13,6 +15,7 @@ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+ 
+ export function ProviderSubagentBar(props: {
+   readonly provider: ProviderInstanceEntry | null;
++  readonly externalSession?: ExternalSessionIdentity | undefined;
+   readonly showInstanceBadge: boolean;
+   readonly modelLabel: string;
+   readonly effortLabel: string | null;
+@@ -21,9 +24,16 @@ export function ProviderSubagentBar(props: {
+   readonly actions?: ReactNode;
+ }) {
+   const { status } = props;
++  const external = externalSessionPresentation(
++    props.externalSession,
++    props.provider?.connectionRole,
++  );
+   const live = status !== null && isOrchestrationV2WorkActive(status.status);
+-  const modelDescription =
+-    props.effortLabel === null ? props.modelLabel : `${props.modelLabel}, ${props.effortLabel}`;
++  const modelDescription = external
++    ? `${external.displayName} · ${external.modelLabel}`
++    : props.effortLabel === null
++      ? props.modelLabel
++      : `${props.modelLabel}, ${props.effortLabel}`;
+   const announcement = formatProviderSubagentStatus(
+     status === null ? null : { ...status, startedAt: null },
+     0,
+@@ -38,8 +48,8 @@ export function ProviderSubagentBar(props: {
+         <span className="flex min-w-0 max-w-full items-center gap-2">
+           {props.provider ? (
+             <ProviderInstanceIcon
+-              driverKind={props.provider.driverKind}
+-              displayName={props.provider.displayName}
++              driverKind={external?.driverKind ?? props.provider.driverKind}
++              displayName={external?.displayName ?? props.provider.displayName}
+               accentColor={props.provider.accentColor}
+               acpRegistryAgentId={props.provider.acpRegistryAgentId}
+               acpRegistryIconUrl={props.provider.acpRegistryIconUrl}
+@@ -49,8 +59,10 @@ export function ProviderSubagentBar(props: {
+               badgeClassName="right-[-0.125rem] bottom-[-0.125rem] h-3 min-w-3 px-0.5 text-5xs"
+             />
+           ) : null}
+-          <span className="min-w-0 truncate font-medium text-foreground">{props.modelLabel}</span>
+-          {props.effortLabel === null ? null : (
++          <span className="min-w-0 truncate font-medium text-foreground">
++            {external ? `${external.displayName} · ${external.modelLabel}` : props.modelLabel}
++          </span>
++          {external || props.effortLabel === null ? null : (
+             <span className="shrink-0 text-muted-foreground">{props.effortLabel}</span>
+           )}
+         </span>
+diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
+index 50b50273..64d272ad 100644
+--- a/apps/web/src/components/chat/SubagentTooltipContent.tsx
++++ b/apps/web/src/components/chat/SubagentTooltipContent.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionPresentation } from "../../externalSessionPresentation";
+ import type {
+   OrchestrationV2ThreadShell,
+   OrchestrationV2TurnItemStatus,
+@@ -42,7 +43,10 @@ export function SubagentTooltipContent(props: {
+   elapsed?: ReactNode;
+   parentThread?: Pick<OrchestrationV2ThreadShell, "projectId" | "worktreePath"> | undefined;
+   childThread?:
+-    | Pick<OrchestrationV2ThreadShell, "branch" | "worktreePath" | "modelSelection">
++    | Pick<
++        OrchestrationV2ThreadShell,
++        "branch" | "worktreePath" | "modelSelection" | "externalSession"
++      >
+     | undefined;
+   parentProject?: Pick<OrchestrationProjectShell, "workspaceRoot"> | undefined;
+   childProject?: Pick<OrchestrationProjectShell, "id" | "title" | "workspaceRoot"> | undefined;
+@@ -54,10 +58,15 @@ export function SubagentTooltipContent(props: {
+     props.modelSelection ??
+     (props.origin === "app_owned" ? props.childThread?.modelSelection : undefined);
+   const {
+-    modelLabel,
++    modelLabel: inferredModelLabel,
+     modelSlug,
+     workspace: metadata,
+   } = resolveSubagentMetadata({ ...props, modelSelection: childSelection });
++  const external = externalSessionPresentation(
++    props.childThread?.externalSession,
++    props.provider?.connectionRole,
++  );
++  const modelLabel = external?.modelLabel ?? inferredModelLabel;
+   const preview = subagentDetailPreview(props);
+   const providerModel = props.provider?.models.find((candidate) => candidate.slug === modelSlug);
+   const childModel = props.provider
+@@ -104,7 +113,7 @@ export function SubagentTooltipContent(props: {
+         })
+         .find(Boolean)
+     : undefined;
+-  const driver = props.provider?.driver ?? props.driver;
++  const driver = external?.driverKind ?? props.provider?.driver ?? props.driver;
+   const entries = deriveProviderInstanceEntries(props.providers ?? []);
+   const entry = entries.find((candidate) => candidate.instanceId === props.provider?.instanceId);
+   const showInstanceBadge = entry !== undefined && shouldShowInstanceBadge(entry, entries);
+@@ -123,7 +132,9 @@ export function SubagentTooltipContent(props: {
+         {driver ? (
+           <ProviderInstanceIcon
+             driverKind={driver}
+-            displayName={entry?.displayName ?? props.provider?.displayName ?? driver}
++            displayName={
++              external?.displayName ?? entry?.displayName ?? props.provider?.displayName ?? driver
++            }
+             accentColor={entry?.accentColor}
+             acpRegistryIconUrl={props.provider?.iconUrl}
+             showBadge={showInstanceBadge && entry?.accentColor !== undefined}
+@@ -136,7 +147,11 @@ export function SubagentTooltipContent(props: {
+         )}
+         <span className="inline-flex min-w-0 items-center gap-1 text-foreground/75">
+           <span className="min-w-0 truncate">
+-            {showInstanceBadge ? `${modelLabel} · ${entry.displayName}` : modelLabel}
++            {external
++              ? `${external.displayName} · ${modelLabel}`
++              : showInstanceBadge
++                ? `${modelLabel} · ${entry.displayName}`
++                : modelLabel}
+           </span>
+           {effort || speed?.speedIcon ? (
+             <span className="inline-flex shrink-0 items-center gap-1">
+diff --git a/apps/web/src/components/chat/ThreadRelationshipIcon.tsx b/apps/web/src/components/chat/ThreadRelationshipIcon.tsx
+index e9791591..31f8f779 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipIcon.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipIcon.tsx
+@@ -1,4 +1,9 @@
+-import type { ProviderDriverKind, ServerProvider } from "@t3tools/contracts";
++import { externalSessionPresentation } from "../../externalSessionPresentation";
++import type {
++  ExternalSessionIdentity,
++  ProviderDriverKind,
++  ServerProvider,
++} from "@t3tools/contracts";
+ import { BotIcon, type LucideIcon } from "lucide-react";
+ import { cn } from "../../lib/utils";
+ import {
+@@ -50,11 +55,13 @@ export function threadRelationshipStatusLabel(status: string | null): string {
+ export function ThreadRelationshipIcon({
+   driver,
+   provider,
++  externalSession,
+   providerEntries = [],
+   anyInstanceBadge = hasInstanceBadge(providerEntries),
+   status,
+   fallbackIcon: FallbackIcon = BotIcon,
+ }: {
++  externalSession?: ExternalSessionIdentity | undefined;
+   driver?: ProviderDriverKind | undefined;
+   provider?: ServerProvider | undefined;
+   providerEntries?: ReadonlyArray<ProviderInstanceEntry>;
+@@ -63,6 +70,7 @@ export function ThreadRelationshipIcon({
+   status: string | null;
+   fallbackIcon?: LucideIcon;
+ }) {
++  const external = externalSessionPresentation(externalSession, provider?.connectionRole);
+   const iconClassName = "size-4 shrink-0 text-muted-foreground";
+   const entry = driver
+     ? providerEntries.find((candidate) => candidate.instanceId === provider?.instanceId)
+@@ -72,8 +80,10 @@ export function ThreadRelationshipIcon({
+     <span className="relative inline-flex size-4 shrink-0 items-center justify-center">
+       {driver ? (
+         <ProviderInstanceIcon
+-          driverKind={driver}
+-          displayName={entry?.displayName ?? provider?.displayName ?? driver}
++          driverKind={external?.driverKind ?? driver}
++          displayName={
++            external?.displayName ?? entry?.displayName ?? provider?.displayName ?? driver
++          }
+           accentColor={entry?.accentColor}
+           acpRegistryAgentId={entry?.acpRegistryAgentId}
+           acpRegistryIconUrl={entry?.acpRegistryIconUrl ?? provider?.iconUrl}
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+index 16882da3..315c946e 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+@@ -820,6 +820,7 @@ export function ThreadRelationshipsPanel(props: {
+     const relationshipContent = (
+       <>
+         <ThreadRelationshipIcon
++          externalSession={node?.thread?.externalSession}
+           driver={isSubagent && !isParent ? providerDriver : undefined}
+           provider={provider}
+           providerEntries={providerEntries}
+diff --git a/apps/web/src/components/chat/composerSubmission.test.ts b/apps/web/src/components/chat/composerSubmission.test.ts
+index 23e85c9c..a6a86e76 100644
+--- a/apps/web/src/components/chat/composerSubmission.test.ts
++++ b/apps/web/src/components/chat/composerSubmission.test.ts
+@@ -233,5 +233,11 @@ describe("isComposerSubmissionBlocked", () => {
+       isComposerSubmissionBlocked({ ...answer, attachmentBlockReason: "Attach the file again" }),
+     ).toBe(true);
+     expect(isComposerSubmissionBlocked({ ...answer, environmentUnavailable: true })).toBe(true);
++    expect(
++      isComposerSubmissionBlocked({
++        ...answer,
++        responseDisabledReason: "This session cannot answer requests.",
++      }),
++    ).toBe(true);
+   });
+ });
+diff --git a/apps/web/src/components/chat/composerSubmission.ts b/apps/web/src/components/chat/composerSubmission.ts
+index 2f9ffe0d..6a708561 100644
+--- a/apps/web/src/components/chat/composerSubmission.ts
++++ b/apps/web/src/components/chat/composerSubmission.ts
+@@ -36,11 +36,14 @@ export function isComposerSubmissionBlocked(input: {
+   submissionTarget: ComposerSubmissionInput["submissionTarget"];
+   noProviderAvailable: boolean;
+   sendDisabledReason: string | null;
++  responseDisabledReason?: string | null;
+   attachmentBlockReason: string | null;
+   environmentUnavailable: boolean;
+ }): boolean {
+   return input.submissionTarget === "pending-user-input"
+-    ? input.attachmentBlockReason !== null || input.environmentUnavailable
++    ? input.responseDisabledReason != null ||
++        input.attachmentBlockReason !== null ||
++        input.environmentUnavailable
+     : input.noProviderAvailable || input.sendDisabledReason !== null;
+ }
+ 
+diff --git a/apps/web/src/components/chat/useComposerProviderModel.ts b/apps/web/src/components/chat/useComposerProviderModel.ts
+index a3db11d0..8261ef8f 100644
+--- a/apps/web/src/components/chat/useComposerProviderModel.ts
++++ b/apps/web/src/components/chat/useComposerProviderModel.ts
+@@ -48,6 +48,7 @@ export function useComposerProviderModel(
+     projectModelSelection,
+     promptInjectionState,
+     candidateInstanceIds,
++    boundInstanceId,
+     lockedProvider,
+     lockedInstanceId,
+     threadStarted,
+@@ -60,6 +61,7 @@ export function useComposerProviderModel(
+   );
+   const selection = resolveComposerProviderSelection({
+     entries: providerInstanceEntries,
++    boundInstanceId,
+     candidateInstanceIds: [
+       draftModelSelectionApplies(draftModelState, threadStarted)
+         ? draftModelState.activeProvider
+@@ -75,7 +77,7 @@ export function useComposerProviderModel(
+     selection.selectedProviderEntry?.driverKind ?? selection.requestedDriverKind;
+   const modelState = deriveEffectiveComposerModelState({
+     draft: draftModelState,
+-    threadStarted,
++    threadStarted: threadStarted || selection.selectedProviderEntry?.connectionRole === "discovery",
+     providers: providerStatuses,
+     selectedProvider,
+     selectedInstanceId,
+diff --git a/apps/web/src/components/chat/useComposerSelection.browser.test.tsx b/apps/web/src/components/chat/useComposerSelection.browser.test.tsx
+index 147a48aa..1cf4efb1 100644
+--- a/apps/web/src/components/chat/useComposerSelection.browser.test.tsx
++++ b/apps/web/src/components/chat/useComposerSelection.browser.test.tsx
+@@ -78,6 +78,7 @@ function Picker(props: {
+   thread: EnvironmentThreadShell;
+   runtime: Parameters<typeof useComposerSelection>[0]["activeRuntime"];
+   model?: string;
++  providerStatuses?: ReadonlyArray<ServerProvider>;
+ }) {
+   const { onProviderModelSelectStable } = useComposerSelection({
+     environmentId,
+@@ -87,7 +88,7 @@ function Picker(props: {
+     activeRuntime: props.runtime,
+     activeProjectSettings: { settings: { newWorktreesStartFromOrigin: false } },
+     settings: DEFAULT_UNIFIED_SETTINGS,
+-    providerStatuses: providers,
++    providerStatuses: props.providerStatuses ?? providers,
+     lockedProvider: null,
+     supportsProviderSwitchingViaHandoff: true,
+     multipleModelSelections: null,
+@@ -206,3 +207,29 @@ it("saves a pick of a seeded model the started thread does not show", async () =
+     ),
+   );
+ });
++
++it("keeps an empty discovery-bound session on its connection when a model shortcut selects a local provider", async () => {
++  setup();
++  const instanceId = ProviderInstanceId.make("cc_fleet");
++  const thread = {
++    ...cursorThread("empty-fleet-binding"),
++    modelSelection: createModelSelection(instanceId, "keep"),
++    itemCount: 0,
++    latestRun: null,
++    runtime: null,
++  };
++  const connection: ServerProvider = {
++    ...providers[0]!,
++    instanceId,
++    driver: ProviderDriverKind.make("acpRegistry"),
++    connectionRole: "discovery",
++  };
++  const ref = scopeThreadRef(environmentId, thread.id);
++  await using _screen = await render(
++    <Picker thread={thread} runtime={null} providerStatuses={[...providers, connection]} />,
++  );
++  await page.getByRole("button", { name: "Pick the model" }).click();
++  const draft = useComposerDraftStore.getState().getComposerDraft(ref);
++  expect(draft?.activeProvider).toBeUndefined();
++  expect(thread.modelSelection.instanceId).toBe(instanceId);
++});
+diff --git a/apps/web/src/components/chat/useComposerSelection.ts b/apps/web/src/components/chat/useComposerSelection.ts
+index 01562f0c..8e6c92c5 100644
+--- a/apps/web/src/components/chat/useComposerSelection.ts
++++ b/apps/web/src/components/chat/useComposerSelection.ts
+@@ -92,8 +92,14 @@ export function useComposerSelection(input: ComposerSelectionInput) {
+   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
+   const applyThreadModelPick = useApplyThreadModelPick();
+ 
++  const isExternalConnection =
++    !isLocalDraftThread &&
++    (activeThread?.externalSession !== undefined ||
++      providerStatuses.find(
++        (provider) => provider.instanceId === activeThread?.modelSelection.instanceId,
++      )?.connectionRole === "discovery");
+   const handleRuntimeModeChange = (mode: RuntimeMode) => {
+-    if (mode === runtimeMode) return;
++    if (isExternalConnection || mode === runtimeMode) return;
+     setComposerDraftRuntimeMode(composerDraftTarget, mode);
+     if (isLocalDraftThread) {
+       setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+@@ -103,6 +109,13 @@ export function useComposerSelection(input: ComposerSelectionInput) {
+   const handleRuntimeModeChangeStable = useStableCallback(handleRuntimeModeChange);
+ 
+   const openProviderSetup = (instanceId: ProviderInstanceId) => {
++    if (
++      providerStatuses.find((provider) => provider.instanceId === instanceId)?.connectionRole ===
++      "discovery"
++    ) {
++      void navigate({ to: "/settings/connections" });
++      return;
++    }
+     void navigate({
+       to: "/settings/providers",
+       search: { environmentId, instanceId },
+@@ -131,7 +144,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
+     model: string,
+     options?: { focusComposer?: boolean },
+   ) => {
+-    if (!activeThread) return;
++    if (!activeThread || isExternalConnection) return;
+     const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
+     const resolvedDriverKind = entry?.driver ?? null;
+     if (
+diff --git a/apps/web/src/components/settings/AcpSessionManagementSection.tsx b/apps/web/src/components/settings/AcpSessionManagementSection.tsx
+index d2f46c09..35e99a7a 100644
+--- a/apps/web/src/components/settings/AcpSessionManagementSection.tsx
++++ b/apps/web/src/components/settings/AcpSessionManagementSection.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionPresentation } from "../../externalSessionPresentation";
+ import {
+   AuthOrchestrationOperateScope,
+   AuthProvidersManageScope,
+@@ -460,6 +461,13 @@ function InstanceSessionManagement(
+                       <p className="truncate text-xs text-foreground">
+                         {session.title ?? session.sessionId}
+                       </p>
++                      {session.externalSession ? (
++                        <p className="truncate text-xs text-muted-foreground">
++                          {externalSessionPresentation(session.externalSession)?.displayName} ·{" "}
++                          {session.externalSession.model ?? "Model unknown"} ·{" "}
++                          {session.externalSession.connection.host}
++                        </p>
++                      ) : null}
+                       <code className="block truncate text-3xs text-muted-foreground">
+                         {session.sessionId}
+                       </code>
+diff --git a/apps/web/src/components/settings/ConnectionsSettings.tsx b/apps/web/src/components/settings/ConnectionsSettings.tsx
+index 9d309a8b..ec085fe4 100644
+--- a/apps/web/src/components/settings/ConnectionsSettings.tsx
++++ b/apps/web/src/components/settings/ConnectionsSettings.tsx
+@@ -1,6 +1,7 @@
+ import { SessionPermissions } from "./SessionPermissions";
+ import { useSearch } from "@tanstack/react-router";
+ import { ChevronRightIcon, EllipsisIcon } from "lucide-react";
++import { ProviderSettingsPanel } from "./ProviderSettingsPanel";
+ import { useAtomValue } from "@effect/atom-react";
+ import { type ReactNode, useState } from "react";
+ import {
+@@ -1679,6 +1680,13 @@ function ConnectionsSettingsContent({
+           <LocalEnvironmentSetting />
+         </SettingsSection>
+       ) : null}
++      {primaryEnvironment ? (
++        <ProviderSettingsPanel
++          environmentId={primaryEnvironment.environmentId}
++          scoped
++          category="connections"
++        />
++      ) : null}
+       <SettingsSection
+         {...searchableSetting("remote-environments")}
+         title="Environments"
+diff --git a/apps/web/src/components/settings/ProviderInstanceCard.tsx b/apps/web/src/components/settings/ProviderInstanceCard.tsx
+index 66b5e1fc..affa89da 100644
+--- a/apps/web/src/components/settings/ProviderInstanceCard.tsx
++++ b/apps/web/src/components/settings/ProviderInstanceCard.tsx
+@@ -1433,7 +1433,7 @@ export function ProviderInstanceCard({
+         />
+       ) : null}
+ 
+-      {driverOption !== undefined ? (
++      {driverOption !== undefined && liveProvider?.connectionRole !== "discovery" ? (
+         <SettingsSection title="Models">
+           <div className="px-3 py-3 sm:px-4">
+             <p className="mb-3 text-xs text-muted-foreground">
+diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+index c3cf2859..c8c25ad4 100644
+--- a/apps/web/src/components/settings/ProviderSettingsPanel.tsx
++++ b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+@@ -300,6 +300,7 @@ function EnvironmentUnavailablePlaceholder({
+ }
+ 
+ interface ProviderSettingsTarget {
++  readonly category?: "providers" | "connections" | undefined;
+   readonly environmentId?: EnvironmentId;
+   readonly instanceId?: ProviderInstanceId;
+   readonly scoped?: boolean;
+@@ -455,6 +456,7 @@ function ProviderSettingsPanelContent(target: ProviderSettingsTarget) {
+               ? target.instanceId
+               : undefined
+           }
++          category={target.category}
+           projectIds={target.projectIds ?? []}
+         />
+       ) : null}
+@@ -467,11 +469,13 @@ function RemoteSessionGatedProviderSettings({
+   deviceTabs,
+   targetInstanceId,
+   projectIds,
++  category,
+ }: {
+   readonly environment: EnvironmentPresentation;
+   readonly deviceTabs?: ReactNode;
+   readonly targetInstanceId?: ProviderInstanceId | undefined;
+   readonly projectIds: readonly ProjectId[];
++  readonly category?: "providers" | "connections" | undefined;
+ }) {
+   const sessionState = useEnvironmentSessionState(environment.environmentId);
+   const operateAccess = resolveRemoteOperateAccess({
+@@ -485,6 +489,7 @@ function RemoteSessionGatedProviderSettings({
+       operateAccess={operateAccess}
+       deviceTabs={deviceTabs}
+       targetInstanceId={targetInstanceId}
++      category={category}
+       projectIds={projectIds}
+     />
+   );
+@@ -496,12 +501,14 @@ function AccessGatedProviderSettings({
+   deviceTabs,
+   targetInstanceId,
+   projectIds,
++  category,
+ }: {
+   readonly environment: EnvironmentPresentation;
+   readonly operateAccess: ProviderOperateAccess;
+   readonly deviceTabs?: ReactNode;
+   readonly targetInstanceId?: ProviderInstanceId | undefined;
+   readonly projectIds: readonly ProjectId[];
++  readonly category?: "providers" | "connections" | undefined;
+ }) {
+   const access = classifyProviderEnvironmentAccess({
+     connectionPhase: environment.connection.phase,
+@@ -524,6 +531,7 @@ function AccessGatedProviderSettings({
+       readOnly={access.kind === "read-only"}
+       deviceTabs={deviceTabs}
+       targetInstanceId={targetInstanceId}
++      category={category}
+       projectIds={projectIds}
+     />
+   );
+@@ -539,19 +547,23 @@ export function EnvironmentProviderSettings({
+   deviceTabs,
+   targetInstanceId,
+   projectIds = NO_PROJECT_IDS,
++  category = "providers",
+ }: {
+   readonly environmentId: EnvironmentId;
+   readonly environmentLabel: string;
+   readonly deviceTabs?: ReactNode;
+   readonly targetInstanceId?: ProviderInstanceId | undefined;
+   readonly projectIds?: readonly ProjectId[];
++  readonly category?: "providers" | "connections" | undefined;
+   readonly readOnly?: boolean;
+ }) {
+   const settings = useEnvironmentSettings(environmentId);
+   const managedPolicy = useManagedPolicy(environmentId);
+   // A policy that allows no provider leaves nothing to add.
+   const canAddProvider =
+-    !readOnly && managedPolicy?.limits?.providers?.allowedDrivers?.length !== 0;
++    category === "providers" &&
++    !readOnly &&
++    managedPolicy?.limits?.providers?.allowedDrivers?.length !== 0;
+   const canWriteSettings = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+   const canRefreshProviders = useEnvironmentScope(environmentId, AuthOrchestrationReadScope);
+   const updateSettings = useUpdateEnvironmentSettings(environmentId);
+@@ -726,7 +738,7 @@ export function EnvironmentProviderSettings({
+     ),
+   );
+ 
+-  const rows: InstanceRow[] = [];
++  const allRows: InstanceRow[] = [];
+   const visibleDriverKinds = new Set<ProviderDriverKind>(
+     visibleProviderSettings.map((providerSettings) => providerSettings.provider),
+   );
+@@ -745,7 +757,7 @@ export function EnvironmentProviderSettings({
+         resolveProviderInstanceEnabled(explicitInstance ?? { driver }) ||
+         defaultInstanceId === targetInstanceId)
+     ) {
+-      rows.push({
++      allRows.push({
+         instanceId: defaultInstanceId,
+         explicitInstance,
+         driver,
+@@ -755,7 +767,7 @@ export function EnvironmentProviderSettings({
+     }
+     for (const [id, instance] of instancesByDriver.get(providerSettings.provider) ?? []) {
+       if (id === defaultInstanceId) continue;
+-      rows.push({
++      allRows.push({
+         instanceId: id,
+         explicitInstance: instance,
+         driver: instance.driver,
+@@ -766,7 +778,7 @@ export function EnvironmentProviderSettings({
+   for (const [driver, list] of instancesByDriver) {
+     if (visibleDriverKinds.has(driver)) continue;
+     for (const [id, instance] of list) {
+-      rows.push({
++      allRows.push({
+         instanceId: id,
+         explicitInstance: instance,
+         driver: instance.driver,
+@@ -775,6 +787,13 @@ export function EnvironmentProviderSettings({
+     }
+   }
+ 
++  const rows = allRows.filter(
++    (row) =>
++      (serverProviders.find((provider) => provider.instanceId === row.instanceId)
++        ?.connectionRole ===
++        "discovery") ===
++      (category === "connections"),
++  );
+   const targetInstanceMissing =
+     targetInstanceId !== undefined &&
+     selectedInstanceId === targetInstanceId &&
+@@ -976,6 +995,7 @@ export function EnvironmentProviderSettings({
+     <>
+       <SettingsSection
+         {...searchableSetting("providers")}
++        title={category === "connections" ? "Session connections" : "Providers"}
+         variant="plain"
+         titleAction={
+           canAddProvider ? (
+@@ -1079,99 +1099,105 @@ export function EnvironmentProviderSettings({
+               <div className="p-6 text-sm text-muted-foreground">
+                 {targetInstanceMissing
+                   ? "This provider instance is no longer available on this device."
+-                  : "No providers configured."}
++                  : category === "connections"
++                    ? "No session connections configured."
++                    : "No providers configured."}
+               </div>
+             )}
+           </div>
+         </SettingsGroup>
+       </SettingsSection>
+ 
+-      <UsageProviderSettings
+-        key={environmentId}
+-        environmentId={environmentId}
+-        environmentLabel={environmentLabel}
+-        sources={settings.usageLimitSources}
+-        readOnly={readOnly}
+-      />
+-
+-      {/* The server drops text generators under a provider allow-list. */}
+-      {managedPolicy?.limits?.providers?.allowedDrivers === undefined ? (
+-        <TextGeneratorsSettings
+-          key={`text-generators:${environmentId}`}
+-          environmentId={environmentId}
+-          environmentLabel={environmentLabel}
+-          providers={serverProviders}
+-          readOnly={readOnly}
+-        />
+-      ) : null}
++      {category === "providers" ? (
++        <>
++          <UsageProviderSettings
++            key={environmentId}
++            environmentId={environmentId}
++            environmentLabel={environmentLabel}
++            sources={settings.usageLimitSources}
++            readOnly={readOnly}
++          />
+ 
+-      <SettingsSection title="Advanced">
+-        <SettingsRow
+-          id={searchableSetting("provider-health-check-interval").id}
+-          title={
+-            <span className="inline-flex items-center gap-1.5">
+-              {searchableSetting("provider-health-check-interval").title}
+-              <PolicyTooltip>
+-                This interval is configured here, then the shared Background activity policy decides
+-                whether provider probes may run when the timer fires. Custom intervals appear as
+-                Advanced in Maintenance settings.
+-              </PolicyTooltip>
+-            </span>
+-          }
+-          description="Refresh provider status, versions, and models in the background. Set to 0 to disable."
+-          resetAction={
+-            providerHealthRefreshIntervalSeconds !== defaultProviderHealthRefreshIntervalSeconds ? (
+-              <span
+-                inert={!canWriteSettings}
+-                className={!canWriteSettings ? "opacity-50" : undefined}
+-              >
+-                <SettingResetButton
+-                  label="provider health check interval"
+-                  onClick={() =>
+-                    updateSettings(
+-                      backgroundActivityOverrideSettings(
+-                        settings.backgroundActivity,
+-                        resolvedBackgroundActivity,
+-                        { providerHealthRefreshInterval: undefined },
+-                      ),
+-                    )
+-                  }
+-                />
+-              </span>
+-            ) : null
+-          }
+-          control={
+-            <div
+-              inert={!canWriteSettings}
+-              aria-disabled={!canWriteSettings || undefined}
+-              className={cn(
+-                "flex shrink-0 items-center gap-2",
+-                !canWriteSettings && "opacity-50 select-none",
+-              )}
+-            >
+-              <IntervalSecondsField
+-                label="provider health check interval"
+-                value={providerHealthRefreshIntervalSeconds}
+-                min={0}
+-                step={PROVIDER_HEALTH_INTERVAL_STEP_SECONDS}
+-                onCommit={(seconds, options) =>
+-                  updateSettings(
+-                    backgroundActivityOverrideSettings(
+-                      settings.backgroundActivity,
+-                      resolvedBackgroundActivity,
+-                      { providerHealthRefreshInterval: Duration.seconds(seconds) },
+-                    ),
+-                    options,
+-                  )
+-                }
+-              />
+-              <span className="text-xs text-muted-foreground">seconds</span>
+-            </div>
+-          }
+-        />
+-        <CompactIdleThreadsRow />
+-      </SettingsSection>
++          {/* The server drops text generators under a provider allow-list. */}
++          {managedPolicy?.limits?.providers?.allowedDrivers === undefined ? (
++            <TextGeneratorsSettings
++              key={`text-generators:${environmentId}`}
++              environmentId={environmentId}
++              environmentLabel={environmentLabel}
++              providers={serverProviders}
++              readOnly={readOnly}
++            />
++          ) : null}
+ 
++          <SettingsSection title="Advanced">
++            <SettingsRow
++              id={searchableSetting("provider-health-check-interval").id}
++              title={
++                <span className="inline-flex items-center gap-1.5">
++                  {searchableSetting("provider-health-check-interval").title}
++                  <PolicyTooltip>
++                    This interval is configured here, then the shared Background activity policy
++                    decides whether provider probes may run when the timer fires. Custom intervals
++                    appear as Advanced in Maintenance settings.
++                  </PolicyTooltip>
++                </span>
++              }
++              description="Refresh provider status, versions, and models in the background. Set to 0 to disable."
++              resetAction={
++                providerHealthRefreshIntervalSeconds !==
++                defaultProviderHealthRefreshIntervalSeconds ? (
++                  <span
++                    inert={!canWriteSettings}
++                    className={!canWriteSettings ? "opacity-50" : undefined}
++                  >
++                    <SettingResetButton
++                      label="provider health check interval"
++                      onClick={() =>
++                        updateSettings(
++                          backgroundActivityOverrideSettings(
++                            settings.backgroundActivity,
++                            resolvedBackgroundActivity,
++                            { providerHealthRefreshInterval: undefined },
++                          ),
++                        )
++                      }
++                    />
++                  </span>
++                ) : null
++              }
++              control={
++                <div
++                  inert={!canWriteSettings}
++                  aria-disabled={!canWriteSettings || undefined}
++                  className={cn(
++                    "flex shrink-0 items-center gap-2",
++                    !canWriteSettings && "opacity-50 select-none",
++                  )}
++                >
++                  <IntervalSecondsField
++                    label="provider health check interval"
++                    value={providerHealthRefreshIntervalSeconds}
++                    min={0}
++                    step={PROVIDER_HEALTH_INTERVAL_STEP_SECONDS}
++                    onCommit={(seconds, options) =>
++                      updateSettings(
++                        backgroundActivityOverrideSettings(
++                          settings.backgroundActivity,
++                          resolvedBackgroundActivity,
++                          { providerHealthRefreshInterval: Duration.seconds(seconds) },
++                        ),
++                        options,
++                      )
++                    }
++                  />
++                  <span className="text-xs text-muted-foreground">seconds</span>
++                </div>
++              }
++            />
++            <CompactIdleThreadsRow />
++          </SettingsSection>
++        </>
++      ) : null}
+       {isAddInstanceDialogOpen && !readOnly ? (
+         <AddProviderInstanceDialog
+           open
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index 641bc0cf..f489292e 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -1,3 +1,4 @@
++import { externalSessionPresentation } from "../../externalSessionPresentation";
+ import { useAtomMount } from "@effect/atom-react";
+ import { asLaunchingThread } from "@t3tools/client-runtime/state/thread-inbox";
+ import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
+@@ -130,6 +131,7 @@ export type SidebarProviderEntry = Pick<
+   ProviderInstanceEntry,
+   | "instanceId"
+   | "driverKind"
++  | "connectionRole"
+   | "enabled"
+   | "displayName"
+   | "accentColor"
+@@ -192,18 +194,23 @@ function SidebarProviderStack(props: {
+   const stack = resolveThreadProviderStack(props.thread);
+   const currentInstanceId = stack[stack.length - 1]!;
+   const currentEntry = props.providerEntryByInstanceId.get(currentInstanceId) ?? null;
+-  if (currentEntry === null) return null;
+-  const showInstanceBadge = shouldShowInstanceBadge(
+-    currentEntry,
+-    props.providerEntryByInstanceId.values(),
++  const external = externalSessionPresentation(
++    props.thread.externalSession,
++    currentEntry?.connectionRole,
+   );
++  const identity = external ?? currentEntry;
++  if (identity === null) return null;
++  const showInstanceBadge =
++    currentEntry !== null &&
++    external === null &&
++    shouldShowInstanceBadge(currentEntry, props.providerEntryByInstanceId.values());
+   const current = (
+     <ProviderInstanceIcon
+-      driverKind={currentEntry.driverKind}
+-      displayName={currentEntry.displayName}
+-      accentColor={currentEntry.accentColor}
+-      acpRegistryAgentId={currentEntry.acpRegistryAgentId}
+-      acpRegistryIconUrl={currentEntry.acpRegistryIconUrl}
++      driverKind={identity.driverKind}
++      displayName={identity.displayName}
++      accentColor={currentEntry?.accentColor}
++      acpRegistryAgentId={currentEntry?.acpRegistryAgentId}
++      acpRegistryIconUrl={currentEntry?.acpRegistryIconUrl}
+       showBadge={showInstanceBadge}
+       size="compact"
+       iconClassName="opacity-60"
+@@ -265,7 +272,11 @@ function SidebarThreadTooltip({
+   terminalStatus: TerminalStatusIndicator | null;
+   terminalProcessCount: number;
+ }) {
+-  const driverKind = providerEntry?.driverKind ?? null;
++  const external = externalSessionPresentation(
++    thread.externalSession,
++    providerEntry?.connectionRole,
++  );
++  const driverKind = external?.driverKind ?? providerEntry?.driverKind ?? null;
+   const previousProviderNames = thread.providerInstanceHistory
+     .filter((instanceId) => instanceId !== modelInstanceId)
+     .map((instanceId) => providerEntryByInstanceId.get(instanceId)?.displayName ?? instanceId);
+@@ -297,6 +308,9 @@ function SidebarThreadTooltip({
+             <div className="min-w-0 truncate text-foreground/75">{environmentLabel}</div>
+           </div>
+         ) : null}
++        {external ? (
++          <div className="text-xs text-muted-foreground">{external.connectionLabel}</div>
++        ) : null}
+         {thread.branch ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <GitBranchIcon className="size-3 shrink-0 stroke-muted-foreground" />
+@@ -316,20 +330,25 @@ function SidebarThreadTooltip({
+             <ProviderInstanceIcon
+               driverKind={driverKind}
+               displayName={
+-                providerEntry?.displayName ?? thread.runtime?.providerName ?? modelInstanceId
++                external?.displayName ??
++                providerEntry?.displayName ??
++                thread.runtime?.providerName ??
++                modelInstanceId
+               }
+               accentColor={providerEntry?.accentColor}
+               acpRegistryAgentId={providerEntry?.acpRegistryAgentId}
+               acpRegistryIconUrl={providerEntry?.acpRegistryIconUrl}
+-              showBadge={showInstanceBadge && providerEntry?.accentColor !== undefined}
++              showBadge={!external && showInstanceBadge && providerEntry?.accentColor !== undefined}
+               badgeContent="none"
+               badgeClassName="h-2 min-w-2 px-0"
+               iconClassName="size-3 shrink-0 grayscale opacity-60"
+             />
+             <div className="min-w-0 truncate text-foreground/75">
+-              {showInstanceBadge && providerEntry
+-                ? `${modelLabel} · ${providerEntry.displayName}`
+-                : modelLabel}
++              {external
++                ? `${external.displayName} · ${external.modelLabel}`
++                : showInstanceBadge && providerEntry
++                  ? `${modelLabel} · ${providerEntry.displayName}`
++                  : modelLabel}
+             </div>
+           </div>
+         ) : null}
+@@ -825,9 +844,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   const selectedModel = providerEntry?.models.find(
+     (model) => model.slug === thread.modelSelection.model,
+   );
+-  const modelLabel = selectedModel
+-    ? getTriggerDisplayModelName(selectedModel, providerEntry?.driverKind)
+-    : thread.modelSelection.model;
++  const modelLabel =
++    externalSessionPresentation(thread.externalSession, providerEntry?.connectionRole)
++      ?.modelLabel ??
++    (selectedModel
++      ? getTriggerDisplayModelName(selectedModel, providerEntry?.driverKind)
++      : thread.modelSelection.model);
+ 
+   const isRemote = thread.environmentId !== props.currentEnvironmentId;
+   const showsScratchMachine = !checkoutThread.branch && props.scratchMachineLabel !== null;
+@@ -1710,9 +1732,12 @@ export const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props
+   const selectedModel = providerEntry?.models.find(
+     (model) => model.slug === thread.modelSelection.model,
+   );
+-  const modelLabel = selectedModel
+-    ? getTriggerDisplayModelName(selectedModel, providerEntry?.driverKind)
+-    : thread.modelSelection.model;
++  const modelLabel =
++    externalSessionPresentation(thread.externalSession, providerEntry?.connectionRole)
++      ?.modelLabel ??
++    (selectedModel
++      ? getTriggerDisplayModelName(selectedModel, providerEntry?.driverKind)
++      : thread.modelSelection.model);
+   const runningTerminalIds = useThreadRunningTerminalIds({
+     environmentId: thread.environmentId,
+     threadId: thread.id,
+diff --git a/apps/web/src/externalSessionPresentation.test.ts b/apps/web/src/externalSessionPresentation.test.ts
+new file mode 100644
+index 00000000..03766372
+--- /dev/null
++++ b/apps/web/src/externalSessionPresentation.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from "vite-plus/test";
++import {
++  externalSessionPresentation,
++  externalSessionSendDisabledReason,
++} from "./externalSessionPresentation";
++
++const identity = {
++  version: 1 as const,
++  engine: "claude-code" as const,
++  connection: { kind: "fleet" as const, host: "node-one", transport: "tmux" as const },
++  capabilities: {
++    send: true,
++    interrupt: true,
++    respond: true,
++    setModel: false,
++    setPermissionMode: false,
++    terminal: false,
++  },
++};
++
++describe("externalSessionPresentation", () => {
++  it("uses the observed engine and model without guessing from transport or local defaults", () => {
++    expect(externalSessionPresentation(identity)).toEqual({
++      driverKind: "claudeAgent",
++      displayName: "Claude Code",
++      modelLabel: "Model unknown",
++      connectionLabel: "node-one · Fleet · tmux",
++    });
++    expect(
++      externalSessionPresentation({ ...identity, engine: "codex", model: "gpt-5.4" }),
++    ).toMatchObject({ driverKind: "codex", displayName: "Codex", modelLabel: "gpt-5.4" });
++    expect(externalSessionPresentation(null)).toBeNull();
++    expect(externalSessionPresentation(null, "discovery")).toMatchObject({
++      displayName: "Agent unknown",
++      modelLabel: "Model unknown",
++    });
++  });
++});
++
++it("gates input by the current session capability and preserves live request responses", () => {
++  const stopped = { ...identity, capabilities: { ...identity.capabilities, send: false } };
++  expect(externalSessionSendDisabledReason(stopped, "discovery", false)).not.toBeNull();
++  expect(externalSessionSendDisabledReason(stopped, "discovery", true)).toBeNull();
++  expect(
++    externalSessionSendDisabledReason(
++      { ...stopped, capabilities: { ...stopped.capabilities, respond: false } },
++      "discovery",
++      true,
++    ),
++  ).not.toBeNull();
++  expect(externalSessionSendDisabledReason(undefined, "discovery", false)).toBe(
++    "Loading session details.",
++  );
++  expect(externalSessionSendDisabledReason(undefined, undefined, false)).toBeNull();
++});
+diff --git a/apps/web/src/externalSessionPresentation.ts b/apps/web/src/externalSessionPresentation.ts
+new file mode 100644
+index 00000000..10b88640
+--- /dev/null
++++ b/apps/web/src/externalSessionPresentation.ts
+@@ -0,0 +1,37 @@
++import { ProviderDriverKind, type ExternalSessionIdentity } from "@t3tools/contracts";
++
++export function externalSessionPresentation(
++  session: ExternalSessionIdentity | null | undefined,
++  connectionRole?: "discovery",
++) {
++  if (!session)
++    return connectionRole === "discovery"
++      ? {
++          driverKind: ProviderDriverKind.make("externalSession"),
++          displayName: "Agent unknown",
++          modelLabel: "Model unknown",
++          connectionLabel: "Fleet connection",
++        }
++      : null;
++  return {
++    driverKind: ProviderDriverKind.make(session.engine === "claude-code" ? "claudeAgent" : "codex"),
++    displayName: session.engine === "claude-code" ? "Claude Code" : "Codex",
++    modelLabel: session.model ?? "Model unknown",
++    connectionLabel: `${session.connection.host} · Fleet · ${session.connection.transport}`,
++  };
++}
++
++export function externalSessionSendDisabledReason(
++  session: ExternalSessionIdentity | null | undefined,
++  connectionRole: "discovery" | undefined,
++  answeringRequest: boolean,
++): string | null {
++  if (!session) return connectionRole === "discovery" ? "Loading session details." : null;
++  if (answeringRequest)
++    return session.capabilities.respond
++      ? null
++      : "This connection cannot answer requests for this session.";
++  return session.capabilities.send
++    ? null
++    : "This session cannot accept messages through this connection.";
++}
+diff --git a/apps/web/src/providerInstances.test.ts b/apps/web/src/providerInstances.test.ts
+index 891f3312..77f61f4d 100644
+--- a/apps/web/src/providerInstances.test.ts
++++ b/apps/web/src/providerInstances.test.ts
+@@ -13,6 +13,7 @@ import {
+   deriveProviderInstanceEntries,
+   getDefaultProviderInstanceModel,
+   isProviderInstancePickerReady,
++  isProviderInstancePickerVisible,
+   resolveDefaultProviderModelSelection,
+   resolveSelectableProviderInstance,
+   shouldShowInstanceBadge,
+@@ -59,6 +60,23 @@ const model = (slug: string, isCustom = false, isDefault = false) => ({
+ });
+ 
+ describe("isProviderInstancePickerReady", () => {
++  it("keeps a discovery connection addressable without offering it for new runs", () => {
++    const connection: ServerProvider = {
++      ...provider({ provider: ProviderDriverKind.make("acpRegistry"), instanceId: "cc_fleet" }),
++      connectionRole: "discovery",
++    };
++    const [entry] = deriveProviderInstanceEntries([connection]);
++    expect(entry?.instanceId).toBe("cc_fleet");
++    expect(entry && isProviderInstancePickerReady(entry)).toBe(false);
++    expect(entry && isProviderInstancePickerVisible(entry)).toBe(false);
++    expect(
++      resolveDefaultProviderModelSelection([connection], {
++        instanceId: connection.instanceId,
++        model: "keep",
++      }),
++    ).toBeNull();
++  });
++
+   it("rejects a disabled instance even while its last probe status is ready", () => {
+     const [entry] = deriveProviderInstanceEntries([
+       provider({
+diff --git a/apps/web/src/providerInstances.ts b/apps/web/src/providerInstances.ts
+index fa4cd69a..b36c634d 100644
+--- a/apps/web/src/providerInstances.ts
++++ b/apps/web/src/providerInstances.ts
+@@ -29,6 +29,7 @@ export const NO_PROVIDER_MODEL_SELECTION: ModelSelection = {
+ export interface ProviderInstanceEntry {
+   readonly instanceId: ProviderInstanceId;
+   readonly driverKind: ProviderDriverKind;
++  readonly connectionRole?: "discovery" | undefined;
+   readonly displayName: string;
+   readonly accentColor?: string | undefined;
+   readonly acpRegistryAgentId?: string | undefined;
+@@ -50,11 +51,16 @@ export function hasInstanceBadge(entries: ReadonlyArray<ProviderInstanceEntry>):
+ 
+ /** Disabled instances may retain ready status until reconciliation. */
+ export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
+-  return entry.enabled && entry.isAvailable && entry.status === "ready";
++  return (
++    entry.snapshot.connectionRole !== "discovery" &&
++    entry.enabled &&
++    entry.isAvailable &&
++    entry.status === "ready"
++  );
+ }
+ 
+ export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): boolean {
+-  return entry.enabled;
++  return entry.snapshot.connectionRole !== "discovery" && entry.enabled;
+ }
+ 
+ export function deriveProviderInstanceEntries(
+@@ -68,6 +74,7 @@ export function deriveProviderInstanceEntries(
+     return {
+       instanceId,
+       driverKind,
++      connectionRole: snapshot.connectionRole,
+       displayName: resolveProviderInstanceDisplayName(snapshot),
+       accentColor: normalizeProviderAccentColor(snapshot.accentColor),
+       ...(driverKind === "acpRegistry" && snapshot.iconUrl
+@@ -214,7 +221,7 @@ export function getDefaultProviderInstanceModel(
+ }
+ 
+ const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
+-  entry.enabled && entry.isAvailable;
++  entry.snapshot.connectionRole !== "discovery" && entry.enabled && entry.isAvailable;
+ 
+ export function resolveSelectableProviderInstanceEntry(
+   entries: ReadonlyArray<ProviderInstanceEntry>,
+diff --git a/packages/client-runtime/src/state/models.ts b/packages/client-runtime/src/state/models.ts
+index 6bc914b8..36ef269e 100644
+--- a/packages/client-runtime/src/state/models.ts
++++ b/packages/client-runtime/src/state/models.ts
+@@ -141,6 +141,7 @@ function threadRunStatusIsActive(status: ThreadRuntimeSummary["status"]): boolea
+ }
+ 
+ export interface EnvironmentThreadShell {
++  readonly externalSession?: OrchestrationV2ThreadShell["externalSession"];
+   readonly environmentId: EnvironmentId;
+   readonly id: ThreadId;
+   readonly projectId: ProjectId;
+@@ -328,6 +329,7 @@ export function presentThreadShell(
+     hasActionableProposedPlan: thread.hasActionableProposedPlan,
+     pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [],
+     providerInstanceHistory: thread.providerInstanceHistory ?? [],
++    ...(thread.externalSession === undefined ? {} : { externalSession: thread.externalSession }),
+     goal: thread.goal ?? null,
+     itemCount: thread.itemCount,
+     visibleItemCount: thread.visibleItemCount,
+diff --git a/packages/contracts/src/acpRegistry.ts b/packages/contracts/src/acpRegistry.ts
+index aef667ec..1e44631c 100644
+--- a/packages/contracts/src/acpRegistry.ts
++++ b/packages/contracts/src/acpRegistry.ts
+@@ -1,3 +1,4 @@
++import { ExternalSessionIdentity } from "./externalSession.ts";
+ import * as Effect from "effect/Effect";
+ import * as Schema from "effect/Schema";
+ 
+@@ -144,6 +145,7 @@ const AcpRegistrySessionId = TrimmedNonEmptyString.check(Schema.isMaxLength(1_02
+ const AcpRegistrySessionPath = TrimmedNonEmptyString.check(Schema.isMaxLength(4_096));
+ 
+ export const AcpRegistrySession = Schema.Struct({
++  externalSession: Schema.optionalKey(ExternalSessionIdentity),
+   sessionId: AcpRegistrySessionId,
+   cwd: AcpRegistrySessionPath,
+   additionalDirectories: Schema.Array(AcpRegistrySessionPath).check(Schema.isMaxLength(32)),
+@@ -287,6 +289,7 @@ export const AcpRegistryProbeResult = Schema.Struct({
+   modelOptionIds: Schema.optionalKey(
+     Schema.Array(AcpRegistryProbeText).check(Schema.isMaxLength(16)),
+   ),
++  connectionRole: Schema.optionalKey(Schema.Literal("discovery")),
+   sessionManagement: Schema.Struct({
+     canList: Schema.Boolean,
+     canLoad: Schema.Boolean,
+diff --git a/packages/contracts/src/externalSession.ts b/packages/contracts/src/externalSession.ts
+new file mode 100644
+index 00000000..384a82ec
+--- /dev/null
++++ b/packages/contracts/src/externalSession.ts
+@@ -0,0 +1,26 @@
++import * as Schema from "effect/Schema";
++import { TrimmedNonEmptyString } from "./baseSchemas.ts";
++
++export const ExternalSessionCapabilities = Schema.Struct({
++  send: Schema.Boolean,
++  interrupt: Schema.Boolean,
++  respond: Schema.Boolean,
++  setModel: Schema.Boolean,
++  setPermissionMode: Schema.Boolean,
++  terminal: Schema.Boolean,
++});
++export type ExternalSessionCapabilities = typeof ExternalSessionCapabilities.Type;
++
++export const ExternalSessionIdentity = Schema.Struct({
++  version: Schema.Literal(1),
++  engine: Schema.Literals(["claude-code", "codex"]),
++  connection: Schema.Struct({
++    kind: Schema.Literal("fleet"),
++    host: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
++    transport: Schema.Literals(["tmux", "native", "codex"]),
++  }),
++  model: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
++  nativeSessionId: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(1_024))),
++  capabilities: ExternalSessionCapabilities,
++});
++export type ExternalSessionIdentity = typeof ExternalSessionIdentity.Type;
+diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
+index 8dd47df3..fc03a48e 100644
+--- a/packages/contracts/src/index.ts
++++ b/packages/contracts/src/index.ts
+@@ -4,6 +4,7 @@ export * from "./composerContext.ts";
+ export * from "./composerContextClipboard.ts";
+ export * from "./background.ts";
+ export * from "./acpRegistry.ts";
++export * from "./externalSession.ts";
+ export * from "./auth.ts";
+ export * from "./environment.ts";
+ export * from "./environmentHttp.ts";
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index ce0e21f4..27903037 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -1,6 +1,7 @@
+ import { OrchestrationMessageContext } from "./composerContext.ts";
+ import { withRecordIdTable } from "./orchestrationV2IdTable.ts";
+ import * as DateTime from "effect/DateTime";
++import { ExternalSessionIdentity } from "./externalSession.ts";
+ import * as Effect from "effect/Effect";
+ import * as Schema from "effect/Schema";
+ import * as SchemaAST from "effect/SchemaAST";
+@@ -1092,6 +1093,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
+ export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2PendingBackgroundTask.Type;
+ 
+ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
++  externalSession: Schema.optionalKey(ExternalSessionIdentity),
+   cursorStoreCwd: Schema.optional(TrimmedNonEmptyString),
+   modelSelection: Schema.optional(ModelSelection),
+   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+@@ -2070,6 +2072,7 @@ export const OrchestrationV2DomainEvent = Schema.Union([
+   Schema.Struct({
+     ...OrchestrationV2EventBase.fields,
+     type: Schema.Literal("provider-thread.updated"),
++    metadataOnly: Schema.optionalKey(Schema.Literal(true)),
+     payload: OrchestrationV2ProviderThread,
+   }),
+   Schema.Struct({
+@@ -2194,6 +2197,7 @@ export type OrchestrationV2LatestVisibleMessageSummary =
+   typeof OrchestrationV2LatestVisibleMessageSummary.Type;
+ 
+ export const OrchestrationV2ThreadShell = Schema.Struct({
++  externalSession: Schema.optionalKey(ExternalSessionIdentity),
+   ...OrchestrationV2CreationFields,
+   id: ThreadId,
+   projectId: ProjectId,
+@@ -3015,6 +3019,7 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
+   Schema.Struct({
+     ...OrchestrationV2JsonEventBaseFields,
+     type: Schema.Literal("provider-thread.updated"),
++    metadataOnly: Schema.optionalKey(Schema.Literal(true)),
+     payload: OrchestrationV2ProviderThreadJson,
+   }),
+   Schema.Struct({
+diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
+index 5f7def72..05af255b 100644
+--- a/packages/contracts/src/server.ts
++++ b/packages/contracts/src/server.ts
+@@ -220,6 +220,7 @@ export const ServerProviderUpdateState = Schema.Struct({
+ export type ServerProviderUpdateState = typeof ServerProviderUpdateState.Type;
+ 
+ export const ServerProvider = Schema.Struct({
++  connectionRole: Schema.optionalKey(Schema.Literal("discovery")),
+   // Only instanceId is stable enough for provider routing.
+   instanceId: ProviderInstanceId,
+   driver: ProviderDriverKind,
+diff --git a/packages/provider-acp-registry/src/server/driver.test.ts b/packages/provider-acp-registry/src/server/driver.test.ts
+index b49e884b..249ded54 100644
+--- a/packages/provider-acp-registry/src/server/driver.test.ts
++++ b/packages/provider-acp-registry/src/server/driver.test.ts
+@@ -263,6 +263,7 @@ describe("acpRegistrySnapshotReadiness", () => {
+           models: [{ id: "probe-model", name: "Probe model", description: null }],
+           currentModelId: "probe-model",
+           configOptions: [],
++          connectionRole: "discovery",
+           sessionManagement: {
+             canList: true,
+             canLoad: true,
+@@ -290,6 +291,7 @@ describe("acpRegistrySnapshotReadiness", () => {
+       ),
+     ).toMatchObject({
+       auth: { status: "unknown", canLogout: true },
++      connectionRole: "discovery",
+       nativeSessions: { canList: true, canLoad: true, canResume: true },
+       models: [{ slug: "live-model", isDefault: true }],
+     });
+diff --git a/packages/provider-acp-registry/src/server/driver.ts b/packages/provider-acp-registry/src/server/driver.ts
+index 99cda923..b208ccec 100644
+--- a/packages/provider-acp-registry/src/server/driver.ts
++++ b/packages/provider-acp-registry/src/server/driver.ts
+@@ -324,6 +324,9 @@ function baseSnapshot(
+     ...(input.probe === undefined
+       ? {}
+       : {
++          ...(input.probe.probe.connectionRole === undefined
++            ? {}
++            : { connectionRole: input.probe.probe.connectionRole }),
+           nativeSessions: {
+             canList: input.probe.probe.sessionManagement.canList,
+             canLoad: input.probe.probe.sessionManagement.canLoad,
+diff --git a/packages/provider-acp-registry/src/server/probe.ts b/packages/provider-acp-registry/src/server/probe.ts
+index 761939bc..7788d5c9 100644
+--- a/packages/provider-acp-registry/src/server/probe.ts
++++ b/packages/provider-acp-registry/src/server/probe.ts
+@@ -1,5 +1,9 @@
+ import { resolveProviderProbeTimeoutMs } from "@t3tools/provider-core/server/snapshotProbe";
+-import { supportsExternalSession } from "@t3tools/provider-acp/server/externalSession";
++import {
++  supportsExternalSession,
++  externalSessionIdentity,
++  externalSessionConnectionRole,
++} from "@t3tools/provider-acp/server/externalSession";
+ import {
+   AcpRegistryListProvidersResult,
+   AcpRegistryOperationError,
+@@ -335,6 +339,9 @@ export function acpRegistryProbeResult(
+       ? { agentVersion: boundedText(started.initializeResult.agentInfo.version, MAX_ID_LENGTH) }
+       : {}),
+     authMethods: normalizeAcpRegistryAuthMethods(started.initializeResult.authMethods, spawn),
++    ...(externalSessionConnectionRole(started.initializeResult._meta) === undefined
++      ? {}
++      : { connectionRole: "discovery" }),
+     sessionManagement: {
+       canList: started.initializeResult.agentCapabilities?.sessionCapabilities?.list != null,
+       canLoad: started.initializeResult.agentCapabilities?.loadSession === true,
+@@ -724,8 +731,12 @@ export const listAcpRegistrySessions = Effect.fn("AcpRegistryProbe.listSessions"
+       const sessionId = boundedOpaqueValue(session.sessionId, 1_024);
+       const cwd = boundedOpaqueValue(session.cwd, 4_096);
+       if (sessionId === undefined || cwd === undefined) return [];
++      const identity = supportsExternalSession(initialized._meta)
++        ? externalSessionIdentity(session._meta)
++        : undefined;
+       return [
+         {
++          ...(identity === undefined ? {} : { externalSession: identity }),
+           sessionId,
+           cwd,
+           additionalDirectories: (session.additionalDirectories ?? [])
+diff --git a/packages/provider-acp/src/server/adapter.ts b/packages/provider-acp/src/server/adapter.ts
+index 7d70e89d..a70ec539 100644
+--- a/packages/provider-acp/src/server/adapter.ts
++++ b/packages/provider-acp/src/server/adapter.ts
+@@ -3,6 +3,8 @@
+ import {
+   acceptedExternalSessionInput,
+   externalSessionState,
++  externalSessionIdentity,
++  externalSessionRuntimeInfo,
+   supportsExternalSession,
+ } from "./externalSession.ts";
+ 
+@@ -18,7 +20,7 @@ import {
+   type OrchestrationV2ProviderRetry,
+   type OrchestrationV2ProviderSession,
+   type OrchestrationV2ProviderThread,
+-  type OrchestrationV2ProviderThreadNativeMetadata,
++  OrchestrationV2ProviderThreadNativeMetadata,
+   type OrchestrationV2ProviderTurn,
+   type OrchestrationV2RuntimeRequest,
+   type OrchestrationV2Subagent,
+@@ -858,6 +860,8 @@ function forkFromTurnMetaFor(input: {
+   return input.flavor.forkFromTurn.forkMeta(ref.nativeId);
+ }
+ 
++const equivalentNativeMetadata = Schema.toEquivalence(OrchestrationV2ProviderThreadNativeMetadata);
++
+ function isCompactionMessage(message: ProviderAdapter.ProviderAdapterV2TurnMessage): boolean {
+   return message.text.trim() === "/compact" && message.attachments.length === 0;
+ }
+@@ -2100,6 +2104,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+           rootForegroundWork = undefined;
+           agentRequests.clear();
+           nativeChildren.clear();
++          const identity = externallyManagedSession
++            ? externalSessionIdentity(setup.sessionSetupResult._meta)
++            : undefined;
++          if (identity !== undefined)
++            yield* Ref.update(nativeMetadataBySessionId, (current) =>
++              new Map(current).set(setup.sessionId, {
++                ...current.get(setup.sessionId),
++                externalSession: identity,
++              }),
++            );
+           yield* Ref.set(activeSessionSetup, setup);
+         });
+         const activeSelection = yield* Ref.make<ModelSelection | null>(null);
+@@ -5465,15 +5479,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                     now: yield* DateTime.now,
+                   })
+                 : undefined);
+-            if (known !== undefined) {
++            const externalStatus =
++              externalState === "unavailable"
++                ? "error"
++                : externalState === "idle"
++                  ? "idle"
++                  : "active";
++            if (known !== undefined && known.status !== externalStatus) {
+               const providerThread: OrchestrationV2ProviderThread = {
+                 ...known,
+-                status:
+-                  externalState === "unavailable"
+-                    ? "error"
+-                    : externalState === "idle"
+-                      ? "idle"
+-                      : "active",
++                status: externalStatus,
+                 updatedAt: yield* DateTime.now,
+               };
+               yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+@@ -5516,6 +5531,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                 const merged = {
+                   ...current.get(notification.sessionId),
+                   ...stateEvent.metadata,
++                  ...(externallyManagedSession &&
++                  update.sessionUpdate === "session_info_update" &&
++                  externalSessionIdentity(update._meta) !== undefined
++                    ? { externalSession: externalSessionIdentity(update._meta)! }
++                    : {}),
+                 };
+                 return [merged, new Map(current).set(notification.sessionId, merged)] as const;
+               });
+@@ -5538,8 +5558,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                   ...knownProviderThread.nativeMetadata,
+                   ...(yield* Ref.get(nativeMetadataBySessionId)).get(notification.sessionId),
+                 },
+-                updatedAt: now,
++                updatedAt: externallyManagedSession ? knownProviderThread.updatedAt : now,
+               };
++              if (
++                externallyManagedSession &&
++                update.sessionUpdate === "session_info_update" &&
++                equivalentNativeMetadata(
++                  knownProviderThread.nativeMetadata ?? {},
++                  providerThread.nativeMetadata ?? {},
++                )
++              )
++                return;
+               yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                 new Map(current).set(notification.sessionId, providerThread),
+               );
+@@ -5547,6 +5576,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                 type: "provider_thread.updated",
+                 driver,
+                 providerThread,
++                ...(externallyManagedSession ? { metadataOnly: true, sessionScoped: true } : {}),
+               });
+             }
+             return;
+@@ -8823,9 +8853,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+               : { previousState: previousInstructionState }),
+           });
+           const sessionSetup = yield* Ref.get(activeSessionSetup);
++          const identity = externallyManagedSession
++            ? (yield* Ref.get(nativeMetadataBySessionId)).get(sessionId)?.externalSession
++            : undefined;
+           const runtimeInstructions = buildRuntimeInstructions({
+-            harness: flavor.runtimeHarness ?? driver,
+-            model: turnInput.modelSelection.model,
++            ...(externallyManagedSession
++              ? externalSessionRuntimeInfo(identity)
++              : {
++                  harness: flavor.runtimeHarness ?? driver,
++                  model: turnInput.modelSelection.model,
++                }),
+             pullRequestLinking:
+               sessionSetup === null ||
+               flavor.sessionCarriesPullRequestLinking?.(sessionSetup.initializeResult) !== true,
+@@ -9577,10 +9614,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                       ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
+                       now,
+                     });
+-                  const providerThread =
+-                    threadInput.forceNewNativeThread && threadInput.existingProviderThread
+-                      ? { ...created, id: threadInput.existingProviderThread.id }
+-                      : created;
++                  const providerThread = {
++                    ...created,
++                    ...(threadInput.forceNewNativeThread && threadInput.existingProviderThread
++                      ? { id: threadInput.existingProviderThread.id }
++                      : {}),
++                    nativeMetadata: {
++                      ...created.nativeMetadata,
++                      ...(yield* Ref.get(nativeMetadataBySessionId)).get(sessionId),
++                    },
++                  };
+                   yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                     new Map(current).set(sessionId, providerThread),
+                   );
+@@ -9667,6 +9710,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
+                     status:
+                       (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId)?.status ??
+                       ("idle" as const),
++                    nativeMetadata: {
++                      ...threadInput.providerThread.nativeMetadata,
++                      ...(yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId)
++                        ?.nativeMetadata,
++                      ...(yield* Ref.get(nativeMetadataBySessionId)).get(sessionId),
++                    },
+                     updatedAt: now,
+                   };
+                 }),
+diff --git a/packages/provider-acp/src/server/externalSession.test.ts b/packages/provider-acp/src/server/externalSession.test.ts
+new file mode 100644
+index 00000000..8448c624
+--- /dev/null
++++ b/packages/provider-acp/src/server/externalSession.test.ts
+@@ -0,0 +1,73 @@
++import { describe, expect, it } from "@effect/vitest";
++import {
++  externalSessionIdentity,
++  externalSessionConnectionRole,
++  externalSessionRuntimeInfo,
++} from "./externalSession.ts";
++
++const identity = {
++  version: 1,
++  engine: "claude-code",
++  connection: { kind: "fleet", host: "worker", transport: "tmux" },
++  model: "model-a",
++  capabilities: {
++    send: true,
++    interrupt: true,
++    respond: false,
++    setModel: false,
++    setPermissionMode: false,
++    terminal: false,
++  },
++};
++
++describe("external session identity boundary", () => {
++  it("uses the native engine and only observed models in runtime instructions", () => {
++    const claude = externalSessionIdentity({ "t3.codes/externalSessionIdentity": identity });
++    expect(externalSessionRuntimeInfo(claude)).toEqual({
++      harness: "Claude Code",
++      model: "model-a",
++    });
++    expect(externalSessionRuntimeInfo({ ...claude!, engine: "codex" })).toEqual({
++      harness: "Codex",
++      model: "model-a",
++    });
++    expect(externalSessionRuntimeInfo(undefined)).toEqual({ harness: "external session" });
++  });
++  it("retains explicit native identity and requires complete boolean capabilities", () => {
++    expect(externalSessionIdentity({ "t3.codes/externalSessionIdentity": identity })).toEqual(
++      identity,
++    );
++    for (const invalid of [
++      { ...identity, version: 2 },
++      { ...identity, engine: "acpRegistry" },
++      { ...identity, engine: "codex" },
++      { ...identity, connection: { ...identity.connection, host: "" } },
++      { ...identity, capabilities: { send: true } },
++      { ...identity, capabilities: { ...identity.capabilities, send: "true" } },
++      { ...identity, model: "" },
++    ])
++      expect(
++        externalSessionIdentity({ "t3.codes/externalSessionIdentity": invalid }),
++      ).toBeUndefined();
++    expect(externalSessionIdentity({ provider: "claude", model: "model-a" })).toBeUndefined();
++  });
++  it("requires explicit negotiated discovery role", () => {
++    expect(
++      externalSessionConnectionRole({
++        "t3.codes/externalSession": { version: 1 },
++        "t3.codes/connectionRole": { version: 1, role: "discovery" },
++      }),
++    ).toBe("discovery");
++    expect(
++      externalSessionConnectionRole({
++        "t3.codes/connectionRole": { version: 1, role: "discovery" },
++      }),
++    ).toBeUndefined();
++    expect(
++      externalSessionConnectionRole({
++        "t3.codes/externalSession": { version: 1 },
++        "t3.codes/connectionRole": { version: 2, role: "discovery" },
++      }),
++    ).toBeUndefined();
++  });
++});
+diff --git a/packages/provider-acp/src/server/externalSession.ts b/packages/provider-acp/src/server/externalSession.ts
+index 7cb57629..e2ea04ad 100644
+--- a/packages/provider-acp/src/server/externalSession.ts
++++ b/packages/provider-acp/src/server/externalSession.ts
+@@ -1,3 +1,45 @@
++import { ExternalSessionIdentity } from "@t3tools/contracts";
++import * as Schema from "effect/Schema";
++
++const isExternalSessionIdentity = Schema.is(ExternalSessionIdentity);
++
++export function externalSessionIdentity(
++  metadata: Readonly<Record<string, unknown>> | null | undefined,
++): ExternalSessionIdentity | undefined {
++  const value = metadata?.["t3.codes/externalSessionIdentity"];
++  return isExternalSessionIdentity(value) &&
++    (value.engine === "codex") === (value.connection.transport === "codex")
++    ? value
++    : undefined;
++}
++
++export function externalSessionRuntimeInfo(identity: ExternalSessionIdentity | undefined) {
++  return {
++    harness:
++      identity?.engine === "claude-code"
++        ? "Claude Code"
++        : identity?.engine === "codex"
++          ? "Codex"
++          : "external session",
++    ...(identity?.model === undefined ? {} : { model: identity.model }),
++  };
++}
++
++export function externalSessionConnectionRole(
++  metadata: Readonly<Record<string, unknown>> | null | undefined,
++) {
++  const value = metadata?.["t3.codes/connectionRole"];
++  return supportsExternalSession(metadata) &&
++    typeof value === "object" &&
++    value !== null &&
++    "version" in value &&
++    value.version === 1 &&
++    "role" in value &&
++    value.role === "discovery"
++    ? ("discovery" as const)
++    : undefined;
++}
++
+ export function supportsExternalSession(
+   metadata: Readonly<Record<string, unknown>> | null | undefined,
+ ) {
+diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
+index a726529c..39390458 100644
+--- a/packages/provider-core/src/server/ProviderAdapter.ts
++++ b/packages/provider-core/src/server/ProviderAdapter.ts
+@@ -95,6 +95,7 @@ export const ProviderAdapterV2Event = Schema.Union([
+   }),
+   Schema.Struct({
+     type: Schema.Literal("provider_thread.updated"),
++    metadataOnly: Schema.optionalKey(Schema.Literal(true)),
+     driver: ProviderDriverKind,
+     providerThread: OrchestrationV2ProviderThread,
+     /** Work remaining at this point in the event stream, including native continuations. */
+-- 
+2.47.3
+

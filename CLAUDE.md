@@ -13,19 +13,34 @@ and installed through the existing service updater; never create a second T3 dep
 Read README "Existing fleet sessions in T3 Code", `patches/t3/README.md`, and
 `docs/testing/fleet-e2e-matrix.md` on demand.
 
+Fleet is a discovery connection. `t3.codes/externalSessionIdentity` v1 carries
+the owner-supplied Claude Code/Codex engine, connection, optional observed model
+and effective capabilities. Keep the existing opaque ACP bindings; never swap
+an imported thread to a native driver that launches another worker. Metadata-only
+events must survive serialization and preserve activity timestamps. New drafts
+exclude discovery connections; existing lazy bindings retain them while loading.
+The management/list handshake must advertise the same versioned capability as
+selected observation; otherwise the bridge intentionally omits catalog identity.
+Session connections uses ProviderSettingsPanel's existing environment selection;
+never gate it on a primary/local backend or add a second selection owner.
+
 Only exact Codex owner rows with the complete ended/read-only contract may
 load archived native history. Preserve native UUID and route binding, cancel
 pending controls on that transition, and keep all actions disabled. Never
 resume a thread for a read or treat an ordinary offline row as empty history.
 
-The five-patch T3 series includes self-hosted Authentik sign-in through the existing
+The eight-patch T3 series includes self-hosted Authentik sign-in through the existing
 EnvironmentAuth/SessionStore, AuthSessionRepository and ServerSecretStore owners.
 Keep `T3CODE_OIDC_REQUIRED=true` with the private config-file path in the existing
 `service.env`; do not trust forwarded identity headers or make legacy pairing a
 remote fallback. Browser refresh secrets remain HttpOnly; native credentials use
 the existing secure stores. Sign-in/renewal wakes the existing primary connection
 supervisor after an auth rejection; preserve that recovery without another socket
-owner. Safari/Home Screen needs only the served web build; stock native clients
+owner. Lost refresh responses reuse a grant/session-bound 60-second receipt in the
+existing private ServerSecretStore; that server store is not encrypted. Desktop
+credentials use Electron safeStorage encryption. Root shell selection follows
+committed route matches while an OIDC callback is pending, preserving Settings'
+sidebar context. Safari/Home Screen needs only the served web build; stock native clients
 need matching app changes for renewable OIDC sign-in.
 Read `docs/self-hosted-t3-auth.md` on demand. Maintain the patch series when updating
 T3; an official binary does not implement these OIDC flags. Do not add a second

@@ -473,3 +473,33 @@ def test_wire_session_becoming_read_only_stops_observation_without_another_actio
             assert [u["messageId"] for u in updates if "messageId" in u] == ["prior", "native-user"]
             assert len(owner["attempts"]) == 1
     asyncio.run(check())
+
+
+@pytest.mark.parametrize(('provider', 'transport', 'engine'), [
+    ('claude', 'native', 'claude-code'), ('codex', 'codex', 'codex'),
+])
+def test_wire_identity_uses_owner_engine_and_preserves_attachment_history(owner, tmp_path, provider, transport, engine):
+    async def check():
+        owner['row'].update(provider=provider, transport=transport, model='owner-model',
+                            capabilities={'send': True, 'interrupt': True, 'set_model': True},
+                            title='Other agent name is not identity')
+        async with connection(owner, tmp_path) as (call, updates, requests):
+            listed = await call('session/list', {})
+            entry = listed['result']['sessions'][0]
+            assert entry['sessionId'] == SID
+            identity = entry['_meta']['t3.codes/externalSessionIdentity']
+            assert identity['engine'] == engine
+            assert identity['connection'] == {'kind': 'fleet', 'host': 'isolated-node', 'transport': transport}
+            assert identity['model'] == 'owner-model'
+            assert identity['capabilities']['send'] is True
+            assert identity['capabilities']['setModel'] is False
+            assert [(u['messageId'], u['content']['text']) for u in updates
+                    if u['sessionUpdate'] == 'agent_message_chunk'] == [('prior', 'Prior history')]
+            owner['row']['model'] = 'owner-model-changed'
+            loaded = await call('session/load', {'sessionId': SID, 'cwd': '/isolated', 'mcpServers': []})
+            updated = loaded['result']['_meta']['t3.codes/externalSessionIdentity']
+            assert updated['engine'] == engine
+            assert updated['model'] == 'owner-model-changed'
+            assert any(u.get('_meta', {}).get('t3.codes/externalSessionIdentity') == updated for u in updates)
+            assert owner['attempts'] == owner['delivered'] == requests == []
+    asyncio.run(check())

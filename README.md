@@ -180,14 +180,24 @@ uv run --script /path/to/cc-proxy/scripts/cc-proxy-acp \
   --token-file /path/to/existing-hq-token
 ```
 
-Use a stable installed copy of the script. In T3 Code's provider settings choose
-**Local ACP command**, set the executable to `uv`, and add the arguments above one
-per row. Choose an existing local project for the fleet conversation views and
+Use a stable installed copy of the script. Configure its **Local ACP command**
+entry with executable `uv` and the arguments above, one per row. The maintained
+build places the negotiated fleet entry under **Settings → Connections**.
+Choose an existing local project for the fleet conversation views and
 set the provider configuration's `autoImportProjectId` to its project ID through
 T3's settings API. The patched server adds discovered sessions to that project's
 sidebar automatically, with a 30-second delay between discovery passes, even with no browser open. It loads history when a
 conversation is selected and preserves archived/deleted views. **List sessions**
 and **Import** remain available for manual selection.
+
+Fleet is a discovery and connection layer, not a model provider. Existing
+conversations show Claude Code or Codex from the native owner, with the observed
+model when available. Configure fleet under **Settings → Connections**; it is
+excluded from new-session provider selection. Discovery enriches existing
+bindings without changing their IDs or activity order; retained history absent
+from discovery is enriched when opened. Unsupported controls stay unavailable.
+Session connections uses the existing environment selector, including saved
+remote servers when the desktop local backend is disabled.
 
 Import binds the existing native session ID; the bridge does not start or resume
 another Claude or Codex process. New blank threads cannot launch fleet agents.
@@ -225,7 +235,7 @@ The bridge keeps standard ACPv1 synchronous prompt completion. These additions
 require explicit client/provider opt-in; older T3 clients can continue a session
 but do not provide the full external-session experience.
 
-The five-patch series' pinned base, build/update procedure and upgrade considerations
+The eight-patch series' pinned base, build/update procedure and upgrade considerations
 are in its README. Actual live evidence and remaining limits are kept separately in the
 [fleet acceptance matrix](docs/testing/fleet-e2e-matrix.md). Text prompts are
 supported; image/file input and provider/model changes are not fleet operations.

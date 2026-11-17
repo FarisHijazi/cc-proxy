@@ -844,7 +844,8 @@ def test_external_session_v1_metadata_is_explicit_and_observed_state_is_not_a_lo
         initialized = await agent.initialize(2, client_capabilities=s.ClientCapabilities.model_validate({
             "_meta": {"t3.codes/externalSession": {"version": 1}}}))
         assert initialized.protocol_version == 1
-        assert initialized.field_meta == {"t3.codes/externalSession": {"version": 1}}
+        assert initialized.field_meta == {"t3.codes/externalSession": {"version": 1},
+                                          "t3.codes/connectionRole": {"version": 1, "role": "discovery"}}
         await agent.load_session("/local/fleet", SID)
         attached = agent.sessions[SID]
         await agent.poll(SID, attached)
@@ -1182,4 +1183,170 @@ def test_archived_history_requires_the_complete_codex_owner_contract(changes):
                 await hq.detail(SID)
         finally:
             await hq.http.aclose()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(('provider', 'transport', 'engine'), [
+    ('claude', 'tmux', 'claude-code'),
+    ('claude', 'native', 'claude-code'),
+    ('codex', 'codex', 'codex'),
+])
+def test_external_identity_discovery_preserves_route_and_uses_owner_engine(provider, transport, engine):
+    async def check():
+        hq = mock_hq(listing=[row(provider=provider, transport=transport, title='Misleading other engine',
+                                 model='gpt-test', account='must-not-be-exposed')])
+        agent = FleetAgent(hq, observe=False)
+        initialized = await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        assert initialized.field_meta['t3.codes/connectionRole'] == {'version': 1, 'role': 'discovery'}
+        response = await agent.list_sessions('/local/fleet')
+        entry = response.sessions[0]
+        assert entry.session_id == SID
+        identity = entry.field_meta['t3.codes/externalSessionIdentity']
+        assert identity['engine'] == engine
+        assert identity['connection'] == {'kind': 'fleet', 'host': 'node-one', 'transport': transport}
+        assert identity['model'] == 'gpt-test'
+        assert 'account' not in identity
+        assert identity['capabilities'] == {
+            'send': transport == 'tmux', 'interrupt': transport == 'tmux', 'respond': False,
+            'setModel': False, 'setPermissionMode': False, 'terminal': False}
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('changes', [
+    {'provider': None}, {'provider': 'unknown'}, {'provider': 'codex', 'transport': 'native'},
+    {'provider': 'claude', 'transport': 'codex'}, {'transport': 'ssh'}, {'host': '\ninvalid'},
+])
+def test_external_identity_never_guesses_unverified_engine_or_connection(changes):
+    async def check():
+        hq = mock_hq(listing=[row(**{'provider': 'claude', **changes})])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        entry = (await agent.list_sessions('/local/fleet')).sessions[0]
+        assert 't3.codes/externalSessionIdentity' not in (entry.field_meta or {})
+        assert entry.session_id == SID
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+def test_external_identity_detail_updates_without_state_change_and_disables_archive_controls():
+    async def check():
+        native_id = '11111111-1111-4111-8111-111111111111'
+        first = row(provider='codex', transport='codex', codex_thread_id=native_id, model='model-one',
+                    capabilities={'send': True, 'interrupt': False, 'respond': False, 'set_model': True})
+        second = {**first, 'model': 'model-two', 'capabilities': {'send': False, 'interrupt': True, 'respond': True}}
+        archive = {**second, 'read_only': True, 'alive': False, 'lifecycle': 'ended'}
+        hq = mock_hq(first, second)
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        loaded = await agent.load_session('/local/fleet', SID)
+        identity = loaded.field_meta['t3.codes/externalSessionIdentity']
+        assert identity['nativeSessionId'] == native_id
+        assert identity['model'] == 'model-one'
+        assert identity['capabilities']['send'] is True
+        assert identity['capabilities']['setModel'] is False
+        await agent.poll(SID, agent.sessions[SID])
+        await agent.emit_state(SID, archive, agent.sessions[SID])
+        updates = [update['_meta'] for _, update in conn.updates if update['sessionUpdate'] == 'session_info_update']
+        identities = [update['t3.codes/externalSessionIdentity'] for update in updates]
+        assert [identity['model'] for identity in identities] == ['model-one', 'model-two', 'model-two']
+        assert updates[0]['t3.codes/externalSessionState'] == updates[1]['t3.codes/externalSessionState']
+        assert identities[1]['capabilities']['interrupt'] is True
+        assert all(value is False for value in identities[2]['capabilities'].values())
+        assert list(agent.sessions) == [SID]
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+def test_external_identity_observation_failure_disables_controls_and_recovery_restores_them():
+    async def check():
+        detail = row(provider='claude', transport='native', claude_session_id='exact-native-owner',
+                     model='model-current', capabilities={'send': True, 'interrupt': True, 'respond': True,
+                                                          'set_model': True, 'set_permission_mode': True})
+        agent = FleetAgent(mock_hq(detail), observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        await agent.resume_session('/local/fleet', SID)
+        attached = agent.sessions[SID]
+        await agent.emit_state(SID, None, attached)
+        await agent.emit_state(SID, detail, attached)
+        identities = [u['_meta']['t3.codes/externalSessionIdentity'] for _, u in conn.updates
+                      if u['sessionUpdate'] == 'session_info_update']
+        assert [i['capabilities']['send'] for i in identities] == [True, False, True]
+        assert all(not i['capabilities']['setModel'] and not i['capabilities']['setPermissionMode']
+                   and not i['capabilities']['terminal'] for i in identities)
+        assert all(i['nativeSessionId'] == 'exact-native-owner' for i in identities)
+    asyncio.run(check())
+
+
+def test_external_identity_does_not_leak_invalid_optional_metadata_or_opt_out_extension():
+    async def check():
+        detail = row(provider='claude', transport='tmux', model={'invalid': 'model'}, claude_session_id='\ninvalid')
+        hq = mock_hq(detail, listing=[detail])
+        agent = FleetAgent(hq, observe=False)
+        conn = client()
+        agent.on_connect(conn)
+        await agent.initialize(1)
+        assert (await agent.list_sessions('/local/fleet')).sessions[0].field_meta is None
+        assert (await agent.load_session('/local/fleet', SID)).field_meta is None
+        assert all(u['sessionUpdate'] != 'session_info_update' for _, u in conn.updates)
+        identity = bridge['external_identity'](detail)
+        assert 'model' not in identity and 'nativeSessionId' not in identity
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('owner_value', [False, 'true', 1])
+def test_external_identity_explicit_owner_denial_overrides_legacy_tmux_support(owner_value):
+    async def check():
+        hq = mock_hq(listing=[row(provider='claude', transport='tmux', menu={'signature': 'pending'},
+                                 capabilities={'send': owner_value, 'interrupt': owner_value, 'respond': owner_value})])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        entry = (await agent.list_sessions('/local/fleet')).sessions[0]
+        capabilities = entry.field_meta['t3.codes/externalSessionIdentity']['capabilities']
+        assert not any(capabilities.values())
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('capabilities', [None, {}, [], 'invalid'])
+def test_external_identity_malformed_owner_capabilities_are_not_legacy_absence(capabilities):
+    async def check():
+        hq = mock_hq(listing=[row(provider='claude', transport='tmux', capabilities=capabilities)])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+        entry = (await agent.list_sessions('/local/fleet')).sessions[0]
+        assert not any(entry.field_meta['t3.codes/externalSessionIdentity']['capabilities'].values())
+        assert hq.actions == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(('field', 'limit', 'output'), [
+    ('host', 256, None), ('model', 256, 'model'), ('claude_session_id', 1024, 'nativeSessionId'),
+])
+def test_external_identity_text_bounds_match_shared_contract(field, limit, output):
+    async def check():
+        for length in (limit, limit + 1):
+            value = 'x' * length
+            hq = mock_hq(listing=[row(provider='claude', transport='tmux', **{field: value})])
+            agent = FleetAgent(hq, observe=False)
+            await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+                '_meta': {'t3.codes/externalSession': {'version': 1}}}))
+            entry = (await agent.list_sessions('/local/fleet')).sessions[0]
+            identity = (entry.field_meta or {}).get('t3.codes/externalSessionIdentity')
+            if output is None:
+                assert (identity is not None) == (length <= limit)
+            else:
+                assert identity is not None
+                assert identity.get(output) == (value if length <= limit else None)
+            assert hq.actions == []
     asyncio.run(check())

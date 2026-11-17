@@ -56,6 +56,44 @@ def available(row):
             and row.get("lifecycle") not in {"ended", "unreachable", "unknown"})
 
 
+def metadata_text(value, limit=256):
+    return value if (isinstance(value, str) and 0 < len(value) <= limit and value.strip() == value
+                     and not any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)) else None
+
+
+def external_identity(row):
+    provider, transport = row.get("provider"), row.get("transport")
+    host = metadata_text(row.get("host_label") or row.get("host"))
+    if not host or (provider, transport) not in (("claude", "tmux"), ("claude", "native"), ("codex", "codex")):
+        return None
+    live = available(row)
+    owner = row.get("capabilities")
+    owner = owner if isinstance(owner, dict) else {}
+    control = row.get("native_control") or {}
+    control = control if isinstance(control, dict) else {}
+    menu = row.get("menu")
+    # The verified-Claude tmux owner predates explicit capability fields.
+    legacy_tmux = transport == "tmux" and "capabilities" not in row
+    send = legacy_tmux or owner.get("send") is True
+    interrupt = legacy_tmux or owner.get("interrupt") is True
+    respond = legacy_tmux and bool(menu) or owner.get("respond") is True
+    result = {"version": 1, "engine": "claude-code" if provider == "claude" else "codex",
+              "connection": {"kind": "fleet", "host": host, "transport": transport},
+              "capabilities": {"send": live and send and not bool(control or menu),
+                  "interrupt": live and interrupt,
+                  "respond": live and respond and control.get("subtype") != "request_user_dialog",
+                  "setModel": False, "setPermissionMode": False, "terminal": False}}
+    for key, source in (("model", "model"), ("nativeSessionId", "codex_thread_id" if provider == "codex" else "claude_session_id")):
+        value = metadata_text(row.get(source), 1024 if key == "nativeSessionId" else 256)
+        if value:
+            result[key] = value
+    return result
+
+
+def identity_meta(identity):
+    return {"t3.codes/externalSessionIdentity": identity} if identity else None
+
+
 def messages(row):
     return [m for m in row.get("messages", []) if m.get("role") in {"user", "assistant"}
             and isinstance(m.get("text"), str) and m["text"]]
@@ -189,6 +227,7 @@ class Attached:
     control_task: asyncio.Task | None = None
     control_key: str | None = None
     state: str | None = None
+    identity: dict | None = None
     history_truncated: bool = False
 
 
@@ -215,7 +254,8 @@ class FleetAgent(Agent):
         self.external_session = (self.client_capabilities.field_meta or {}).get(
             "t3.codes/externalSession") == {"version": 1}
         return s.InitializeResponse(protocol_version=1,
-            field_meta={"t3.codes/externalSession": {"version": 1}},
+            field_meta={"t3.codes/externalSession": {"version": 1},
+                        "t3.codes/connectionRole": {"version": 1, "role": "discovery"}},
             agent_info=s.Implementation(name="cc-proxy-fleet", title="CC fleet", version="0.2.0"),
             agent_capabilities=s.AgentCapabilities.model_validate({"loadSession": True,
                 "sessionCapabilities": {"list": {}, "resume": {}, "close": {}}}), auth_methods=[])
@@ -243,7 +283,8 @@ class FleetAgent(Agent):
             if tmux_session and tmux_session != title:
                 title = f"{tmux_session} — {title}"
             sessions.append(s.SessionInfo(session_id=row["id"], cwd=row.get("workdir") or cwd or "/",
-                                           title=f"[{host} · {transport}] {title}"))
+                                           title=f"[{host} · {transport}] {title}",
+                                           field_meta=identity_meta(external_identity(row)) if self.external_session else None))
         return s.ListSessionsResponse(sessions=sessions,
             next_cursor=selected[-1]["id"] if start + len(selected) < len(rows) else None)
 
@@ -295,11 +336,11 @@ class FleetAgent(Agent):
         await self.emit_state(session_id, row, attached)
         if self.observe:
             attached.observer = asyncio.create_task(self.watch(session_id, attached))
-        return s.ResumeSessionResponse(config_options=CONFIG_OPTIONS)
+        return s.ResumeSessionResponse(config_options=CONFIG_OPTIONS, field_meta=identity_meta(attached.identity))
 
     async def load_session(self, cwd, session_id, **kwargs):
-        await self.resume_session(cwd, session_id, **kwargs)
-        return s.LoadSessionResponse(config_options=CONFIG_OPTIONS)
+        response = await self.resume_session(cwd, session_id, **kwargs)
+        return s.LoadSessionResponse(config_options=CONFIG_OPTIONS, field_meta=response.field_meta)
 
     async def set_config_option(self, config_id, session_id, value, **kwargs):
         if config_id != "model" or value != "attached":
@@ -338,13 +379,17 @@ class FleetAgent(Agent):
                 state = "running"
             elif activity == "idle":
                 state = "idle"
-        if attached.state != state:
+        identity = external_identity(row) if row is not None else None
+        if identity is None and attached.identity is not None:
+            identity = {**attached.identity, "capabilities": {key: False for key in attached.identity["capabilities"]}}
+        if attached.state != state or attached.identity != identity:
             if (attached.state == "idle" and state in {"running", "requires_action"}
                     and attached.cancelled and not attached.pending):
                 attached.cancel_attempted = attached.cancelled = False
             await self.conn.session_update(session_id, s.SessionInfoUpdate(field_meta={
-                "t3.codes/externalSessionState": {"version": 1, "state": state}}))
-            attached.state = state
+                "t3.codes/externalSessionState": {"version": 1, "state": state},
+                **(identity_meta(identity) or {})}))
+            attached.state, attached.identity = state, identity
 
     async def poll(self, session_id, attached):
         if attached.control_task is not None and attached.control_task.done():

@@ -5,13 +5,78 @@ fixture does not establish that a particular Claude/Codex version or T3 UI handl
 the same interaction. The latest candidate must retain source identities and must
 never replace a worker or retry an uncertain write.
 
+## Native engine and connection acceptance (2026-11-17)
+
+The existing Linux service is on `0.1.10-ccfleet.20261117.6`, activated at
+21:08:53 UTC from source `556d84aa10429b8c0d76030e80bad7b6d106d683`. Its 19
+isolated and 12 public protection checks passed again; original bindings/history
+remain preserved. The eight reproducible patches and archive checksum are in
+[the patch README](../../patches/t3/README.md). The native engine checks below
+were performed on .5 at 20:48–20:58 UTC. The only .6 production change is to show
+Session connections on remote-only clients using the existing environment selector;
+its real Chromium regression failed before and passed after the correction.
+Fleet is a discovery connection; each attached conversation carries its validated
+Claude Code or Codex engine, observed model and supported controls. Opaque routing
+bindings remain unchanged. The adapter does not launch replacement native drivers.
+
+| Check | Live evidence |
+| --- | --- |
+| Catalog identity | All 49 advertised routes carried valid native identity: 32 Claude Code and 17 Codex, including all three VMs, Mac and Remote Control routes. These are routes, not a claim of 49 unique processes. |
+| Automatic enrichment | The existing discovery owner populated identities into existing sidebar records; no manual import or database write was used. Historical records absent from the live catalog remain preserved without guessed identities. |
+| Binding/history preservation | All 96 original conversation/provider-thread bindings and message IDs survived; the later 98-record baseline also survived activation. The same source UUIDs and existing run IDs remained. |
+| Ended Codex history | The exact selected archive retained its native message ID and text hash, original binding and zero new runs. All six native action capabilities were false. Its runtime reader is ready with no lastError; external unavailable maps to provider-thread error because the native worker is ended. |
+| Desktop .5 saved sign-in | Installed the signed local build and reopened after its previous access expired. The same native grant refreshed at 20:54:38.956 UTC, reconnected WebSocket at 20:54:39.315 UTC and saved credentials; no new sign-in grant or local backend was created. |
+| Desktop .5 native identity | Actual Providers settings contained Codex, Claude and routed Claude, with fleet excluded. The existing Dev fixture displayed Claude Code and Model unknown because the owner supplied no model. |
+| Desktop .5 continuation | Exactly one prompt through the native composer returned `NATIVE_ENGINE_READY_20261117`. Native transcript contains one user prompt and one assistant reply, with unchanged native UUID and T3 binding. Persisted source IDs/text match byte-for-byte and the session returned idle. Delivered runtime_info correctly identifies the Claude Code harness. |
+| Final adapter regression command | The CI-equivalent ACP/MCP command passed 155 tests with one intentional opt-in live skip; Ruff passed. The actual reserved native continuation above is separate from that skip. |
+| Packaged authentication | 19 isolated checks passed in a fresh home; the tracked child and process group stopped. |
+| Public protection | All 12 public checks passed: UI/current asset redirect to Authentik; API and real WebSocket Upgrade reject anonymous, spoofed identity, forged loopback and invalid bearer requests. Auth metadata remains public and no-store. |
+| Activation scope | Existing service updated through the official installer/service owner. Its cgroup contained three service processes and zero protected Claude/Codex workers. ACP activation changed only the existing instance command path; verification sent zero native actions and revoked its temporary local credential. |
+
+Live testing first caught missing catalog capability negotiation: selected-session
+loads requested native metadata, while management listings did not. The seventh
+patch fixes the existing management handshake; its real JSON-RPC regression failed
+before and passed afterward, including malformed metadata rejection and absence
+of session load/start calls. Both failed activation attempts were rolled back and
+retained privately before the successful .5 activation.
+
+The same live work caught a lost native refresh response at 20:11 UTC, before .4
+activation. A retry after the old five-second cache expired revoked the device
+grant. The .5 owner keeps one exact, committed-successor receipt for 60 seconds in
+the existing private SecretStore. Failing-before regressions cover response loss
+after the client deadline, owner restart, expired replay and revocation. The full
+focused auth suite passed 50 tests. A real desktop callback also exposed a
+transient sidebar-provider crash while Settings remained mounted; a real Chromium
+test reproduced it and passed after root layout selection followed committed route
+matches. These regressions do not substitute for native client acceptance.
+
+Metadata-only discovery did not reorder conversations. One selected archive's
+activity timestamp changed during the verification because its existing attach
+path emits a fresh historyLoaded event. Earlier server-start recovery also updated
+two activity times without changing messages/runs. Those attachment/recovery
+behaviors are distinct from identity enrichment and remain unchanged.
+
+All six HQ readers moved to 0.9.7 using their existing service owners; ftower MCP
+remained 0.9.5. Reader activation checks preserved 55 protected process identities
+and 52 tmux panes. A later broad T3 census found two departed process identities;
+one observed replacement was a search helper, and the old exits cannot both be
+attributed conclusively. No native shutdown/input action was sent by this rollout;
+do not claim every process in that long-lived census survived.
+
+Private Dev evidence: `t3-identity-acp-live-proof-20261117.json`,
+`t3-identity-preservation-20261117.json`,
+`t3-identity5-metadata-preservation-20261117.json`,
+`t3-identity-public-auth-20261117-5.json`, and the isolated .5 report under
+`~/.local/state/cc-proxy/t3-external-identity-20261117/`. These observations are
+separate from the earlier dated continuation, control and iPhone checks below.
+
 ## Self-hosted Authentik acceptance (2026-11-17)
 
-The existing service is active on `0.1.10-ccfleet.20261117.3`, source
+At the earlier authentication stage, the existing service ran `0.1.10-ccfleet.20261117.3`, source
 `da4e1eb262edb862fc08328431b9f2b0a403183a`; systemd reports activation at
 18:51:14 UTC. The required OIDC configuration and port remain in the existing
-`service.env`. The five maintained patches and archive checksum are recorded in
-[the patch README](../../patches/t3/README.md).
+`service.env`. That stage used the first five patches; the current maintained series and archive
+checksum are recorded in [the patch README](../../patches/t3/README.md).
 
 The first real browser attempt on `.2` exposed a failure that negative auth tests
 had not found: Authentik sign-in and HTTP sidebar loading succeeded, but opening a
@@ -46,7 +111,7 @@ control or every client surface.
 | Native composer continuation | One prompt to the reserved Dev toy produced exact assistant marker `DESKTOP_AUTH_READY_20261117` and returned idle around 19:06 UTC. All 11 Dev baseline workers retained their original PID/birth identities afterward. No ordinary user conversation received test input. |
 | Cross-device history | The existing Chrome login, without reload, displayed exact `DESKTOP_AUTH_READY_20261117` from the native desktop prompt in the same Dev fixture. |
 | Active Mac root | Actual Chrome opened native Codex root `01a1e076…`, matched the verified active root identity and displayed current conversation content without a syncing or auth error. No input was sent to that live root. |
-| Ended Mac history | Mac HQ 0.9.6 and the updated ACP adapter loaded the exact ended diagnostic subagent’s saved message through the existing native reader. Chrome displayed that history without a syncing state. Native UUID remained `notLoaded`, current root remained active, and T3 run IDs stayed empty. The backend rejects every send/control; the current T3 UI still permits an unsent draft and can enable Submit. The verification draft was cleared without submission. |
+| Ended Mac history | Mac HQ 0.9.6 and the updated ACP adapter loaded the exact ended diagnostic subagent’s saved message through the existing native reader. Chrome displayed that history without a syncing state. Native UUID remained `notLoaded`, current root remained active, and T3 run IDs stayed empty. The backend rejects every send/control; the .3 T3 UI still permitted an unsent draft and could enable Submit. The .4 identity UI subsequently disabled submission for this exact ended session. The verification draft was cleared without submission. |
 | iPhone Safari | User completed Authentik sign-in on their iPhone and confirmed that existing VM conversations open. This is user-observed physical-device acceptance, not automation. Home Screen installation and stock native mobile OIDC are not claimed. |
 | Worker identity audit at 18:55 UTC | One baseline PID differed; the corresponding route is an HQ scheduled routine. Journal records its existing reaper at 18:25:01 UTC and next scheduled spawn at 18:40:02 UTC, both before `.3` activation. The other 11 workers on that VM retained exact PID/birth identities. |
 
@@ -72,7 +137,7 @@ Besides the known scheduled routine, its oncall conversation resumed the same
 UUID through the existing account router in a new process and remained busy.
 The initiator is not known. A separate task process had ended without a replacement;
 its exit cause is unknown. Both owner services on that VM retained their prior
-PIDs/start times and zero restarts. This work performed no service or worker action
+PIDs/start times and zero restarts. That authentication stage performed no service or worker action
 on that VM, and the audit did not restart anything. Do not equate a long-lived
 census difference with a deployment-caused termination. Detailed identity evidence
 remains private under `~/.codex/tmp/fleet-mcp/` on Mac.
@@ -137,7 +202,7 @@ Evidence: `t3-auto-discovery-real-new-session-20261117.json`. The test also expo
 a separate Remote Control alias for the same conversation and slow fleet listing;
 those observations are distinct from the passing automatic-discovery assertion.
 
-## Current candidate checks
+## Earlier protocol regression baseline
 
 `tests/account_acp_test.py`, `tests/account_acp_transport_test.py`, and
 `tests/fleet_acp_live_test.py`: **87 passed, 1 skipped; live acceptance is opt-in**.
