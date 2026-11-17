@@ -18,12 +18,24 @@ static ALIAS_TARGETS: once_cell::sync::Lazy<HashMap<&'static str, &'static str>>
         m.insert("fable", KIMI_DEFAULT_MODEL);
         m.insert("claude-fable-5", KIMI_DEFAULT_MODEL);
         m.insert("kimi-for-coding", KIMI_DEFAULT_MODEL);
+        for upstream in ALLOWED_MODELS {
+            m.insert(upstream, upstream);
+        }
         m.insert("kimi-k3", "k3");
-        m.insert("k3", "k3");
+        m.insert("kimi-k3-256k", "k3-256k");
+        m.insert("kimi-k3.1-pro", "k3.1-pro");
+        m.insert("kimi-k3.1-pro-highspeed", "k3.1-pro-highspeed");
         m
     });
 
-const ALLOWED_MODELS: &[&str] = &["kimi-for-coding", "k3"];
+const ALLOWED_MODELS: &[&str] = &[
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+    "k3",
+    "k3-256k",
+    "k3.1-pro",
+    "k3.1-pro-highspeed",
+];
 
 pub fn resolve_model(model: &str) -> String {
     ALIAS_TARGETS
@@ -34,7 +46,7 @@ pub fn resolve_model(model: &str) -> String {
 }
 
 pub fn is_k3(model: &str) -> bool {
-    model == "k3"
+    model.starts_with("k3")
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
@@ -104,6 +116,15 @@ mod tests {
     #[test]
     fn resolve_k3_to_k3() {
         assert_eq!(resolve_model("k3"), "k3");
+    }
+
+    #[test]
+    fn resolve_k3_1_models() {
+        assert_eq!(resolve_model("kimi-k3.1-pro"), "k3.1-pro");
+        assert_eq!(resolve_model("k3.1-pro-highspeed"), "k3.1-pro-highspeed");
+        assert_eq!(resolve_model("kimi-for-coding-highspeed"), "kimi-for-coding-highspeed");
+        assert!(is_k3("k3.1-pro"));
+        assert!(assert_allowed_model("k3.1-pro").is_ok());
     }
 
     #[test]

@@ -73,6 +73,9 @@ any of the three.
    by both new backends, as is `anthropic::accumulate_response` (SSE -> one
    Messages JSON), which every streaming backend needs for its non-streaming
    path.
+   Kimi model names live in `providers/kimi/translate/model_allowlist.rs` (aliases + upstream allowlist) and
+   `registry.rs` `KIMI_MODELS`; every `k3*` model takes the k3 request shape. A kimi.ai account needs
+   `CCP_KIMI_OAUTH_HOST=https://auth.kimi.ai` and `CCP_KIMI_BASE_URL=https://api.kimi.ai/coding/v1`.
 7. **`cursor-cli` follows the caller, and `--workspace` is not a sandbox.**
    An Anthropic request carries no working directory, so
    `cursor_cli::workspace` reads it out of the environment block Claude Code
@@ -164,7 +167,8 @@ RC owner rather than rewriting usage percentages. Live TUI and regression eviden
 Model access differs across Claude accounts: `fallback.on.model_unavailable` defaults to true and
 tries the same requested model on the next account after a 404. A model rejection never disables
 that account or creates a cooldown; quota/auth errors take precedence over model-not-found errors.
-Cursor CLI discovery advertises signed-in CLI models as `cursor-cli:<id>`; the legacy `cursor-agent`
+Cursor CLI discovery advertises signed-in CLI models as `cursor-cli:<id>`, one row per model (`listed_models` in
+`src/providers/cursor_cli/models.rs`: no `-fast`, highest effort, thinking variant); the legacy `cursor-agent`
 id remains a Cursor API alias. See `docs/devlog/claude_20261028-model-access-and-cursor-cli.md` (plain path).
 
 Quota fallback: `account_inject` (the credential owner) attaches every usable login,

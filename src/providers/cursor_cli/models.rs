@@ -284,15 +284,91 @@ pub fn supported_models() -> Vec<String> {
 /// backend. Plan and write variants still route by prefix but are not listed,
 /// so the menu offers each Cursor model once and never a file-editing agent.
 pub fn discovered_model_ids() -> Vec<String> {
-    discover_models()
+    listed_models(&discover_models())
         .into_iter()
         .map(|model| format!("cursor-cli:{model}"))
         .collect()
 }
 
+/// Effort suffixes, most preferred first. A bare id ranks after `medium`.
+const EFFORT_PREFERENCE: &[&str] = &["xhigh", "extra-high", "max", "high", "medium", "low", "minimal", "none"];
+const BARE_RANK: usize = 5;
+
+/// Drops `-fast` variants and lists each model once: its highest effort, the
+/// thinking variant when there is one. Every id still routes; only the menu is
+/// shorter.
+pub fn listed_models(models: &[String]) -> Vec<String> {
+    let key = |id: &str| -> (String, (usize, bool)) {
+        let thinking = id.contains("-thinking");
+        let plain = id.replace("-thinking", "");
+        for (rank, effort) in EFFORT_PREFERENCE.iter().enumerate() {
+            if let Some(base) = plain.strip_suffix(&format!("-{effort}")) {
+                return (base.to_string(), (rank, !thinking));
+            }
+        }
+        (plain, (BARE_RANK, !thinking))
+    };
+    let mut best: Vec<(String, (usize, bool), String)> = Vec::new();
+    for id in models.iter().filter(|id| !id.ends_with("-fast")) {
+        let (base, rank) = key(id);
+        match best.iter_mut().find(|(b, _, _)| *b == base) {
+            Some(entry) if rank < entry.1 => {
+                entry.1 = rank;
+                entry.2 = id.clone();
+            }
+            Some(_) => {}
+            None => best.push((base, rank, id.clone())),
+        }
+    }
+    best.into_iter().map(|(_, _, id)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_keeps_one_effort_per_model_and_no_fast_variants() {
+        let ids: Vec<String> = [
+            "auto",
+            "gpt-5.3-codex-low",
+            "gpt-5.3-codex-low-fast",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-high",
+            "gpt-5.3-codex-xhigh",
+            "gpt-5.3-codex-xhigh-fast",
+            "claude-opus-5-5-high",
+            "claude-opus-5-5-max",
+            "claude-opus-5-thinking-high",
+            "composer-2.5",
+            "composer-2.5-fast",
+            "grok-4.7-medium",
+            "grok-4.7-low",
+            "gpt-5.5-none",
+            "gpt-5.5-extra-high",
+            "muse-1.0-minimal",
+            "claude-4.6-opus-max",
+            "claude-4.6-opus-max-thinking",
+            "claude-4.6-opus-high-thinking",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            listed_models(&ids),
+            [
+                "auto",
+                "gpt-5.3-codex-xhigh",
+                "claude-opus-5-5-max",
+                "claude-opus-5-thinking-high",
+                "composer-2.5",
+                "grok-4.7-medium",
+                "gpt-5.5-extra-high",
+                "muse-1.0-minimal",
+                "claude-4.6-opus-max-thinking",
+            ]
+        );
+    }
 
     #[test]
     fn bare_id_defaults_to_read_only_ask() {

@@ -931,8 +931,10 @@ The model id carries the execution mode:
 | `cursor-cli-agent:<model>` | full agent | **yes**, and it is off by default |
 
 `<model>` is any id `cursor-agent --list-models` prints, e.g.
-`/model cursor-cli:claude-opus-5-5-high`. `/v1/models` lists every model the
-signed-in CLI offers as `cursor-cli:<model>` (read-only ask mode), refreshed
+`/model cursor-cli:claude-opus-5-5-high`. `/v1/models` lists each model the
+signed-in CLI offers once, as `cursor-cli:<model>` (read-only ask mode): `-fast`
+variants are dropped, and of a model's effort levels only the highest is listed
+(`xhigh` first), preferring its thinking variant. Every id still routes. Refreshed
 from `--list-models` at most every 10 minutes. A failed lookup is retried after
 30 seconds; `claude-codex cursor-cli auth status` also prints the full CLI list.
 The plan and write prefixes route the same ids but are not listed. `cursor-agent` and

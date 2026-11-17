@@ -38,7 +38,20 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
     "composer-2.5-fast",
 ];
 
-pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
+pub(crate) const KIMI_MODELS: &[&str] = &[
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+    "kimi-k2.6",
+    "kimi-k3",
+    "kimi-k3-256k",
+    "kimi-k3.1-pro",
+    "kimi-k3.1-pro-highspeed",
+    "k2.6",
+    "k3",
+    "k3-256k",
+    "k3.1-pro",
+    "k3.1-pro-highspeed",
+];
 pub(crate) use crate::providers::gemini::models::GEMINI_MODELS;
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
