@@ -1,10 +1,8 @@
-"""Remote Control links for proxy sessions: the session's page on HQ (cchq) and its claude.ai mirror.
+"""Remote Control links for proxy sessions: HQ and its claude.ai mirror.
 
-HQ lists the native Remote Control sessions it hosts with their claude.ai mirror URL, but Remote
-Control traffic never names the Claude Code session: the CLI replaces the session id with the
-Remote Control id. What both share is the reply: a worker event relays an assistant message with
-the `msg_…` id of the model reply that the traffic database recorded for the session moments earlier.
-A link, once found, never changes, so it is kept; an unmatched session is retried after RETRY_S.
+HQ's canonical Claude UUID is authoritative when present. Older native owners
+expose only a cse route; those retain the existing exact assistant-message ID
+correlation against recorded proxy traffic, with bounded retry of misses.
 """
 
 import json
@@ -17,15 +15,29 @@ import zlib
 RC_PREFIX = "https://api.anthropic.com/v1/code/sessions/"
 EVENTS_SUFFIX = "/worker/events"
 EVENT_FLOWS, REPLY_WINDOW_S, RETRY_S = 40, 180, 300
+CLAUDE_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 MESSAGE_ID = re.compile(rb'"id":\s*"(msg_[A-Za-z0-9_]+)"')
 
 
 def hub_sessions(hub_url, timeout=5):
-    """HQ's native sessions, each {"id", "cse", "claude_url"}."""
+    """HQ native routes, preserving their optional authoritative Claude UUID."""
     with urllib.request.urlopen(f"{hub_url.rstrip('/')}/api/sessions", timeout=timeout) as r:
         rows = json.loads(r.read()).get("sessions") or []
-    return [{"id": s["id"], "cse": s["claude_session_id"], "claude_url": (s.get("upstream") or {}).get("session_url")}
-            for s in rows if s.get("transport") == "native" and str(s.get("claude_session_id", "")).startswith("cse_")]
+    result = []
+    for row in rows:
+        if row.get("transport") != "native":
+            continue
+        identity = row.get("claude_session_id")
+        cse = row.get("session")
+        if not isinstance(cse, str) or not cse.startswith("cse_"):
+            cse = identity  # Older HQ snapshots carried the wire ID in this field.
+        if not isinstance(cse, str) or not cse.startswith("cse_"):
+            continue
+        canonical = identity if isinstance(identity, str) and CLAUDE_UUID.fullmatch(identity) else None
+        result.append({"id": row["id"], "cse": cse,
+                       "claude_url": (row.get("upstream") or {}).get("session_url"),
+                       "claude_session_id": canonical})
+    return result
 
 
 def _body(blob):
@@ -70,6 +82,13 @@ class RemoteLinks:
     def __call__(self, db, days):
         hub = hub_sessions(self.hub_url)
         now = time.time()
+        for session in hub:
+            canonical = session.get("claude_session_id")
+            if canonical:
+                # A native route can change conversation on /resume or /clear.
+                # Its current owner binding supersedes a previously cached reply match.
+                self.owners[session["cse"]] = canonical
+                self.misses.pop(session["cse"], None)
         wanted = {s["cse"] for s in hub if s["cse"] not in self.owners and now - self.misses.get(s["cse"], 0) >= RETRY_S}
         flows, newest = {}, {}
         for flow_id, url, started in db.execute(

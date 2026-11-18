@@ -84,3 +84,39 @@ def test_hq_failure_keeps_the_sessions_and_says_why(tmp_path):
         raise OSError("connection refused, token=secret")
     board.links = down
     assert board.remote_links(database()) == ({}, "cchq unreachable: OSError"), "no exception text reaches the page"
+
+
+def test_hub_native_route_survives_canonical_uuid_binding(monkeypatch):
+    import io
+    rows = [
+        {"id": "opaque-bound", "transport": "native", "session": "cse_bound", "claude_session_id": ONE,
+         "upstream": {"session_url": "https://claude.ai/code/bound"}},
+        {"id": "opaque-legacy", "transport": "native", "claude_session_id": "cse_legacy"},
+        {"id": "not-native", "transport": "tmux", "session": "cse_other", "claude_session_id": TWO},
+        {"id": "invalid-route", "transport": "native", "session": "other", "claude_session_id": TWO},
+    ]
+    urlopen = links_module["hub_sessions"].__globals__["urllib"].request
+    monkeypatch.setattr(urlopen, "urlopen", lambda *args, **kwargs: io.BytesIO(json.dumps({"sessions": rows}).encode()))
+    found = links_module["hub_sessions"]("http://hq.test")
+    assert found == [
+        {"id": "opaque-bound", "cse": "cse_bound", "claude_url": "https://claude.ai/code/bound", "claude_session_id": ONE},
+        {"id": "opaque-legacy", "cse": "cse_legacy", "claude_url": None, "claude_session_id": None},
+    ]
+
+
+def test_canonical_binding_links_without_a_recorded_reply_and_updates_cached_owner(monkeypatch):
+    current = ONE
+    def bound_hub(*args, **kwargs):
+        return [{"id": "opaque", "cse": "cse_bound", "claude_url": None, "claude_session_id": current}]
+    scope = RemoteLinks.__call__.__globals__
+    monkeypatch.setitem(scope, "hub_sessions", bound_hub)
+    monkeypatch.setitem(scope, "owner", lambda *args: (_ for _ in ()).throw(AssertionError("canonical identity must not infer from replies")))
+    links = RemoteLinks("http://hq.test", "https://hq")
+    links.misses["cse_bound"] = time.time()
+    links.owners["cse_bound"] = "stale-cached-owner"
+    db = database()
+    assert links(db, 7) == {ONE: {"cchq": "https://hq/#session=opaque", "claude": None}}
+    assert links.misses == {}
+    current = TWO
+    assert links(db, 7) == {TWO: {"cchq": "https://hq/#session=opaque", "claude": None}}
+    assert links.owners == {"cse_bound": TWO}
