@@ -13,29 +13,83 @@ function batch(sent: Body[], index = 0) {
 }
 
 function setup(on: On, response?: (body: Body, count: number) => number | Promise<number>, identity = () => sessionId,
-  publisher = () => ({ pid: 1234, sessionId: identity(), bridgeSessionId: 'session_' + 'a'.repeat(32) })) {
+  publisher = () => ({ pid: 1234, sessionId: identity(), bridgeSessionId: 'session_' + 'a'.repeat(32) }),
+  environment: Record<string, string> = {}) {
   const clock = mock.clock(on)
   const sent: Body[] = []
+  const reads: string[] = []
+  const headers: unknown[] = []
   mock.env(on, {
     CC_PROXY_SESSION_EVENTS_URL: 'http://127.0.0.1:9000/v1/code/sessions/mod-events',
     CC_PROXY_SESSION_EVENTS_KEY_FILE: '/private/toy-key',
     CLAUDE_CONFIG_DIR: '/private/profile',
+    ...environment,
   })
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: identity() }))
   on('process.hookEnv', () => ({ value: { CLAUDE_PID: '1234' } }))
-  on('fs.read', (_$, e) => ({ value: e.path === '/private/toy-key' ? 'toy-key-with-more-than-thirty-two-bytes' :
-    JSON.stringify(publisher()) }))
+  on('fs.read', (_$, e) => {
+    reads.push(e.path)
+    return { value: e.path === '/private/toy-key' ? 'toy-key-with-more-than-thirty-two-bytes' : JSON.stringify(publisher()) }
+  })
   on('http.fetch', async (_$, e) => {
+    headers.push(e.init?.headers)
     const body = JSON.parse(String(e.init?.body)) as Body
     sent.push(body)
     const status = await (response?.(body, sent.length) ?? 200)
     return { value: { status, ok: status === 200, headers: {}, text: JSON.stringify({
       claude_session_id: body.claude_session_id, session_id: body.native_session_id }) } }
   })
-  return { clock, sent }
+  return { clock, sent, reads, headers }
 }
+
+test('proxy transport publishes through the reserved endpoint without reading or sending a credential', async ($, on) => {
+  const { clock, sent, reads, headers } = setup(on, undefined, undefined, undefined, {
+    CC_PROXY_SESSION_EVENTS_URL: 'https://session-events.cc-proxy.invalid/v1/code/sessions/mod-events',
+    CC_PROXY_SESSION_EVENTS_KEY_FILE: '',
+  })
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start(start)
+  await $.tool.call({ tool: 'Bash', command: 'printf toy' })
+  await clock.advance(500)
+  expect(sent.length).toBe(1)
+  expect(reads).toEqual(['/private/profile/sessions/1234.json'])
+  expect(headers).toEqual([{ 'content-type': 'application/json' }])
+})
+
+test('a direct HQ endpoint still uses only its configured native credential', async ($, on) => {
+  const { clock, headers } = setup(on)
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start(start)
+  await $.tool.call({ tool: 'Bash', command: 'printf toy' })
+  await clock.advance(500)
+  expect(headers).toEqual([{ 'content-type': 'application/json', 'x-hq-native-key': 'toy-key-with-more-than-thirty-two-bytes' }])
+})
+
+test('a reserved proxy endpoint cannot receive a configured HQ credential', async ($, on) => {
+  const { clock, sent, reads } = setup(on, undefined, undefined, undefined, {
+    CC_PROXY_SESSION_EVENTS_URL: 'https://session-events.cc-proxy.invalid/v1/code/sessions/mod-events',
+  })
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start(start)
+  expect(await $.tool.call({ tool: 'Bash', command: 'printf toy' })).toEqual({ result: 'ok' })
+  await clock.advance(500)
+  expect(sent).toEqual([])
+  expect(reads).toEqual([])
+})
+
+test('keyless mode rejects endpoints outside the exact reserved proxy address', async ($, on) => {
+  const { clock, sent } = setup(on, undefined, undefined, undefined, {
+    CC_PROXY_SESSION_EVENTS_URL: 'https://session-events.cc-proxy.invalid:8443/v1/code/sessions/mod-events',
+    CC_PROXY_SESSION_EVENTS_KEY_FILE: '',
+  })
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start(start)
+  await $.tool.call({ tool: 'Bash', command: 'printf toy' })
+  await clock.advance(500)
+  expect(sent).toEqual([])
+})
 
 test('observes a tool once without changing input, result, or permissions', async ($, on) => {
   const { clock, sent } = setup(on)
