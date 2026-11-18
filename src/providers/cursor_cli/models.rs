@@ -291,7 +291,16 @@ pub fn discovered_model_ids() -> Vec<String> {
 }
 
 /// Effort suffixes, most preferred first. A bare id ranks after `medium`.
-const EFFORT_PREFERENCE: &[&str] = &["xhigh", "extra-high", "max", "high", "medium", "low", "minimal", "none"];
+const EFFORT_PREFERENCE: &[&str] = &[
+    "xhigh",
+    "extra-high",
+    "max",
+    "high",
+    "medium",
+    "low",
+    "minimal",
+    "none",
+];
 const BARE_RANK: usize = 5;
 
 /// Drops `-fast` variants and lists each model once: its highest effort, the

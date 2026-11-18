@@ -39,7 +39,11 @@ jobs:
           --with httpx==0.28.1 --with httpx2==2.16.0 --with pytest
           pytest -q tests/account_acp_test.py tests/account_acp_transport_test.py
           tests/fleet_acp_live_test.py tests/account_mcp_relay_test.py
-          tests/session_client_test.py tests/account_remote_links_test.py
+          tests/session_client_test.py
+      - name: Test native session links in the proxy dependency environment
+        run: >-
+          uv run --no-project --with mitmproxy==12.2.1 --with pytest
+          pytest -q tests/account_remote_links_test.py
       - name: Lint fleet adapters
         run: >-
           uvx ruff check scripts/cc-proxy-acp scripts/account_mcp_relay.py

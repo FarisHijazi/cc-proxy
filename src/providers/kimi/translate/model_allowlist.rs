@@ -122,7 +122,10 @@ mod tests {
     fn resolve_k3_1_models() {
         assert_eq!(resolve_model("kimi-k3.1-pro"), "k3.1-pro");
         assert_eq!(resolve_model("k3.1-pro-highspeed"), "k3.1-pro-highspeed");
-        assert_eq!(resolve_model("kimi-for-coding-highspeed"), "kimi-for-coding-highspeed");
+        assert_eq!(
+            resolve_model("kimi-for-coding-highspeed"),
+            "kimi-for-coding-highspeed"
+        );
         assert!(is_k3("k3.1-pro"));
         assert!(assert_allowed_model("k3.1-pro").is_ok());
     }

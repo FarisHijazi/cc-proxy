@@ -31,14 +31,17 @@ and terminal input ran in the same Claude PID and process birth throughout:
 - On the final source, `/clear` changed the conversation UUID while retaining
   the original process and bridge. HQ bound the new UUID automatically, and one
   fresh SDK prompt received its exact reply with native and Mod completion.
+- A second clear exposed cached old messages under the new UUID. The final HQ
+  fix passed another live clear: zero messages before prompting, then exactly
+  the new user/assistant pair. The process, bridge and observer cursor survived.
 - All 32 observer long polls succeeded; the excess read returned 503. An ordinary
   detail read still returned 200 in 5 ms. Anonymous API/native launch requests
   returned 401, and all eight original Dev terminal panes retained identity.
 
 Regression checks: 170 SDK/ACP/link tests; 17 official Mod tests and exact-version
 TypeScript declarations; 69 launcher/router tests with two existing optional
-skips. The HQ full suite passed 566 tests before its final action-fence change;
-all 95 affected native/observer tests passed after that change. Independent
+skips. The HQ full suite passed 566 tests before its final identity/history fixes;
+all 100 affected native/observer tests passed after those changes. Independent
 reviews covered receipt identity, uncertain writes, UUID rotation, delayed tool
 results, cancellation, long-poll isolation and wheel contents.
 
