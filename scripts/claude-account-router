@@ -17,8 +17,8 @@ import sys
 import tempfile
 import time
 import urllib.request
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 
@@ -58,13 +58,15 @@ def proxy_command(
         "--set",
         f"confdir={state / 'ca'}",
         "--allow-hosts",
-        r"^api\.anthropic\.com:443$",
+        r"^(api\.anthropic\.com|session-events\.cc-proxy\.invalid):443$",
         "--set",
         "connection_strategy=lazy",
         "--set",
         "upstream_cert=false",
         "--scripts",
         str(Path(__file__).resolve().with_name("account_router_stream.py")),
+        "--scripts",
+        str(Path(__file__).resolve().with_name("account_remote_route.py")),
         "--set",
         "flow_detail=0",
         "--set",
@@ -74,7 +76,7 @@ def proxy_command(
     ]
     if chrome_manifest:
         command[command.index("--allow-hosts") + 1] = (
-            r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com):443$"
+            r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com|session-events\.cc-proxy\.invalid):443$"
         )
         command += [
             "--scripts",
@@ -130,7 +132,7 @@ def bootstrap_login(source, destination, secure_storage, source_secure_storage=N
 
 
 # Identity and per-account server caches (feature flags, plan, model access).
-ACCOUNT_SCOPED = re.compile(r"^oauthAccount$|cache|subscription|tier|^s1m|penguin", re.I)
+ACCOUNT_SCOPED = re.compile(r"^oauthAccount$|cache|subscription|tier|^s1m|penguin", re.IGNORECASE)
 
 
 def update_account_metadata(path, source):
@@ -494,7 +496,7 @@ def take_settings(forwarded):
         text = value if value.lstrip().startswith("{") else Path(value).expanduser().read_text()
         loaded = json.loads(text)
         if not isinstance(loaded, dict) or not isinstance(loaded.get("env", {}), dict):
-            raise ValueError("--settings must be a JSON object")
+            raise ValueError("--settings must be a JSON object")  # noqa: TRY004 - preserve the CLI's ValueError handling.
         extra = {**extra, **loaded, "env": {**extra.get("env", {}), **loaded.get("env", {})}}
     return rest, extra
 
@@ -623,8 +625,6 @@ def wait_listener(process, port, log_path, certificate=None, host="127.0.0.1"):
 def hq_remote_route(args, state):
     """mitmdump arguments sending this proxy's native Remote Control sessions to HQ."""
     return [
-        "--scripts",
-        str(Path(__file__).resolve().with_name("account_remote_route.py")),
         "--set",
         "hq_remote_origin=" + args.remote_control_backend,
         "--set",
@@ -651,7 +651,7 @@ def serve(args, state):
     )
     # Native Chrome's bridge carries the login in its connect frame.
     command[command.index("--allow-hosts") + 1] = (
-        r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com):443$"
+        r"^(api\.anthropic\.com|bridge\.claudeusercontent\.com|session-events\.cc-proxy\.invalid):443$"
     )
     command += [
         "--scripts",
@@ -852,25 +852,34 @@ def session_mod(config, forwarded, env):
     env.pop("CC_PROXY_SESSION_EVENTS_KEY_FILE", None)
     if config in (None, False):
         return forwarded
-    if not isinstance(config, dict) or set(config) != {"url", "key_file"}:
-        raise ValueError("session_mod needs only url and key_file")
-    origin = urlsplit(config["url"])
-    if (origin.scheme not in {"https", "http"} or not origin.hostname
-            or origin.username or origin.password or origin.query or origin.fragment
-            or origin.path not in {"", "/"}
-            or (origin.scheme == "http" and origin.hostname not in {"localhost", "127.0.0.1", "::1"})):
-        raise ValueError("session_mod.url must be an HTTPS or loopback HTTP HQ origin")
-    key = Path(config["key_file"]).expanduser().resolve()
-    if not key.is_file() or key.stat().st_mode & 0o077:
-        raise ValueError("session_mod.key_file must be a private existing native launch key file")
+    options = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded
     if any(arg in {"-p", "--print", "--bare", "--safe-mode", "--no-remote-control"} or
-           arg.startswith("--print=") for arg in forwarded):
-        raise ValueError("session_mod needs interactive Claude with native Remote Control and plugins enabled")
+           arg.startswith("--print=") for arg in options):
+        return forwarded
+    if config is True:
+        if not env.get("HTTPS_PROXY"):
+            raise ValueError("session_mod=true needs the launcher's existing HTTPS proxy")
+        endpoint = "https://session-events.cc-proxy.invalid/v1/code/sessions/mod-events"
+        key = None
+    else:
+        if not isinstance(config, dict) or set(config) != {"url", "key_file"}:
+            raise ValueError("session_mod needs true, or only url and key_file")
+        origin = urlsplit(config["url"])
+        if (origin.scheme not in {"https", "http"} or not origin.hostname
+                or origin.username or origin.password or origin.query or origin.fragment
+                or origin.path not in {"", "/"}
+                or (origin.scheme == "http" and origin.hostname not in {"localhost", "127.0.0.1", "::1"})):
+            raise ValueError("session_mod.url must be an HTTPS or loopback HTTP HQ origin")
+        key = Path(config["key_file"]).expanduser().resolve()
+        if not key.is_file() or key.stat().st_mode & 0o077:
+            raise ValueError("session_mod.key_file must be a private existing native launch key file")
+        endpoint = config["url"].rstrip("/") + "/v1/code/sessions/mod-events"
     plugin = Path(__file__).resolve().parent / "session-mod"
     if not (plugin / ".claude-plugin/plugin.json").is_file():
         raise ValueError("cc-proxy session Mod is missing from this installation")
-    env["CC_PROXY_SESSION_EVENTS_URL"] = config["url"].rstrip("/") + "/v1/code/sessions/mod-events"
-    env["CC_PROXY_SESSION_EVENTS_KEY_FILE"] = str(key)
+    env["CC_PROXY_SESSION_EVENTS_URL"] = endpoint
+    if key is not None:
+        env["CC_PROXY_SESSION_EVENTS_KEY_FILE"] = str(key)
     forwarded = with_flags(forwarded, "--plugin-dir", str(plugin))
     if "--remote-control" not in forwarded:
         forwarded = with_flags(forwarded, "--remote-control")

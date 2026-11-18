@@ -9,20 +9,24 @@ Configure `session_mod` once in the launcher's existing private accounts file:
 
 ```json
 {
-  "session_mod": {
-    "url": "http://127.0.0.1:8389",
-    "key_file": "/private/path/to/existing-native-launch-key"
-  }
+  "session_mod": true
 }
 ```
 
-Merge that field into the existing account configuration. The URL is the HQ
-origin that already owns the session's native Remote Control route. It must be
-HTTPS, or loopback HTTP; the existing native launch key file must be private.
+Merge that field into the existing account configuration. The launcher requires
+its existing HTTPS proxy route. Events go to a reserved `.invalid` address that
+the proxy intercepts and forwards to its existing HQ native-session owner. The
+client reads and sends no HQ credential. Only already routed native sessions
+are accepted; a proxy without the HQ backend refuses publication locally.
+See [transport boundaries](../../docs/session-mod-transport.md).
+
+For a launcher on the HQ owner itself, direct configuration is also supported:
+`"session_mod": {"url": "http://127.0.0.1:8389", "key_file": "/private/path/to/existing-native-launch-key"}`.
+That URL must be HTTPS or loopback HTTP, and the existing key file must be private.
 The launcher supplies the plugin directory and configuration to new interactive
 children automatically. No key is copied or included in command-line arguments.
 Existing sessions are not reloaded or restarted. Missing configuration disables
-the Mod; print/SDK/safe/bare launches cannot opt in.
+the Mod; print/SDK/safe/bare launches continue without it.
 
 The HQ needs the `mod-events` and observer API implementation. Claude's native
 wire ID differs from its conversation UUID. The Mod reads only its own
@@ -58,8 +62,8 @@ The footprint is `session.start`, `command.run`, `prompt.submit`, `turn.start`,
 `turn.step`, `tool.call`, `session.append`, `turn.complete`, and `session.end`.
 Calls read the two named event environment variables and `CLAUDE_CONFIG_DIR`,
 `session.id`, and the engine's `process.hookEnv` identity. They register the
-status command/timer, read the configured key and exact process publisher, and
-POST to the configured HQ endpoint. `hookEnv` may create the engine-owned plugin
+status command/timer, read the exact process publisher and the configured key
+only in direct mode, and POST to the configured endpoint. `hookEnv` may create the engine-owned plugin
 data directory. The Mod invokes no model or shell, submits no prompt, overrides
 no permissions, and writes no session data.
 

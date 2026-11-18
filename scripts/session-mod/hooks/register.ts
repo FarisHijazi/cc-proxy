@@ -14,6 +14,8 @@ type Publisher = {
 const MAX_EVENT = 24 * 1024
 const MAX_QUEUE = 128 * 1024
 const MAX_BATCH = 16
+// The forward proxy owns authentication for this reserved destination.
+const PROXY_ENDPOINT = 'https://session-events.cc-proxy.invalid/v1/code/sessions/mod-events'
 let endpoint = ''
 let keyFile = ''
 let publisherFile = ''
@@ -131,12 +133,16 @@ async function flush($: API) {
       }
       pending = p
     }
-    const secret = (await $.fs.read(keyFile, { length: 1025 })).trim()
-    if (!/^[\x21-\x7e]{32,1024}$/.test(secret)) {
-      status = 'invalid event credential'; endpoint = ''; return
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    if (keyFile) {
+      const secret = (await $.fs.read(keyFile, { length: 1025 })).trim()
+      if (!/^[\x21-\x7e]{32,1024}$/.test(secret)) {
+        status = 'invalid event credential'; endpoint = ''; return
+      }
+      headers['x-hq-native-key'] = secret
     }
     const result = await $.http.fetch(endpoint, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-hq-native-key': secret },
+      method: 'POST', headers,
       body: JSON.stringify(p.batch),
     })
     if (result.ok) {
@@ -185,12 +191,14 @@ export const register: Register = on => {
     try {
       const configured = await $.env.get('CC_PROXY_SESSION_EVENTS_URL')
       keyFile = await $.env.get('CC_PROXY_SESSION_EVENTS_KEY_FILE') ?? ''
-      if (e.isInteractive && configured && keyFile) {
+      if (e.isInteractive && configured) {
         const url = new URL(configured)
+        const proxied = configured === PROXY_ENDPOINT && !keyFile
         const secure = url.protocol === 'https:' ||
           (url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname))
         if (!secure || url.username || url.password || url.search || url.hash ||
-            url.pathname !== '/v1/code/sessions/mod-events' || !keyFile.startsWith('/')) {
+            url.pathname !== '/v1/code/sessions/mod-events' ||
+            (!proxied && (!keyFile.startsWith('/') || url.hostname === 'session-events.cc-proxy.invalid'))) {
           status = 'invalid event configuration'
         } else {
           const config = await $.env.get('CLAUDE_CONFIG_DIR')

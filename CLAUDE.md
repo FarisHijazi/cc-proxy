@@ -65,7 +65,8 @@ Interactive session programmability reuses HQ's existing native command owner.
 it. Closing a client only detaches, and uncertain commands must never be retried.
 `scripts/session-mod` publishes passive typed observations into the same HQ
 registry, using exact conversation UUIDs and deduplicated event batches. The
-launcher's saved `session_mod` opt-in applies only to new interactive sessions;
+launcher's saved `session_mod: true` uses the existing forward proxy; HQ's key
+stays on the proxy owner. Direct HQ configuration remains optional. The opt-in applies only to new interactive sessions;
 do not reload or stop existing sessions to enable it. SDK/API and configuration
 contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain links).
 
