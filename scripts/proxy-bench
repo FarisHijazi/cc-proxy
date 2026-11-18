@@ -1,0 +1,43 @@
+#!/bin/bash
+# Per-request latency of each proxy path against a direct connection, the way Claude Code talks: one curl
+# sends N requests over ONE kept-alive connection, so "cold" is the first request and "warm" the rest.
+# Same account, model and prompt on every path. The direct path reads that account's token from a cswap
+# slot (never printed); each proxy path sends the placeholder for the alias.
+#
+# Usage: proxy-bench N ALIAS SLOT CA_FILE NAME=HOST:PORT...
+#   CSWAP_HOME   home whose cswap holds SLOT (default: $HOME)
+#   PYTHON       python with claude_swap installed (default: python3)
+# Example: proxy-bench 9 user@example.com 3 ~/ca.pem local=127.0.0.1:18790 remote=10.0.0.2:18790
+set -uo pipefail
+N=$1 ALIAS=$2 SLOT=$3 CA=$4
+shift 4
+TOK=$(HOME=${CSWAP_HOME:-$HOME} "${PYTHON:-python3}" -I -c "
+from claude_swap import oauth
+from claude_swap.switcher import ClaudeAccountSwitcher
+s = ClaudeAccountSwitcher()
+raw, _ = s._read_account_credentials_ex('$SLOT', s.account_email('$SLOT'))
+print(oauth.extract_access_token(raw))")
+[ -n "$TOK" ] && [ "$TOK" != None ] || { echo "no token in cswap slot $SLOT" >&2; exit 1; }
+BODY='{"model":"claude-haiku-5-5","max_tokens":20,"system":"You are Claude Code, Anthropic'"'"'s official CLI for Claude.","messages":[{"role":"user","content":"reply ok"}]}'
+URLS=()
+for _ in $(seq "$N"); do URLS+=(-o /dev/null https://api.anthropic.com/v1/messages); done
+unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy
+common=(-sS -w '%{http_code} %{num_connects} %{time_starttransfer}\n' -H 'anthropic-version: 2023-06-01'
+	-H 'anthropic-beta: oauth-2025-04-20' -H 'content-type: application/json' -d "$BODY")
+for spec in direct "$@"; do
+	name=${spec%%=*}
+	if [ "$spec" = direct ]; then
+		extra=(--noproxy '*' -H "authorization: Bearer $TOK")
+	else
+		extra=(-x "http://${spec#*=}" --cacert "$CA" -H "authorization: Bearer proxy-account-$ALIAS")
+	fi
+	curl "${common[@]}" "${extra[@]}" "${URLS[@]}" | python3 -I -c '
+import statistics, sys
+rows = [line.split() for line in sys.stdin if line.strip()]
+warm = [float(t) for code, _, t in rows[1:] if code == "200"]
+if not rows or not warm:
+	sys.exit(print(f"{sys.argv[1]:9s} FAILED: {[r[0] for r in rows]}"))
+print(f"{sys.argv[1]:9s} cold={float(rows[0][2]):.3f}s  warm median={statistics.median(warm):.3f}s  "
+      f"min={min(warm):.3f}s  max={max(warm):.3f}s  ok={len(warm)}/{len(rows) - 1}  connections={sum(int(r[1]) for r in rows)}")
+' "$name"
+done
