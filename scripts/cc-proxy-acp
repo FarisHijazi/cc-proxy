@@ -13,20 +13,30 @@
 import argparse
 import asyncio
 import hashlib
-import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
-import httpx2
 from acp import Agent, RequestError, run_agent
 from acp import schema as s
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+
+# Source checkouts and immutable bundles keep the SDK next to scripts/. Wheels
+# expose the same cc_proxy package directly; there is no second client copy.
+_source_python = Path(__file__).resolve().parents[1] / "python"
+if _source_python.is_dir():
+    sys.path.insert(0, str(_source_python))
+from cc_proxy.session_client import (
+    ActionRejected as SDKActionRejected,
+)
+from cc_proxy.session_client import (
+    SessionClient,
+    SessionClientError,
+    available,
+)
 
 
 def failure(message):
@@ -49,11 +59,6 @@ class InvalidAnswer(RequestError):
 
     def __init__(self, message):
         super().__init__(-32000, message)
-
-
-def available(row):
-    return (row.get("alive") is True and row.get("online") is not False and row.get("read_only") is not True
-            and row.get("lifecycle") not in {"ended", "unreachable", "unknown"})
 
 
 def metadata_text(value, limit=256):
@@ -128,81 +133,36 @@ def identify_messages(rows, previous):
 
 
 class HQ:
+    """Translate the shared SDK's typed errors to the existing ACP wire errors."""
+
     def __init__(self, url, token, *, transport=None, mcp_url=None, mcp_token=None):
-        self.http = httpx.AsyncClient(base_url=url.rstrip("/"), timeout=180,
-                                      headers={"Authorization": f"Bearer {token}"} if token else {},
-                                      transport=transport, follow_redirects=False)
-        self.mcp_url = mcp_url
-        self.mcp_token = mcp_token
+        self.client = SessionClient(url, token, transport=transport,
+                                    mcp_url=mcp_url, mcp_token=mcp_token)
+        self.http = self.client.http
+
+    async def _call(self, operation, *args, **kwargs):
+        try:
+            return await operation(*args, **kwargs)
+        except SDKActionRejected as exc:
+            raise ActionRejected(str(exc)) from exc
+        except SessionClientError as exc:
+            raise failure(str(exc)) from exc
 
     async def list(self):
-        async with (
-            httpx2.AsyncClient(headers={"Authorization": f"Bearer {self.mcp_token}"}, timeout=180) as http,
-            streamable_http_client(self.mcp_url, http_client=http) as (read, write, *_),
-            ClientSession(read, write) as client,
-        ):
-            await client.initialize()
-            result = await client.call_tool("list_sessions", {})
-            if result.is_error:
-                raise failure("Fleet session discovery failed.")
-            data = result.structured_content
-            rows = data["result"] if data is not None else json.loads(result.content[0].text)
-            if not isinstance(rows, list):
-                raise failure("Fleet session discovery returned an invalid list.")
-            return rows
+        return await self._call(self.client.list)
 
     async def get(self, path):
-        try:
-            response = await self.http.get(path)
-        except httpx.TransportError as exc:
-            raise failure("Fleet HQ is unavailable; the existing session was left running.") from exc
-        if response.status_code != 200:
-            raise failure(f"Fleet HQ read failed (HTTP {response.status_code}).")
-        return response.json()
+        return await self._call(self.client.get, path)
 
     async def detail(self, session_id):
-        row = await self.get(f"/api/sessions/{quote(session_id, safe='')}")
-        if row.get("id") != session_id:
-            raise failure("Fleet HQ returned a different session identity.")
-        archived = (row.get("provider") == "codex" and row.get("transport") == "codex"
-                    and row.get("read_only") is True and row.get("alive") is False
-                    and row.get("online") is True and row.get("lifecycle") == "ended")
-        if not (available(row) or archived) or not row.get("revision"):
-            raise failure("This fleet session is offline or ended; it cannot be controlled.")
-        return row
+        return await self._call(self.client.detail, session_id)
 
     async def action(self, session_id, action, *, revision=None, **fields):
-        path = f"/api/sessions/{quote(session_id, safe='')}"
-        for attempt in range(3):
-            request_id = uuid.uuid4().hex
-            try:
-                row = await self.detail(session_id)
-            except (RequestError, httpx.TransportError, ValueError) as exc:
-                raise ActionRejected("Fleet action was not sent because its current state could not be verified.") from exc
-            if not available(row):
-                raise ActionRejected("This fleet session is offline or ended; it cannot be controlled.")
-            if revision is not None and revision != row["revision"]:
-                raise ActionRejected("The request changed. Read the session again before answering.")
-            body = {"action": action, "revision": revision or row["revision"],
-                    "request_id": request_id, **fields}
-            try:
-                response = await self.http.post(f"{path}/action", json=body)
-            except httpx.TransportError as exc:
-                raise failure(f"Delivery is unknown; do not resend. request_id={request_id}") from exc
-            if response.status_code == 409 and any(phrase in response.text.lower() for phrase in (
-                    "already in progress", "already used with a different payload")):
-                raise failure(f"Delivery is unknown; conflicting action receipt. Do not resend. request_id={request_id}")
-            if (response.status_code == 409 and "refresh" in response.text.lower()
-                    and revision is None and attempt < 2):
-                continue
-            if response.status_code in {400, 401, 403, 404, 409, 422}:
-                raise ActionRejected(f"Fleet action rejected (HTTP {response.status_code}); request_id={request_id}")
-            if response.status_code >= 400:
-                raise failure(f"Delivery is unknown (HTTP {response.status_code}); do not resend. request_id={request_id}")
-            try:
-                return response.json()
-            except ValueError as exc:
-                raise failure(f"Delivery is unknown; invalid action receipt. Do not resend. request_id={request_id}") from exc
+        return await self._call(self.client.action, session_id, action,
+                                revision=revision, **fields)
+
+    async def aclose(self):
+        await self.client.aclose()
 
 
 @dataclass
@@ -650,7 +610,7 @@ async def main():
     try:
         await run_agent(FleetAgent(hq, poll_interval=args.poll_interval, turn_timeout=args.turn_timeout))
     finally:
-        await hq.http.aclose()
+        await hq.aclose()
 
 
 if __name__ == "__main__":

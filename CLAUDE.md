@@ -60,6 +60,15 @@ Local checkouts and deployed copies keep the directory name `claude-code-with-co
 launchers and the ftower unit reference that path. Upstream conventions live in
 [AGENTS.md](AGENTS.md) and still apply.
 
+Interactive session programmability reuses HQ's existing native command owner.
+`python/cc_proxy/session_client.py` owns the shared HTTP client; ACP delegates to
+it. Closing a client only detaches, and uncertain commands must never be retried.
+`scripts/session-mod` publishes passive typed observations into the same HQ
+registry, using exact conversation UUIDs and deduplicated event batches. The
+launcher's saved `session_mod` opt-in applies only to new interactive sessions;
+do not reload or stop existing sessions to enable it. SDK/API and configuration
+contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain links).
+
 ## The constraint that drives everything
 
 **No paid API keys.** Every backend runs on a login that already exists: the

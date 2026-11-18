@@ -11,6 +11,11 @@ dependencies = [
     "claude-swap @ git+https://github.com/FarisHijazi/claude-swap",
 ]
 
+[project.optional-dependencies]
+sessions = ["httpx==0.28.1"]
+sessions-mcp = ["httpx==0.28.1", "httpx2==2.16.0", "mcp==2.3.0"]
+acp = ["httpx==0.28.1", "httpx2==2.16.0", "mcp==2.3.0", "agent-client-protocol==1.0.0"]
+
 [project.scripts]
 cc-proxy = "cc_proxy.cli:main"
 cc-proxy-traffic = "cc_proxy.cli:traffic"
@@ -27,8 +32,15 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/cc_proxy"]
+only-include = ["python/cc_proxy", "scripts"]
+exclude = [
+  "scripts/session-mod/.claude-plugin/types/**",
+  "scripts/session-mod/tsconfig.json",
+  "scripts/session-mod/node_modules/**",
+]
 
-[tool.hatch.build.targets.wheel.force-include]
+# Normal source selection honors excludes; force-include bypasses them.
+[tool.hatch.build.targets.wheel.sources]
 "scripts" = "cc_proxy/scripts"
 
 [tool.hatch.build.targets.sdist]

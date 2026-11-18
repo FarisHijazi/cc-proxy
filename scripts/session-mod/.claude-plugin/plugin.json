@@ -1,0 +1,6 @@
+{
+  "name": "cc-proxy-session",
+  "version": "0.1.0",
+  "description": "Publish structured interactive session events to the existing cc-proxy fleet owner.",
+  "author": { "name": "cc-proxy contributors" }
+}

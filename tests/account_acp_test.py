@@ -245,7 +245,7 @@ def test_only_a_confirmed_stale_revision_can_retry():
         if request.method == "GET":
             return httpx.Response(200, json=row(revision=f"r{len(writes) + 1}"))
         writes.append(json.loads(request.content))
-        return httpx.Response(409, text="refresh the session") if len(writes) == 1 else httpx.Response(200, json={"accepted": True})
+        return httpx.Response(409, text="refresh the session") if len(writes) == 1 else httpx.Response(200, json={"accepted": True, "request_id": json.loads(request.content)["request_id"], "id": SID})
 
     async def check():
         hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
@@ -678,7 +678,7 @@ def test_definitively_rejected_prompt_does_not_block_another_send():
             if len(writes) == 1:
                 return httpx.Response(403, json={"error": "action refused"})
             sent.set()
-            return httpx.Response(200, json={"accepted": True})
+            return httpx.Response(200, json={"accepted": True, "request_id": json.loads(request.content)["request_id"], "id": SID})
         hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
         agent = FleetAgent(hq, observe=False)
         agent.on_connect(client())
@@ -705,7 +705,7 @@ def test_stale_control_is_offered_again_with_a_fresh_revision(kind):
             if request.method == "GET":
                 return httpx.Response(200, json=row(revision="r2", **control))
             writes.append(json.loads(request.content))
-            return httpx.Response(200, json={"accepted": True})
+            return httpx.Response(200, json={"accepted": True, "request_id": json.loads(request.content)["request_id"], "id": SID})
         hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
         agent = FleetAgent(hq, observe=False)
         conn, forms = client(), []
@@ -789,7 +789,7 @@ def test_owner_rejected_control_requires_fresh_consent_before_another_post():
             if request.method == "GET":
                 return httpx.Response(200, json=snapshot)
             writes.append(json.loads(request.content))
-            return httpx.Response(409, text="refresh the session") if len(writes) == 1 else httpx.Response(200, json={"accepted": True})
+            return httpx.Response(409, text="refresh the session") if len(writes) == 1 else httpx.Response(200, json={"accepted": True, "request_id": json.loads(request.content)["request_id"], "id": SID})
         hq = HQ("http://hq.example", "toy-secret", transport=httpx.MockTransport(handle))
         agent = FleetAgent(hq, observe=False)
         conn = client()

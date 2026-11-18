@@ -846,6 +846,37 @@ def placeholder_login(alias, profile, config, secure, remote_control=None, priva
     )
 
 
+def session_mod(config, forwarded, env):
+    """Opt new interactive launches into the existing HQ's event ingestion."""
+    env.pop("CC_PROXY_SESSION_EVENTS_URL", None)
+    env.pop("CC_PROXY_SESSION_EVENTS_KEY_FILE", None)
+    if config in (None, False):
+        return forwarded
+    if not isinstance(config, dict) or set(config) != {"url", "key_file"}:
+        raise ValueError("session_mod needs only url and key_file")
+    origin = urlsplit(config["url"])
+    if (origin.scheme not in {"https", "http"} or not origin.hostname
+            or origin.username or origin.password or origin.query or origin.fragment
+            or origin.path not in {"", "/"}
+            or (origin.scheme == "http" and origin.hostname not in {"localhost", "127.0.0.1", "::1"})):
+        raise ValueError("session_mod.url must be an HTTPS or loopback HTTP HQ origin")
+    key = Path(config["key_file"]).expanduser().resolve()
+    if not key.is_file() or key.stat().st_mode & 0o077:
+        raise ValueError("session_mod.key_file must be a private existing native launch key file")
+    if any(arg in {"-p", "--print", "--bare", "--safe-mode", "--no-remote-control"} or
+           arg.startswith("--print=") for arg in forwarded):
+        raise ValueError("session_mod needs interactive Claude with native Remote Control and plugins enabled")
+    plugin = Path(__file__).resolve().parent / "session-mod"
+    if not (plugin / ".claude-plugin/plugin.json").is_file():
+        raise ValueError("cc-proxy session Mod is missing from this installation")
+    env["CC_PROXY_SESSION_EVENTS_URL"] = config["url"].rstrip("/") + "/v1/code/sessions/mod-events"
+    env["CC_PROXY_SESSION_EVENTS_KEY_FILE"] = str(key)
+    forwarded = with_flags(forwarded, "--plugin-dir", str(plugin))
+    if "--remote-control" not in forwarded:
+        forwarded = with_flags(forwarded, "--remote-control")
+    return forwarded
+
+
 def via(args, accounts, main_account, state, forwarded, extra_settings=None):
     """Run claude against a --serve proxy; this machine holds placeholder logins only."""
     if not (args.via_ca and accounts):
@@ -905,6 +936,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
             extra_settings,
             identify=True,
         )
+        forwarded = session_mod(getattr(args, "session_mod", None), forwarded, env)
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
     finally:
@@ -1003,6 +1035,7 @@ def main():
     )
     args = parser.parse_args()
     saved = json.loads(args.accounts_file.read_text()) if args.accounts_file else {}
+    args.session_mod = saved.get("session_mod")
     if not (args.via or args.serve) and saved.get("via"):
         # The proxy's addresses, tried in order by reach(); via_ca is its CA.
         args.via = saved["via"]
@@ -1155,6 +1188,7 @@ def main():
             wait_listener(proxy, port, log.name, ca)
             (state / "client-ca.pem").write_bytes(certificate_bundle(ca))
             env, settings = client_environment(state, port, main_secure, extra=extra_settings)
+            forwarded = session_mod(args.session_mod, forwarded, env)
             print(
                 f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; config: {state / 'claude'} (shares ~/.claude)",
                 file=sys.stderr,
