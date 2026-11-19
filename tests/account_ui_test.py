@@ -44,6 +44,10 @@ def test_settings_are_saved_with_a_backup_and_other_keys_kept(tmp_path):
     {"fallback": {"on": {"auth": "yes"}}},
     {"fallback": {"chains": {"claude": "codex"}}},
     {"fallback": {"chains": {"claude": ["codex", " "]}}},
+    {"fallback": {"chains": {"**": ["accounts"]}}},
+    {"fallback": {"chains": {"Claude models": ["accounts"]}}},
+    {"fallback": {"chains": {"*": ["accounts", "kimi; rm"]}}},
+    {"fallback": {"chains": {"*": ["accounts"] * 65}}},
 ])
 def test_invalid_settings_are_refused_and_nothing_is_written(tmp_path, change):
     board, accounts = dashboard(tmp_path)
@@ -65,6 +69,14 @@ def test_failover_settings_are_saved_and_cleared(tmp_path):
     assert "threshold" not in board.update({"fallback": {**fallback, "threshold": None}})["fallback"]
     assert "fallback" not in board.update({"fallback": None})
     assert list(json.loads(accounts.read_text())["accounts"]) == ["a", "b"]
+
+
+def test_the_global_chain_names_any_provider_and_keeps_per_family_overrides(tmp_path):
+    board, _ = dashboard(tmp_path)
+    order = ["kimi", "accounts:1", "codex", "cursor-cli", "gemini", "grok", "local", "accounts", " gpt-6-luna "]
+    saved = board.update({"fallback": {"chains": {"*": order, "codex": ["codex", "accounts"]}}})["fallback"]["chains"]
+    assert saved["*"] == [*order[:-1], "gpt-6-luna"]
+    assert saved["codex"] == ["codex", "accounts"]
 
 
 def test_providers_come_from_the_router_model_list():

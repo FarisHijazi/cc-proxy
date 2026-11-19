@@ -57,10 +57,10 @@ try {
   assert.doesNotMatch(await card.innerText(), /%|Tokens.*0/);
   assert.equal(await card.locator(".meter").count(), 0, "credit is not utilization");
   if (process.env.KIMI_SCREENSHOT) await page.screenshot({path: process.env.KIMI_SCREENSHOT, fullPage: true});
-  await page.evaluate(() => { state.provider_quota.kimi = {state: "unavailable", note: "No verified Coding quota API"}; renderProviderCards(); });
+  await page.evaluate(() => { state.provider_quota.kimi = {state: "unavailable", note: "No verified Coding quota API"}; renderAccounts(); });
   assert.match(await card.innerText(), /Quota: unknown.*No verified Coding quota API/s);
   assert.doesNotMatch(await card.innerText(), /Available credit/);
-  await page.evaluate(() => { state.provider_quota.kimi = {state: "error", error: "Kimi balance HTTP 401"}; renderProviderCards(); });
+  await page.evaluate(() => { state.provider_quota.kimi = {state: "error", error: "Kimi balance HTTP 401"}; renderAccounts(); });
   assert.match(await card.innerText(), /Quota: unknown.*HTTP 401/s);
 
   await page.goto("http://dash.test/#routing");

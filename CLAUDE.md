@@ -246,8 +246,13 @@ pool from handing thread ownership to a backup; cooldowns belong to each Registr
 Claude model: accounts, then Codex. Codex model: Codex, then Claude accounts.
 Cursor is never a default target; it requires an explicitly configured chain. The accounts file's
 `fallback` section overrides these defaults (`chains` per family `claude`/`codex`/provider name;
-`accounts:N` = the next N pool accounts, so another backend can sit between accounts;
-`accounts` = the rest; `on` = `rate_limit`/`auth`/`server_error`; `threshold` %).
+`chains["*"]` = the global order the dashboard's flat Accounts list writes, inherited by every family
+without its own chain, with the request's own provider (Claude: its first run of accounts) moved or
+added to the front; a provider-name target is that tier's cell on the provider, skipped when the tier
+has none. Built-in tier providers retain this meaning; other names that are also routable model ids
+(such as `cursor-cli`) are used literally when no tier cell exists;
+`accounts:N` = the next N pool accounts, so another backend can sit between
+accounts; `accounts` = the rest; `on` = `rate_limit`/`auth`/`server_error`; `threshold` %).
 `account_inject` attaches it as `x-claude-codex-fallback` beside the pool (stripped the same way) and alone
 applies `threshold`, putting accounts whose last reply reported 5h/7d utilization at or over it last in
 the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`. Never relay the pool header upstream, never retry after
