@@ -38,20 +38,6 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
     "composer-2.5-fast",
 ];
 
-pub(crate) const KIMI_MODELS: &[&str] = &[
-    "kimi-for-coding",
-    "kimi-for-coding-highspeed",
-    "kimi-k2.6",
-    "kimi-k3",
-    "kimi-k3-256k",
-    "kimi-k3.1-pro",
-    "kimi-k3.1-pro-highspeed",
-    "k2.6",
-    "k3",
-    "k3-256k",
-    "k3.1-pro",
-    "k3.1-pro-highspeed",
-];
 pub(crate) use crate::providers::gemini::models::GEMINI_MODELS;
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
@@ -75,7 +61,10 @@ impl Registry {
         models.insert("codex".into(), Vec::new());
         models.insert(
             "kimi".into(),
-            KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
+            crate::providers::kimi::translate::model_allowlist::all_public_model_ids()
+                .iter()
+                .map(|m| (*m).to_string())
+                .collect(),
         );
         models.insert("cursor".into(), build_cursor_models());
         models.insert(
@@ -160,7 +149,12 @@ impl Registry {
         let live = (provider == "anthropic")
             .then(crate::providers::anthropic::live_models)
             .flatten();
-        let mut models = if provider == "codex" {
+        let mut models = if provider == "kimi" {
+            crate::providers::kimi::translate::model_allowlist::public_model_ids()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else if provider == "codex" {
             selectable_models()
         } else if let Some(live) = live {
             ANTHROPIC_STYLE_ALIASES
@@ -239,6 +233,50 @@ impl Registry {
             .keys()
             .map(|provider| (provider.clone(), self.supported_models_for(provider)))
             .collect()
+    }
+
+    /// Model identities remain available for routing views even when a login is absent.
+    pub fn provider_catalog(&self) -> serde_json::Value {
+        let groups = self.grouped_models_all();
+        let labels = [
+            ("anthropic", "Claude"),
+            ("codex", "Codex"),
+            ("kimi", "Kimi"),
+            ("cursor", "Cursor API"),
+            ("cursor-cli", "cursor-agent CLI"),
+            ("gemini", "Gemini"),
+            ("grok", "Grok"),
+            ("local", "Local"),
+        ];
+        let mut catalog = serde_json::Map::new();
+        for (provider, models) in groups {
+            let label = labels
+                .iter()
+                .find(|(name, _)| *name == provider)
+                .map(|(_, label)| *label)
+                .unwrap_or(&provider);
+            let family = if provider == "anthropic" {
+                "claude"
+            } else {
+                &provider
+            };
+            let mut entry = serde_json::json!({"label": label, "family": family, "models": models});
+            if provider == "kimi" {
+                entry["models"] = serde_json::json!(
+                    crate::providers::kimi::translate::model_allowlist::all_public_model_ids()
+                );
+                let base = crate::config::kimi_base_url();
+                entry["balance_base_url"] = serde_json::json!(if base.trim_end_matches('/')
+                    == "https://api.moonshot.ai/v1"
+                {
+                    Some("https://api.moonshot.ai/v1")
+                } else {
+                    None
+                });
+            }
+            catalog.insert(provider, entry);
+        }
+        serde_json::Value::Object(catalog)
     }
 
     pub async fn prepare_model_catalog(&self, raw_model: &str) {
@@ -464,6 +502,33 @@ fn build_cursor_models() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kimi_catalogue_keeps_hidden_identities_but_lists_current_endpoint_models() {
+        let registry = Registry::with_default_alias();
+        let catalog = registry.provider_catalog();
+        let all = crate::providers::kimi::translate::model_allowlist::all_public_model_ids();
+        assert_eq!(catalog["kimi"]["models"], serde_json::json!(all));
+        assert_eq!(catalog["kimi"]["family"], "kimi");
+        let base = &catalog["kimi"]["balance_base_url"];
+        assert!(base.is_null() || base == "https://api.moonshot.ai/v1");
+        for id in all {
+            assert_eq!(
+                registry.provider_for_model(id, None).unwrap().name(),
+                "kimi"
+            );
+        }
+        assert_eq!(registry.supported_models_for("kimi"), {
+            let mut ids: Vec<_> =
+                crate::providers::kimi::translate::model_allowlist::public_model_ids()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            ids.sort();
+            ids
+        });
+        assert!(registry.provider_for_model("kimi-k2.6", None).is_none());
+    }
+
     /// Every id we list must route somewhere.
     #[test]
     fn everything_listed_can_actually_be_routed() {

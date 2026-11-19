@@ -84,7 +84,7 @@ try {
 
     const kimi = await card(page, "kimi").innerText();
     assert.match(kimi, /unavailable on the proxy host/);
-    assert.match(kimi, /In no failover chain/);
+    assert.match(kimi, /#1 of 1 for Kimi models/);
     assert.match(kimi, /no model calls answered in the last 24 h/);
     assert.match(await card(page, "gemini").innerText(), /router's estimate/);
     assert.match(await page.locator("#accounts").innerText(), /a@example\.com/, "Claude account cards still render");

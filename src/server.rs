@@ -445,6 +445,7 @@ async fn handler_models(
                 "object": "model",
                 "id": model,
                 "display_name": format!("{model} ({provider})"),
+                "provider": provider,
             });
             if provider == "local" {
                 if let Ok(window) = crate::config::local_context_window() {
@@ -466,6 +467,7 @@ async fn handler_models(
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
         "fallback_defaults": crate::fallback::defaults(),
+        "provider_catalog": state.registry.provider_catalog(),
     }))
 }
 

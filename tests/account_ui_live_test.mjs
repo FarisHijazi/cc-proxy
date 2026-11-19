@@ -37,11 +37,13 @@ try {
   const a = page.locator("#models article").first();
   await a.locator('[data-m="codex"]').fill("sol[1m]");
   await a.locator('[data-m="anthropic"]').fill("claude-opus-5-5");
+  if (real[0].models.kimi) await a.locator('[data-m="kimi"]').fill("kimi-k3.1-pro");
   await page.locator("#models [data-save]").click();
   await page.waitForFunction(() => document.querySelector("#models [data-save]").disabled && !document.querySelector("#models [data-reset]").disabled);
   const onDisk = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(onDisk.fallback.tiers.length, real.length, "saving writes the whole list");
   assert.equal(onDisk.fallback.tiers[0].models.codex, "sol[1m]");
+  if (real[0].models.kimi) assert.equal(onDisk.fallback.tiers[0].models.kimi, "kimi-k3.1-pro");
   assert.deepEqual(onDisk.renamed, { old: "a@example.com" }, "unrelated config untouched");
   await page.reload();
   await page.locator("#models article").first().waitFor();
@@ -50,6 +52,7 @@ try {
   await page.waitForFunction(() => document.querySelector("#models [data-reset]").disabled);
   assert.equal("tiers" in (JSON.parse(readFileSync(file, "utf8")).fallback ?? {}), false, "reset removes the override");
   assert.equal(await page.locator('#models [data-m="codex"]').first().inputValue(), real[0].models.codex);
+  if (process.env.KIMI_SCREENSHOT) await page.screenshot({path: process.env.KIMI_SCREENSHOT, fullPage: true});
   console.log("ok live save reload reset");
 } finally {
   await browser?.close();

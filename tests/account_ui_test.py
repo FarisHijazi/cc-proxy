@@ -127,7 +127,7 @@ def tier(**kw):
     [tier(match=[])],
     [tier(match=[" "])],
     [tier(match=["x" * 65])],
-    [tier(match=[str(i) for i in range(9)])],
+    [tier(match=[str(i) for i in range(17)])],
     [tier(models={})],
     [tier(models={"gemini": "gemini-3-pro"})],
     [tier(models={"codex": "bad id"})],
@@ -163,7 +163,7 @@ def test_router_defaults_travel_through_the_provider_read():
             raise OSError("down")
 
     board.opener, board.cache = Down(), {}
-    assert board.providers() == {"reachable": False, "models": {n: [] for n in ui["PROVIDERS"]}, "fallback_defaults": None}
+    assert board.providers() == {"reachable": False, "models": {n: [] for n in ui["PROVIDERS"]}, "fallback_defaults": None, "catalog": {}}
 
 
 @pytest.mark.parametrize("model", ["opus", "opus[1m]", "sonnet", "claude-opus-5-5[1m]"])
@@ -252,3 +252,24 @@ def test_invalid_api_key_changes_are_refused(tmp_path, change):
     with pytest.raises(ValueError):
         board.update({"api_keys": change})
     assert accounts.read_text() == before
+
+
+def test_kimi_is_an_equivalence_destination():
+    tiers = [{"name": "heavy", "match": ["opus", "kimi-k3.1-pro-highspeed"],
+              "models": {"anthropic": "claude-opus-5-5", "kimi": "kimi-k3.1-pro-highspeed"}}]
+    assert ui["checked_tiers"](tiers) == tiers
+
+
+def test_catalogue_identity_is_independent_of_display_labels():
+    catalog = {"kimi": {"label": "Kimi", "family": "kimi", "models": ["k3.1-pro"],
+                        "balance_base_url": "https://api.moonshot.ai/v1"}}
+
+    class Opener:
+        def open(self, url, timeout):
+            return io.BytesIO(json.dumps({"data": [{"id": "k3.1-pro", "provider": "kimi", "display_name": "Friendly model"}],
+                                         "provider_catalog": catalog}).encode())
+
+    board = ui["Dashboard"].__new__(ui["Dashboard"])
+    board.opener, board.cache = Opener(), {}
+    assert board.providers()["models"]["kimi"] == ["k3.1-pro"]
+    assert board.providers()["catalog"] == catalog

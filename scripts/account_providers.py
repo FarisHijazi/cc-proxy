@@ -1,10 +1,7 @@
 """Recorded usage of the non-Claude backends, for the dashboard's provider cards.
 
-Only Cursor's quota is readable (account_cursor_quota.py, cursor-agent's own login). The router
-consumes Codex's `codex.rate_limits` event without recording it, its translated replies carry no
-rate-limit headers, and gemini-web-api, Kimi and Grok report none. So every card shows what the
-traffic database recorded (requests answered, reported tokens, last activity) over an explicit
-window, and a card without a vendor snapshot says its quota is unknown instead of drawing a meter.
+Vendor quota readers run separately from traffic accounting. Recorded replies are not account
+allowances. A backend without a verified vendor snapshot remains unknown, never zero.
 """
 
 import json
@@ -26,18 +23,19 @@ ROUTES = [
      ["cursor-cli-agent:", "cursor-cli-plan:", "cursor-cli-ask:", "cursor-cli:"]),
     ("cursor", ["cursor", "cursor-agent", "cursor-composer", "cursor-composer-fast", "cursor-plan", "cursor-ask",
                 "composer-2.5", "composer-2.5-fast"], ["cursor:", "cursor-plan:", "cursor-ask:"]),
-    ("kimi", ["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"], []),
+    ("kimi", ["k2.6", "k3"], ["kimi-"]),
     ("grok", ["grok-composer-2.5-fast", "grok-4.5"], []),
     ("codex", [], ["gpt-"]),
     ("gemini", [], ["gemini-"]),
 ]
 
 
-def backend_sql():
+def backend_sql(catalog=None):
     """SQL for a row's backend: the router's served_by when it tagged one, else the requested id's
     route. Reads column `m`, the model id without the `[1m]` suffix the router also strips."""
     cases, params = [], []
     for name, exact, prefixes in ROUTES:
+        exact = list(dict.fromkeys([*exact, *(catalog or {}).get(name, {}).get("models", [])]))
         tests = [f"m IN ({','.join('?' * len(exact))})"] if exact else []
         tests += ["substr(m, 1, ?) = ?"] * len(prefixes)
         cases.append(f"WHEN {' OR '.join(tests)} THEN ?")
@@ -76,7 +74,7 @@ def reply_tokens(body):
     }
 
 
-def provider_usage(db, now=None, hours=WINDOW_HOURS, limit=ROW_LIMIT):
+def provider_usage(db, now=None, hours=WINDOW_HOURS, limit=ROW_LIMIT, catalog=None):
     """Per backend: model calls it answered in the last `hours`, with reported tokens.
     Token counting calls are not model calls and are left out.
 
@@ -85,7 +83,7 @@ def provider_usage(db, now=None, hours=WINDOW_HOURS, limit=ROW_LIMIT):
         return None
     now = time.time() if now is None else now
     since = now - hours * 3600
-    backend, backend_params = backend_sql()
+    backend, backend_params = backend_sql(catalog)
     rows = (
         f"(SELECT *, {backend} AS backend FROM (SELECT *, CASE WHEN lower(model) LIKE '%[1m]' "
         "THEN substr(model, 1, length(model) - 4) ELSE model END AS m FROM flows "

@@ -149,7 +149,7 @@ def test_dashboard_caches_the_cursor_read_on_the_cli_card_only():
     board.provider_quota.__func__.__globals__["cursor_quota"] = lambda: calls.append(1) or CURSOR
     board.provider_quota.__func__.__globals__["codex_quota"] = lambda: None
     first = board.provider_quota()
-    assert sorted(first) == ["codex", "cursor-cli"] and first["codex"] is None
+    assert sorted(first) == ["codex", "cursor-cli", "kimi"] and first["codex"] is None
     assert first["cursor-cli"]["windows"][0]["used"] == 18.25
     assert board.provider_quota() is first and calls == [1]
 
@@ -163,7 +163,40 @@ def test_malformed_cursor_fields_are_isolated_and_cached():
     board.provider_quota.__func__.__globals__["cursor_quota"] = lambda: calls.append(1) or bad
     board.provider_quota.__func__.__globals__["codex_quota"] = lambda: 1 / 0
     first = board.provider_quota()
-    assert first == {"codex": {"error": "codex quota: ZeroDivisionError"},
+    assert first["kimi"]["state"] == "unavailable"
+    assert {k: v for k, v in first.items() if k != "kimi"} == {"codex": {"error": "codex quota: ZeroDivisionError"},
                      "cursor-cli": {"error": "cursor-cli quota: ValueError"}}
     assert "private-value" not in json.dumps(first)
     assert board.provider_quota() is first and calls == [1]
+
+
+def test_every_kimi_public_alias_is_attributed_without_served_by():
+    ids = ["kimi-for-coding", "kimi-for-coding-highspeed", "kimi-k3", "kimi-k3-256k",
+           "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"]
+    db = database([(NOW - i, None, model + "[1m]", 200, STREAMED) for i, model in enumerate(ids)])
+    assert providers["provider_usage"](db, now=NOW, catalog={"kimi": {"models": ids}})["providers"]["kimi"]["requests"] == len(ids)
+
+
+def test_kimi_balance_uses_router_endpoint_and_cache_invalidates_on_endpoint_switch():
+    ui = runpy.run_path(str(Path(__file__).parents[1] / "scripts/account_ui.py"), run_name="account_ui")
+    board = ui["Dashboard"].__new__(ui["Dashboard"])
+    board.cache = {}
+    base, calls = [None], []
+    board.providers = lambda: {"catalog": {"kimi": {"balance_base_url": base[0]}}}
+    board.provider_quota.__func__.__globals__.update(
+        codex_quota=lambda: None, cursor_quota=lambda: None,
+        kimi_quota=lambda base_url: calls.append(base_url) or {"state": "available" if base_url else "unavailable"})
+    first = board.provider_quota()
+    assert first["kimi"]["state"] == "unavailable"
+    assert board.provider_quota() is first and calls == [None]
+    base[0] = "https://api.moonshot.ai/v1"
+    assert board.provider_quota()["kimi"]["state"] == "available"
+    assert calls == [None, base[0]]
+
+
+def test_catalogue_new_aliases_are_attributed_without_code_changes():
+    db = database([(NOW - 1, None, "future-native-id", 200, STREAMED),
+                   (NOW - 2, "codex/gpt-6.1-sol", "future-native-id", 200, STREAMED)])
+    usage = providers["provider_usage"](db, now=NOW, catalog={"kimi": {"models": ["future-native-id"]}})
+    assert usage["providers"]["kimi"]["requests"] == 1
+    assert usage["providers"]["codex"]["requests"] == 1

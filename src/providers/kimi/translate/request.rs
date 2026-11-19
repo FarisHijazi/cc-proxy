@@ -31,6 +31,14 @@ pub struct KimiChatRequest {
     pub thinking: Option<KimiThinking>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +53,7 @@ pub struct KimiThinking {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(into = "Value", try_from = "Value")]
 pub enum KimiToolChoice {
     Auto,
     None,
@@ -55,6 +63,39 @@ pub enum KimiToolChoice {
         kind: String,
         function: KimiToolChoiceFunction,
     },
+}
+
+impl From<KimiToolChoice> for Value {
+    fn from(choice: KimiToolChoice) -> Value {
+        match choice {
+            KimiToolChoice::Auto => Value::String("auto".into()),
+            KimiToolChoice::None => Value::String("none".into()),
+            KimiToolChoice::Required => Value::String("required".into()),
+            KimiToolChoice::Function { kind, function } => {
+                serde_json::json!({"type":kind, "function":{"name":function.name}})
+            }
+        }
+    }
+}
+
+impl TryFrom<Value> for KimiToolChoice {
+    type Error = String;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            Some("auto") => Ok(Self::Auto),
+            Some("none") => Ok(Self::None),
+            Some("required") => Ok(Self::Required),
+            _ if value["type"] == "function" => value["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .map(|name| Self::Function {
+                    kind: "function".into(),
+                    function: KimiToolChoiceFunction { name: name.into() },
+                })
+                .ok_or_else(|| "named tool choice requires a name".into()),
+            _ => Err("invalid Kimi tool_choice".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +178,8 @@ pub fn translate_request(
     assert_allowed_model(&resolved).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let k3 = is_k3(&resolved);
+    validate_request(req)?;
+    let thinking = read_thinking(req, k3)?;
     let messages = build_messages(req, &resolved)?;
     let tools = read_tools(req)?;
     let tool_choice = read_tool_choice(req)?;
@@ -150,21 +193,205 @@ pub fn translate_request(
         },
         max_tokens: clamp_max_tokens(req.max_tokens, k3),
         reasoning_effort: Some(map_reasoning_effort(read_effort(req)?, k3)),
-        thinking: Some(KimiThinking {
-            kind: "enabled".to_string(),
-        }),
+        thinking,
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
         parallel_tool_calls: parallel_tool_calls(req),
         prompt_cache_key: opts.session_id,
+        temperature: read_sampling(req, "temperature", 2.0)?,
+        top_p: read_sampling(req, "top_p", 1.0)?,
+        stop: read_stop(req)?,
+        response_format: read_response_format(req)?,
     };
 
+    if out
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.kind == "disabled")
+    {
+        out.reasoning_effort = None;
+    }
+    if let Some(KimiToolChoice::Function { function, .. }) = &out.tool_choice {
+        anyhow::ensure!(
+            out.tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == function.name)),
+            "tool_choice names an unregistered tool"
+        );
+    }
+    // Moonshot rejects a named tool_choice while thinking is on; `required` with only that tool forces the same call.
+    if out.reasoning_effort.is_some()
+        && let Some(KimiToolChoice::Function { function, .. }) = &out.tool_choice
+    {
+        let name = function.name.clone();
+        if let Some(tools) = out.tools.as_mut() {
+            tools.retain(|tool| tool.function.name == name);
+        }
+        out.tool_choice = Some(KimiToolChoice::Required);
+    }
     // Collapse auto tool_choice to None (default behavior)
     if matches!(out.tool_choice, Some(KimiToolChoice::Auto)) {
         out.tool_choice = None;
     }
 
     Ok(out)
+}
+
+fn read_sampling(req: &MessagesRequest, key: &str, max: f64) -> Result<Option<f64>, anyhow::Error> {
+    req.extra
+        .get(key)
+        .map(|value| {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("{key} must be numeric"))?;
+            anyhow::ensure!(
+                (0.0..=max).contains(&number),
+                "{key} must be between 0 and {max}"
+            );
+            Ok(number)
+        })
+        .transpose()
+}
+
+fn read_stop(req: &MessagesRequest) -> Result<Option<Vec<String>>, anyhow::Error> {
+    req.extra
+        .get("stop_sequences")
+        .map(|value| {
+            let items = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("stop_sequences must be an array"))?;
+            anyhow::ensure!(
+                items.len() <= 5,
+                "Kimi supports at most five stop sequences"
+            );
+            items
+                .iter()
+                .map(|item| {
+                    let stop = item
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("stop sequence must be a string"))?;
+                    anyhow::ensure!(
+                        !stop.is_empty() && stop.len() <= 32,
+                        "Kimi stop sequences must contain 1..32 bytes"
+                    );
+                    Ok(stop.to_string())
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn read_response_format(req: &MessagesRequest) -> Result<Option<Value>, anyhow::Error> {
+    let format = req
+        .extra
+        .get("output_config")
+        .and_then(|config| config.get("format"))
+        .or_else(|| req.extra.get("output_format"));
+    format.map(|format| {
+        anyhow::ensure!(format["type"] == "json_schema" && format["schema"].is_object(), "Kimi structured output requires a json_schema object");
+        Ok(serde_json::json!({"type":"json_schema", "json_schema":{"name":"response", "schema":format["schema"]}}))
+    }).transpose()
+}
+
+fn read_thinking(req: &MessagesRequest, k3: bool) -> Result<Option<KimiThinking>, anyhow::Error> {
+    let mode = req
+        .extra
+        .get("thinking")
+        .map(|thinking| {
+            thinking
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("thinking requires type"))
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        mode.is_none() || matches!(mode, Some("enabled" | "disabled" | "adaptive")),
+        "unsupported thinking type"
+    );
+    anyhow::ensure!(
+        !k3 || mode != Some("disabled"),
+        "K3 cannot disable thinking; use output_config.effort=low to reduce reasoning"
+    );
+    Ok((!k3).then(|| KimiThinking {
+        kind: if mode == Some("disabled") {
+            "disabled"
+        } else {
+            "enabled"
+        }
+        .into(),
+    }))
+}
+
+fn validate_request(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    for key in ["top_k", "mcp_servers", "container"] {
+        anyhow::ensure!(!req.extra.contains_key(key), "Kimi does not support {key}");
+    }
+    if let Some(system) = req.extra.get("system") {
+        anyhow::ensure!(
+            system.is_string()
+                || system.as_array().is_some_and(|blocks| blocks
+                    .iter()
+                    .all(|block| block["type"] == "text" && block["text"].is_string())),
+            "Kimi system content must contain text only"
+        );
+    }
+    for message in &req.messages {
+        let Some(blocks) = message.content.as_array() else {
+            anyhow::ensure!(
+                message.content.is_string(),
+                "message content must be text or an array"
+            );
+            continue;
+        };
+        for block in blocks {
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+            let supported = match message.role.as_str() {
+                "assistant" => matches!(kind, "text" | "thinking" | "tool_use"),
+                "user" => matches!(kind, "text" | "image" | "tool_result"),
+                "system" | "developer" => kind == "text",
+                _ => false,
+            };
+            anyhow::ensure!(
+                supported,
+                "Kimi does not support {kind} content in {} messages",
+                message.role
+            );
+            if kind == "tool_result" {
+                if let Some(parts) = block.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        let kind = part["type"].as_str().unwrap_or("");
+                        anyhow::ensure!(
+                            matches!(kind, "text" | "image" | "tool_reference"),
+                            "Kimi does not support tool result content {kind}"
+                        );
+                        if kind == "tool_reference" {
+                            let name = part["tool_name"]
+                                .as_str()
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| {
+                                anyhow::anyhow!("tool_reference requires tool_name")
+                            })?;
+                            anyhow::ensure!(
+                                req.extra
+                                    .get("tools")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|tools| tools
+                                        .iter()
+                                        .any(|tool| tool["name"] == name)),
+                                "tool_reference has no registered function schema: {name}"
+                            );
+                        }
+                    }
+                } else {
+                    anyhow::ensure!(
+                        block.get("content").is_none_or(Value::is_string),
+                        "tool result content must be text or an array"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn clamp_max_tokens(requested: Option<u32>, k3: bool) -> u32 {
@@ -226,14 +453,33 @@ fn map_tool_choice(choice: &serde_json::Map<String, Value>) -> KimiToolChoice {
 
 fn read_tool_choice(req: &MessagesRequest) -> Result<Option<KimiToolChoice>, anyhow::Error> {
     match req.extra.get("tool_choice") {
-        Some(Value::Object(choice)) => Ok(Some(map_tool_choice(choice))),
+        Some(Value::Object(choice)) => {
+            anyhow::ensure!(
+                matches!(
+                    choice.get("type").and_then(Value::as_str),
+                    Some("auto" | "none" | "any" | "tool")
+                ),
+                "unsupported tool_choice type"
+            );
+            if choice.get("type").and_then(Value::as_str) == Some("tool") {
+                anyhow::ensure!(
+                    choice
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty()),
+                    "named tool_choice requires name"
+                );
+            }
+            Ok(Some(map_tool_choice(choice)))
+        }
         Some(Value::String(s)) => Ok(Some(match s.as_str() {
             "auto" => KimiToolChoice::Auto,
             "none" => KimiToolChoice::None,
             "any" | "required" => KimiToolChoice::Required,
-            _ => KimiToolChoice::Auto,
+            _ => anyhow::bail!("unsupported tool_choice: {s}"),
         })),
-        _ => Ok(None),
+        None => Ok(None),
+        _ => anyhow::bail!("tool_choice must be an object or string"),
     }
 }
 
@@ -243,15 +489,21 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
     };
     let tools_arr = match tools {
         Value::Array(a) => a,
-        _ => return Ok(Vec::new()),
+        _ => anyhow::bail!("tools must be an array"),
     };
     let mut out = Vec::new();
     for tool in tools_arr {
+        let kind = tool.get("type").and_then(Value::as_str).unwrap_or("custom");
+        anyhow::ensure!(
+            matches!(kind, "custom" | "function"),
+            "Kimi does not support hosted tool type {kind}; use a client-executed function tool"
+        );
         let name = tool
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        anyhow::ensure!(!name.is_empty(), "function tool requires name");
         let description = tool
             .get("description")
             .and_then(|v| v.as_str())
@@ -529,11 +781,15 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
                             image_url: KimiImageUrl { url },
                         });
                     }
-                    Some(other) => {
+                    Some("tool_reference") => {
+                        let name = b["tool_name"].as_str().unwrap_or("");
                         parts.push(KimiToolResultPart::Text {
-                            text: format!("[unsupported content block omitted: {other}]"),
+                            text: format!(
+                                "Tool available: {name}. Use its registered function schema."
+                            ),
                         });
                     }
+                    Some(_) => unreachable!("tool result validated before translation"),
                     None => {}
                 }
             }
@@ -570,9 +826,21 @@ fn push_assistant_message(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
                     text_parts.push(text.clone());
                 }
             }
-            ContentBlock::Thinking { thinking, .. } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 if !thinking.is_empty() {
-                    thinking_parts.push(thinking.clone());
+                    if signature
+                        .as_deref()
+                        .and_then(crate::providers::translate_shared::foreign_reasoning_provider)
+                        == Some("kimi")
+                    {
+                        thinking_parts.push(thinking.clone());
+                    } else {
+                        text_parts
+                            .push(crate::providers::translate_shared::wrap_reasoning(thinking));
+                    }
                 }
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -658,7 +926,7 @@ mod tests {
     #[test]
     fn translate_tool_result_with_unsupported_blocks() {
         let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "kimi-k2",
+            "model": "kimi-for-coding",
             "messages": [{
                 "role": "user",
                 "content": [{
@@ -672,40 +940,14 @@ mod tests {
             }]
         }))
         .unwrap();
-        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
-        // Should have one tool message
-        assert_eq!(translated.messages.len(), 1);
-        match &translated.messages[0] {
-            KimiMessage::Tool {
-                role,
-                tool_call_id,
-                content,
-            } => {
-                assert_eq!(role, "tool");
-                assert_eq!(tool_call_id, "toolu_1");
-                // content should be an array with text parts
-                let parts: Vec<&Value> = match content {
-                    Value::Array(a) => a.iter().collect(),
-                    _ => panic!("expected array content"),
-                };
-                assert_eq!(parts.len(), 2);
-                assert_eq!(
-                    parts[0].get("text").and_then(|v| v.as_str()),
-                    Some("visible output")
-                );
-                assert_eq!(
-                    parts[1].get("text").and_then(|v| v.as_str()),
-                    Some("[unsupported content block omitted: thinking]")
-                );
-            }
-            _ => panic!("expected Tool message"),
-        }
+        let error = translate_request(&req, TranslateOptions { session_id: None }).unwrap_err();
+        assert!(error.to_string().contains("tool result content thinking"));
     }
 
     #[test]
     fn translate_tool_result_with_image() {
         let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "kimi-k2",
+            "model": "kimi-for-coding",
             "messages": [{
                 "role": "user",
                 "content": [{
@@ -770,8 +1012,13 @@ mod tests {
                 tool_calls,
             } => {
                 assert_eq!(role, "assistant");
-                assert_eq!(content.as_deref(), Some("here's the answer"));
-                assert_eq!(reasoning_content.as_deref(), Some("let me think..."));
+                assert_eq!(
+                    content.as_deref(),
+                    Some(
+                        "<previous_reasoning>\nlet me think...\n</previous_reasoning>here's the answer"
+                    )
+                );
+                assert!(reasoning_content.is_none());
                 assert!(tool_calls.is_some());
                 let tcs = tool_calls.as_ref().unwrap();
                 assert_eq!(tcs.len(), 1);
@@ -802,8 +1049,11 @@ mod tests {
                 reasoning_content,
                 ..
             } => {
-                assert_eq!(content.as_deref(), Some(""));
-                assert_eq!(reasoning_content.as_deref(), Some("thinking..."));
+                assert_eq!(
+                    content.as_deref(),
+                    Some("<previous_reasoning>\nthinking...\n</previous_reasoning>")
+                );
+                assert!(reasoning_content.is_none());
             }
             _ => panic!("expected Assistant message"),
         }
@@ -996,6 +1246,27 @@ mod tests {
     }
 
     #[test]
+    fn named_tool_choice_with_thinking_forces_only_that_tool() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3.1-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name":"search","input_schema":{"type":"object"}},
+                {"name":"lookup","input_schema":{"type":"object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request(&req, TranslateOptions { session_id: None }).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["tool_choice"], "required");
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
     fn system_text_excludes_billing_headers() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "kimi-for-coding",
@@ -1158,6 +1429,43 @@ mod tests {
         .unwrap();
         let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
         assert_eq!(translated.max_tokens, 500000);
+    }
+
+    #[test]
+    fn endpoint_model_ids_preserve_k3_wire_shape() {
+        for (base_url, expected) in [
+            ("https://api.kimi.ai/coding/v1", "k3.1-pro"),
+            ("https://api.kimi.com/coding/v1", "k3.1-pro"),
+            ("https://api.moonshot.ai/v1", "kimi-k3.1-pro"),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "kimi-k3.1-pro",
+                "system": "system instructions",
+                "max_tokens": 100_000,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let old = std::env::var_os("CCP_KIMI_BASE_URL");
+            unsafe { std::env::set_var("CCP_KIMI_BASE_URL", base_url) };
+            let result = translate_request(&req, TranslateOptions { session_id: None });
+            unsafe {
+                match old {
+                    Some(value) => std::env::set_var("CCP_KIMI_BASE_URL", value),
+                    None => std::env::remove_var("CCP_KIMI_BASE_URL"),
+                }
+            }
+            let wire = serde_json::to_value(result.unwrap()).unwrap();
+            assert_eq!(wire["model"], expected, "{base_url}");
+            assert_eq!(wire["max_tokens"], 100_000, "{base_url}");
+            assert_eq!(wire["reasoning_effort"], "high", "{base_url}");
+            assert_eq!(wire["messages"][0]["role"], "user", "{base_url}");
+            assert!(
+                wire["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("system instructions")
+            );
+        }
     }
 
     #[test]

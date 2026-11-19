@@ -396,7 +396,7 @@ function renderAccounts() {
       <div class="card-head">
         ${off ? "" : `<span class="handle" role="img" aria-label="Drag to reorder ${esc(targetLabel(x.target, "claude"))}" title="Drag to reorder (or use the arrows)">⠿</span>`}
         <span class="dot"></span><span class="name">${esc(PROVIDER[x.target] || x.target)}</span><span class="spacer"></span>
-        <span class="badge">${esc(LISTED_BACKENDS.includes(x.target) ? "same tier as the requested Claude model" : "exact model")}</span>
+        <span class="badge">${esc(tierProviderKeys().includes(x.target) ? "same tier as the requested Claude model" : "exact model")}</span>
       </div>
       ${provider && PROVIDER[provider] && provider !== "anthropic" ? providerBody(provider, true) : ""}
       <div class="card-foot">
@@ -529,14 +529,16 @@ async function openFlow(id) {
 }
 
 const FAMILIES = [["claude", "Claude models"], ["codex", "Codex / GPT models"], ["gemini", "Gemini models"],
-                  ["cursor-cli", "cursor-agent CLI"], ["cursor", "Cursor API"]];
+                  ["cursor-cli", "cursor-agent CLI"], ["cursor", "Cursor API"], ["kimi", "Kimi models"], ["grok", "Grok models"]];
 const PROVIDER = {anthropic: "Claude", codex: "Codex", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI",
                   gemini: "Gemini", kimi: "Kimi", grok: "Grok"};
 const TRIGGERS = [["rate_limit", "Rate limited (429)", "Quota used up: try the next target, skip this one until it resets"],
                   ["auth", "Login rejected (401)", "A Claude account's login failed: skip it for a minute"],
                   ["server_error", "Server error (5xx)", "Backend down or overloaded: try the next target right away"],
                   ["model_unavailable", "Model not on this account (404)", "Try the same model on the next Claude account without disabling this account"]];
-const TIERED = ["claude", "codex", "cursor"];
+const tierProviderKeys = () => [...new Set([...(state.fallback_defaults?.tiers || []), ...(state.fallback?.tiers || [])]
+  .flatMap(t => Object.keys(t.models)))];
+const tierFamilies = () => tierProviderKeys().map(p => p === "anthropic" ? "claude" : p);
 // The target that serves a family's own request untouched ("accounts" for Claude).
 const own = (family) => family === "claude" ? "accounts" : family;
 
@@ -552,15 +554,16 @@ function chainOf(family) {
 function providerOf(target, family) {
   if (target === "accounts" || /^accounts:\d+$/.test(target)) return "anthropic";
   if (target === family) return family;
-  if (target === "codex" || target === "cursor") return target;
-  const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(target));
+  if (Object.hasOwn(PROVIDER, target)) return target;
+  const hit = Object.entries(state.providers.catalog || {}).find(([, entry]) => entry.models.includes(target))
+    || Object.entries(state.providers.models).find(([, ids]) => ids.includes(target));
   return hit ? hit[0] : target.startsWith("claude-") ? "anthropic" : target.startsWith("gemini-") ? "gemini" : null;
 }
 function targetLabel(target, family) {
   if (target === "accounts") return family === "claude" ? "Claude accounts · as requested" : "Claude accounts · same tier";
   if (/^accounts:\d+$/.test(target)) return `next ${target.slice(9)} Claude account${target.slice(9) === "1" ? "" : "s"}`;
   if (target === family) return "as requested";
-  return {codex: "Codex · same tier", cursor: "Cursor · same tier"}[target] || target;
+  return tierProviderKeys().includes(target) ? `${PROVIDER[target] || target} · same tier` : target;
 }
 function saveFailover(edit) { const f = failover(); edit(f); save({fallback: f}); }
 
@@ -580,7 +583,7 @@ function renderProviders() {
 const QUOTA = {codex: "no Codex CLI login found on the dashboard host",
                cursor: "this backend may use its own Cursor login; cursor-agent's quota is on the cursor-agent CLI card",
                "cursor-cli": "no readable cursor-agent login on the dashboard host",
-               gemini: "gemini-web-api exposes no quota", kimi: "Kimi reports no quota through the router",
+               gemini: "gemini-web-api exposes no quota", kimi: "Kimi balance unavailable; token quota is not reported",
                grok: "Grok reports no quota through the router"};
 const ESTIMATED = {gemini: "gemini-web-api reports no usage, so token counts are the router's estimate"};
 const compact = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
@@ -592,7 +595,7 @@ function chainSpots(provider, skip) {
 }
 function providerUsage(u, r) {
   // A missing provider_usage (no traffic database, or an older server) is unknown, never zero.
-  if (!u) return `<div class="small muted">Traffic recording is off: usage unknown.</div>`;
+  if (!u || !r) return `<div class="small muted">Traffic recording is off or unavailable: usage unknown.</div>`;
   const tokens = r.tokens_reported
     ? `<div><span class="small muted">Tokens in / cached / out</span><strong>${compact(r.tokens.input)} / ${compact(r.tokens.cache_read)} / ${compact(r.tokens.output)}</strong></div>`
     : `<div><span class="small muted">Tokens</span><strong class="muted">${r.requests ? "not reported" : "none"}</strong></div>`;
@@ -605,8 +608,13 @@ function providerUsage(u, r) {
 }
 // A vendor-reported quota snapshot; a meter only when the vendor gave both used and limit.
 function providerQuota(name, q) {
+  if (q?.state === "available" && q.balances?.available != null) {
+    return Object.entries(q.balances).map(([label, amount]) =>
+      `<div class="small"><strong>${esc(label === "available" ? "Available credit" : label === "cash" ? "Cash credit" : "Voucher credit")}</strong> ${esc(amount)} ${esc(q.currency)}</div>`).join("") +
+      `<div class="small muted">${esc(q.note)}. Balance from ${esc(q.source)}, as of ${esc(new Date(q.at * 1000).toLocaleTimeString())}.</div>`;
+  }
   if (!q || q.error || !(q.windows || []).length) {
-    return `<div class="small"><strong>Quota: unknown.</strong> <span class="muted">${esc(q?.error || QUOTA[name])}</span></div>`;
+    return `<div class="small"><strong>Quota: unknown.</strong> <span class="muted">${esc(q?.error || q?.note || QUOTA[name])}</span></div>`;
   }
   return q.windows.map((w) => w.used != null && w.limit
       ? meter(w.label, {utilization: w.used / w.limit * 100, resets_at: w.resets_at}) + (w.unit === "%" ? "" :
@@ -627,13 +635,12 @@ function providerBody(name, listed = false) {
     : ids.length ? ["ok", `signed in · ${ids.length} model${ids.length === 1 ? "" : "s"}`] : ["bad", "unavailable on the proxy host"];
   return `<div class="small"><span title="${esc(ids.join("\n"))}"><span class="dot ${dot}" style="display:inline-block;width:6px;height:6px"></span> ${esc(status)}</span></div>
       <div class="small">${spots.length ? `Failover: ${esc(spots.join(" · "))}` : `<span class="muted">${listed ? "In no other failover chain." : "In no failover chain: used only when one of its models is requested."}</span>`}</div>
-      ${providerUsage(u, u && {name, ...u.providers[name]})}
+      ${providerUsage(u, u?.providers[name] ? {name, ...u.providers[name]} : null)}
       ${providerQuota(name, (state.provider_quota || {})[name])}`;
 }
 
 function addOptions(family) {
-  // Only Claude, Codex and Cursor ids have a tier (Opus/Sol, Fable/Astra, Sonnet/Luna); others name a model.
-  const tiered = TIERED.includes(family) ? ["accounts", "codex", "cursor"].filter((t) => t !== family)
+  const tiered = tierFamilies().includes(family) ? tierProviderKeys().map(p => p === "anthropic" ? "accounts" : p).filter((t) => t !== family)
     .map((t) => `<option value="${t}">${esc(targetLabel(t, family))}</option>`) : [];
   if (family !== "claude") tiered.unshift(`<option value="${esc(family)}">${esc(PROVIDER[family] || family)} · as requested</option>`);
   return `<optgroup label="Shortcuts">${tiered.join("")}</optgroup>` +
@@ -656,7 +663,7 @@ function renderChains() {
           title="${esc(up ? `${PROVIDER[provider] || provider}: drag to reorder` : "Not available on the router right now: skipped")}">
           <b>${i + 1}</b><span>${esc(targetLabel(t, family))}</span><button data-rm="${i}" title="Remove">×</button></span>`;
       }).join("")}<select data-add><option value="">+ add target</option>${addOptions(family)}</select></div></div>`;
-  }).join("") + `<p class="small muted" style="margin:12px 0 0">"Same tier" picks the equivalent model (Opus ↔ Sol ↔ Cursor Opus, Fable ↔ Astra, Sonnet/Haiku ↔ Luna).
+  }).join("") + `<p class="small muted" style="margin:12px 0 0">"Same tier" picks the equivalent model (Opus ↔ Sol ↔ Cursor Opus, Fable ↔ Astra, Sonnet/Haiku ↔ Luna). Kimi destinations follow the editable router policy, not a vendor quality guarantee.
     Nothing is retried once a reply has started streaming.</p>`;
   $("chains").querySelectorAll(".chain").forEach((row) => {
     const family = row.dataset.family, chain = chainOf(family);
@@ -697,10 +704,11 @@ function renderTriggers() {
 
 const home = (path) => (path || "-").replace(/^\/(home|Users)\/[^/]+/, "~");
 const effectiveTiers = () => state.fallback?.tiers?.length ? state.fallback.tiers : state.fallback_defaults?.tiers ?? [];
-const PROVIDER_KEY = {anthropic: "anthropic", codex: "codex", cursor: "cursor"};
 function providerOfModel(model) {
   if (!model) return "";
-  const hit = Object.entries(state.providers.models).find(([, ids]) => ids.includes(model));
+  const clean = model.toLowerCase().replace(/\[1m\]$/, "");
+  const hit = Object.entries(state.providers.catalog || {}).find(([, entry]) => entry.models.some((id) => id.toLowerCase() === clean))
+    || Object.entries(state.providers.models).find(([, ids]) => ids.some((id) => id.toLowerCase() === clean));
   return hit ? hit[0] : model.startsWith("claude-") ? "anthropic" : model.startsWith("gemini-") ? "gemini" : "";
 }
 function sameTier(provider, model) {
@@ -708,22 +716,17 @@ function sameTier(provider, model) {
   const m0 = (model || "").toLowerCase(), group = effectiveTiers().find((t) => t.match.some((k) => k.toLowerCase() === m0.replace(/\[1m\]$/, "")))
     || effectiveTiers().find((t) => t.match.some((k) => m0.includes(k.toLowerCase())));
   // A configured destination is honoured even when the router does not list it (it shows as an exact id).
-  if (group?.models[PROVIDER_KEY[provider]]) return group.models[PROVIDER_KEY[provider]];
-  const newest = (a, b) => b.localeCompare(a, undefined, {numeric: true});
-  const ids = [...(state.providers.models[provider] || [])].sort(newest), m = (model || "").toLowerCase();
-  const keys = group?.match.map((k) => k.toLowerCase());
-  const plain = (id) => !/fast|low|spark|-mini/.test(id);
-  return (keys?.length && (ids.find((id) => plain(id) && keys.some((k) => id.includes(k))) || ids.find((id) => keys.some((k) => id.includes(k)))))
-    || ids.find(plain) || ids[0] || "";
+  if (group?.models[provider]) return group.models[provider];
+  return "";
 }
 function providerOptions(current) {
-  return Object.entries(state.providers.models).filter(([, ids]) => ids.length).map(([name]) =>
-    `<option value="${esc(name)}" ${name === current ? "selected" : ""}>${esc(PROVIDER[name] || name)}</option>`).join("");
+  return Object.entries(state.providers.models).filter(([name, ids]) => ids.length || name === current).map(([name, ids]) =>
+    `<option value="${esc(name)}" ${name === current ? "selected" : ""}>${esc(PROVIDER[name] || name)}${ids.length ? "" : " (unavailable)"}</option>`).join("");
 }
 function modelOptions(provider, current) {
   const ids = state.providers.models[provider] || [];
   return ids.map((id) => `<option ${id === current ? "selected" : ""}>${esc(id)}</option>`).join("") +
-    `<option value="exact" ${current && !ids.includes(current) ? "selected" : ""}>exact model id…</option>`;
+    `<option value="exact" ${!current || !ids.includes(current) ? "selected" : ""}>exact model id…</option>`;
 }
 function remoteLinks(s) {
   if (!sessions.remote_links) return "";
@@ -786,7 +789,7 @@ async function loadSessions() {
   catch (e) { showError(e); }
 }
 
-const TIER_PROVIDER_LABEL = [["anthropic", "Claude"], ["codex", "Codex"], ["cursor", "Cursor API"]];
+const tierProviderLabels = () => tierProviderKeys().map(p => [p, PROVIDER[p] || p]);
 const tierRow = (t) => ({name: t.name, match: t.match.join(", "), models: {...t.models}});
 const tierSignature = (tiers) => JSON.stringify(tiers.map(({name, match, models}) => [name, match, Object.entries(models).sort(([a], [b]) => a.localeCompare(b))]));
 function draftTiers() {
@@ -837,9 +840,9 @@ function renderModels(force = false) {
     draft.map((r, i) => `<article data-tier="${i}">
       <label>Name<input data-f="name" value="${esc(r.name)}" maxlength="64"></label>
       <label>Match keys, comma separated<input data-f="match" value="${esc(r.match)}" placeholder="opus, sol"></label>
-      <div class="tier-grid">${TIER_PROVIDER_LABEL.map(([p, label]) => `<label>${label} model<input data-m="${p}" list="ids-${p}" value="${esc(r.models[p] || "")}" placeholder="none: skipped"></label>`).join("")}</div>
+      <div class="tier-grid">${tierProviderLabels().map(([p, label]) => `<label>${label} model<input data-m="${p}" list="ids-${p}" value="${esc(r.models[p] || "")}" placeholder="none: skipped"></label>`).join("")}</div>
       <button class="secondary outline" data-rm="${i}">Remove group</button></article>`).join("") +
-    TIER_PROVIDER_LABEL.map(([p]) => `<datalist id="ids-${p}">${ids(p).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>`).join("") +
+    tierProviderLabels().map(([p]) => `<datalist id="ids-${p}">${ids(p).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>`).join("") +
     `<div class="actions"><button data-add class="secondary">Add group</button><button data-save ${dirty ? "" : "disabled"}>Save</button>
       <button data-reset class="secondary" ${configured || dirty ? "" : "disabled"}>Reset to defaults</button></div>`;
   box.querySelectorAll("article").forEach((a) => {
@@ -939,7 +942,12 @@ addEventListener("hashchange", showView);
 $("catalog-filter").oninput = renderCatalog;
 showView();
 
-function render() { renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); renderKeys(); }
+function render() {
+  for (const [name, entry] of Object.entries(state.providers.catalog || {})) {
+    PROVIDER[name] = entry.label;
+    if (!FAMILIES.some(([family]) => family === entry.family)) FAMILIES.push([entry.family, `${entry.label} models`]);
+  }
+  renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); renderKeys(); }
 
 async function loadState() {
   try { state = await api("/api/state"); hasLoaded = true; render(); showError(null); }

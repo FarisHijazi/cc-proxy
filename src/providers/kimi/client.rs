@@ -16,14 +16,14 @@ pub struct KimiError {
 }
 
 pub struct KimiResponse {
-    pub body: Vec<u8>,
+    pub body: reqwest::Response,
     pub status: u16,
     pub request_start_time: u64,
 }
 
 pub struct KimiHttpClient {
-    client: reqwest::blocking::Client,
-    auth_manager: KimiAuthManager<crate::auth::FileAuthStore<StoredAuth>>,
+    client: reqwest::Client,
+    auth_manager: std::sync::Arc<KimiAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
 }
 
 impl Default for KimiHttpClient {
@@ -35,11 +35,11 @@ impl Default for KimiHttpClient {
 impl KimiHttpClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
+            client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("failed to create HTTP client"),
-            auth_manager: KimiAuthManager::new(file_store()),
+            auth_manager: std::sync::Arc::new(KimiAuthManager::new(file_store())),
         }
     }
 
@@ -47,32 +47,42 @@ impl KimiHttpClient {
         &self.auth_manager
     }
 
-    pub fn post_kimi(&self, body: &KimiChatRequest) -> Result<KimiResponse, KimiError> {
-        let mut auth = self.auth_manager.get_auth().map_err(|e| KimiError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-        })?;
+    pub async fn post_kimi(&self, body: &KimiChatRequest) -> Result<KimiResponse, KimiError> {
+        let manager = self.auth_manager.clone();
+        let mut auth = tokio::task::spawn_blocking(move || manager.get_auth())
+            .await
+            .map_err(|e| KimiError {
+                status: 500,
+                message: e.to_string(),
+                detail: None,
+                retry_after: None,
+            })?
+            .map_err(|e| KimiError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+            })?;
 
         let mut attempt = 0u32;
         loop {
-            let result = self.attempt_post(&auth.access, body);
+            let result = self.attempt_post(&auth.access, body).await;
 
             match result {
-                Ok(response) if response.status == 401 && attempt == 0 => {
+                Err(error) if error.status == 401 && attempt == 0 && !auth.refresh.is_empty() => {
                     // First 401: try refresh
-                    match self.auth_manager.force_refresh() {
-                        Ok(new_auth) => {
+                    let manager = self.auth_manager.clone();
+                    match tokio::task::spawn_blocking(move || manager.force_refresh()).await {
+                        Ok(Ok(new_auth)) => {
                             auth = new_auth;
                             attempt += 1;
                             continue;
                         }
-                        Err(e) => {
+                        other => {
                             return Err(KimiError {
                                 status: 401,
                                 message: "Unauthorized".to_string(),
-                                detail: Some(e.to_string()),
+                                detail: Some(format!("OAuth refresh failed: {other:?}")),
                                 retry_after: None,
                             });
                         }
@@ -82,7 +92,10 @@ impl KimiHttpClient {
                 Err(err @ KimiError { status: 429, .. }) => {
                     if attempt < MAX_RATE_LIMIT_RETRIES {
                         let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
-                        std::thread::sleep(std::time::Duration::from_millis(delay.wait_ms));
+                        if delay.exceeds_budget {
+                            return Err(err);
+                        }
+                        crate::retry::sleep(delay.wait_ms).await;
                         attempt += 1;
                         continue;
                     }
@@ -93,7 +106,7 @@ impl KimiHttpClient {
         }
     }
 
-    fn attempt_post(
+    async fn attempt_post(
         &self,
         access_token: &str,
         body: &KimiChatRequest,
@@ -119,7 +132,7 @@ impl KimiHttpClient {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
+            .header("Accept", "text/event-stream")
             .header("Authorization", format!("Bearer {access_token}"));
 
         // Add common headers
@@ -131,7 +144,7 @@ impl KimiHttpClient {
             }
         }
 
-        let resp = match req_builder.body(body_json).send() {
+        let resp = match req_builder.body(body_json).send().await {
             Ok(r) => r,
             Err(e) => {
                 return Err(KimiError {
@@ -151,7 +164,7 @@ impl KimiHttpClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().await.unwrap_or_default();
             return Err(KimiError {
                 status: 429,
                 message: "Rate limited".to_string(),
@@ -161,7 +174,7 @@ impl KimiHttpClient {
         }
 
         if status == 401 || status == 403 {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().await.unwrap_or_default();
             return Err(KimiError {
                 status,
                 message: if status == 401 {
@@ -176,7 +189,7 @@ impl KimiHttpClient {
         }
 
         if !resp.status().is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = resp.text().await.unwrap_or_default();
             return Err(KimiError {
                 status,
                 message: "Upstream error".to_string(),
@@ -185,10 +198,8 @@ impl KimiHttpClient {
             });
         }
 
-        let body_bytes = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
-
         Ok(KimiResponse {
-            body: body_bytes,
+            body: resp,
             status,
             request_start_time,
         })

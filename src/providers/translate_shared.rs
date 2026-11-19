@@ -16,6 +16,20 @@ pub fn wrap_reasoning(reasoning: &str) -> String {
     format!("{REASONING_OPEN}\n{reasoning}\n{REASONING_CLOSE}")
 }
 
+pub fn foreign_reasoning_provider(signature: &str) -> Option<&'static str> {
+    if signature.starts_with("ccp:codex:v1:") {
+        return Some("codex");
+    }
+    if signature.starts_with("ccp:kimi:v1:") {
+        return Some("kimi");
+    }
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .ok()?;
+    decoded.starts_with(b"ccp:kimi:v1:").then_some("kimi")
+}
+
 #[derive(Debug)]
 pub enum ContentBlock {
     Text {

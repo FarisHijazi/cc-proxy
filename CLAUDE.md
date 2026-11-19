@@ -75,7 +75,8 @@ contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain link
 **No paid API keys.** Every backend runs on a login that already exists: the
 Claude Code subscription, the Codex CLI login, `cursor-agent login`, a
 signed-in Google account. Before adding a backend, check it can work without a
-per-token-billed key — if it cannot, it does not belong here.
+per-token-billed key — if it cannot, it does not belong here. The owner explicitly authorized
+Moonshot Open Platform API-key use for Kimi on 2026-11-19; this is a Kimi-only exception.
 
 ## Architecture
 
@@ -135,9 +136,12 @@ any of the three.
    by both new backends, as is `anthropic::accumulate_response` (SSE -> one
    Messages JSON), which every streaming backend needs for its non-streaming
    path.
-   Kimi model names live in `providers/kimi/translate/model_allowlist.rs` (aliases + upstream allowlist) and
-   `registry.rs` `KIMI_MODELS`; every `k3*` model takes the k3 request shape. A kimi.ai account needs
+   `providers/kimi/translate/model_allowlist.rs` owns endpoint-aware Kimi model identities. Registry consumes
+   `public_model_ids()` for listing and `all_public_model_ids()` for routing. Moonshot Open Platform uses
+   `CCP_KIMI_BASE_URL=https://api.moonshot.ai/v1` and prefixed upstream IDs. A kimi.ai Coding account uses
    `CCP_KIMI_OAUTH_HOST=https://auth.kimi.ai` and `CCP_KIMI_BASE_URL=https://api.kimi.ai/coding/v1`.
+   Kimi streams incrementally. Unsupported model IDs and content fail explicitly.
+   `tests/kimi_parity.rs` covers streaming, cancellation, errors, and fallback before output.
 7. **`cursor-cli` follows the caller, and `--workspace` is not a sandbox.**
    An Anthropic request carries no working directory, so
    `cursor_cli::workspace` reads it out of the environment block Claude Code
@@ -335,7 +339,10 @@ Source-labeled non-Claude usage cards use `scripts/account_providers.py` (24-hou
 newest 2,000 replies for token totals). `scripts/account_cursor_quota.py` reads Cursor's own quota RPCs
 and `scripts/account_codex_quota.py` reads ChatGPT's `wham/usage` (Codex CLI `/status`), each with its
 CLI's access token, never refreshing or writing it. Vendor failures are sanitized and isolated;
-other providers' unknown remaining quota must not become zero. Provider ordering stays in fallback chains.
+other providers' unknown remaining quota must not become zero. `scripts/account_kimi_quota.py` reads
+Moonshot monetary credit using the existing Kimi access credential and the router's safe endpoint metadata.
+Credit is not token quota. `/v1/models` exposes `provider_catalog`; the dashboard consumes its identities.
+`src/fallback.rs` owns Kimi equivalence policy in both directions. Provider ordering stays in fallback chains.
 `scripts/account_remote_links.py` links each session to HQ (cchq) and its claude.ai mirror (`--hq`/`--hq-public-url`
 on `account_ui.py`). Remote Control traffic never carries the Claude session id, and folder/time matching was
 measured wrong live; the exact key is the reply `msg_…` id that a worker event relays and the inference response

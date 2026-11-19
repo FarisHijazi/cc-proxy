@@ -115,7 +115,10 @@ fn rehydrate_unsigned_thinking(block: &mut Value) -> bool {
     let signed = map
         .get("signature")
         .and_then(Value::as_str)
-        .is_some_and(|sig| !sig.is_empty());
+        .is_some_and(|sig| {
+            !sig.is_empty()
+                && crate::providers::translate_shared::foreign_reasoning_provider(sig).is_none()
+        });
     if signed {
         return false;
     }
@@ -572,6 +575,22 @@ mod tests {
         });
         let raw = serde_json::to_vec(&body).unwrap();
         assert!(sanitize_anthropic_request(&raw, "req2").is_none());
+    }
+
+    #[test]
+    fn proxy_kimi_thinking_signature_becomes_tagged_text() {
+        let body = serde_json::json!({"messages": [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "kimi reasoning", "signature": "Y2NwOmtpbWk6djE6bXNnXzE6MA"}
+        ]}]});
+        let out =
+            sanitize_anthropic_request(&serde_json::to_vec(&body).unwrap(), "req-kimi").unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            out["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "text", "text": wrap_reasoning("kimi reasoning")
+            })
+        );
     }
 
     #[test]
