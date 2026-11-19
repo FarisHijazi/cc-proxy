@@ -157,195 +157,248 @@ struct StreamError {
     r#type: Option<String>,
 }
 
-#[allow(dead_code)]
 struct ToolSlot {
     tc_index: usize,
     block_index: usize,
-    id: String,
-    name: String,
 }
 
-pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
-    let sse_events = parse_sse_events(input);
-    let mut out = Vec::new();
-    let mut next_block_index = 0usize;
-    let mut thinking_index: Option<usize> = None;
-    let mut text_index: Option<usize> = None;
-    let mut tool_slots: Vec<ToolSlot> = Vec::new();
-    let mut saw_tool_calls = false;
-    let mut finish_reason: Option<String> = None;
-    let mut final_usage: Option<KimiUsage> = None;
+#[derive(Default)]
+struct PendingTool {
+    id: String,
+    name: String,
+    arguments: String,
+}
 
-    for evt in &sse_events {
-        let data = evt.data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
+#[derive(Default)]
+pub struct KimiReducer {
+    next_block_index: usize,
+    thinking_index: Option<usize>,
+    text_index: Option<usize>,
+    tool_slots: Vec<ToolSlot>,
+    pending_tools: std::collections::BTreeMap<usize, PendingTool>,
+    saw_tool_calls: bool,
+    finish_reason: Option<String>,
+    final_usage: Option<KimiUsage>,
+}
+
+impl KimiReducer {
+    pub fn push(&mut self, input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+        let sse_events = parse_sse_events(input);
+        let mut out = Vec::new();
+        for evt in &sse_events {
+            let data = evt.data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+
+            let chunk: StreamChunk = match serde_json::from_str(data) {
+                Ok(c) => c,
+                Err(error) => {
+                    return Err(UpstreamStreamError {
+                        kind: UpstreamErrorKind::Failed,
+                        message: format!("Malformed upstream SSE JSON: {error}"),
+                        retry_after_seconds: None,
+                    });
+                }
+            };
+
+            if let Some(ref err) = chunk.error {
+                return Err(UpstreamStreamError {
+                    kind: UpstreamErrorKind::Failed,
+                    message: err
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Upstream error".to_string()),
+                    retry_after_seconds: None,
+                });
+            }
+
+            if chunk.usage.is_some() && chunk.choices.as_ref().map(|c| c.is_empty()).unwrap_or(true)
+            {
+                self.final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
+                continue;
+            }
+
+            let choice = match chunk.choices.as_ref().and_then(|c| c.first()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let delta = match choice.delta.as_ref() {
+                Some(d) => d,
+                None => {
+                    if choice.finish_reason.is_some() {
+                        self.finish_reason = choice.finish_reason.clone();
+                        if chunk.usage.is_some() {
+                            self.final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            // Reasoning content
+            if let Some(ref reasoning) = delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                if self.thinking_index.is_none() {
+                    self.thinking_index = Some(self.next_block_index);
+                    self.next_block_index += 1;
+                    out.push(ReducerEvent::ThinkingStart {
+                        index: self.thinking_index.unwrap(),
+                    });
+                }
+                out.push(ReducerEvent::ThinkingDelta {
+                    index: self.thinking_index.unwrap(),
+                    text: reasoning.clone(),
+                });
+            }
+
+            // Content text
+            if let Some(ref content) = delta.content
+                && !content.is_empty()
+            {
+                // Close thinking before text
+                if let Some(ti) = self.thinking_index.take() {
+                    out.push(ReducerEvent::ThinkingStop { index: ti });
+                }
+                if self.text_index.is_none() {
+                    self.text_index = Some(self.next_block_index);
+                    self.next_block_index += 1;
+                    out.push(ReducerEvent::TextStart {
+                        index: self.text_index.unwrap(),
+                    });
+                }
+                out.push(ReducerEvent::TextDelta {
+                    index: self.text_index.unwrap(),
+                    text: content.clone(),
+                });
+            }
+
+            // Tool calls
+            if let Some(ref tool_calls) = delta.tool_calls
+                && !tool_calls.is_empty()
+            {
+                // Close thinking and text before tools
+                if let Some(ti) = self.thinking_index.take() {
+                    out.push(ReducerEvent::ThinkingStop { index: ti });
+                }
+                if let Some(ti) = self.text_index.take() {
+                    out.push(ReducerEvent::TextStop { index: ti });
+                }
+
+                for tc in tool_calls {
+                    if let Some(slot) = self
+                        .tool_slots
+                        .iter()
+                        .find(|slot| slot.tc_index == tc.index)
+                    {
+                        if let Some(arguments) = tc
+                            .function
+                            .as_ref()
+                            .and_then(|function| function.arguments.as_ref())
+                            && !arguments.is_empty()
+                        {
+                            out.push(ReducerEvent::ToolDelta {
+                                index: slot.block_index,
+                                partial_json: arguments.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let pending = self.pending_tools.entry(tc.index).or_default();
+                    if let Some(id) = &tc.id {
+                        pending.id.push_str(id);
+                    }
+                    if let Some(function) = &tc.function {
+                        if let Some(name) = &function.name {
+                            pending.name.push_str(name);
+                        }
+                        if let Some(arguments) = &function.arguments {
+                            pending.arguments.push_str(arguments);
+                        }
+                    }
+                    if pending.id.is_empty() || pending.name.is_empty() {
+                        continue;
+                    }
+                    let pending = self
+                        .pending_tools
+                        .remove(&tc.index)
+                        .expect("pending tool exists");
+                    self.saw_tool_calls = true;
+                    let index = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.tool_slots.push(ToolSlot {
+                        tc_index: tc.index,
+                        block_index: index,
+                    });
+                    out.push(ReducerEvent::ToolStart {
+                        index,
+                        id: pending.id,
+                        name: pending.name,
+                    });
+                    if !pending.arguments.is_empty() {
+                        out.push(ReducerEvent::ToolDelta {
+                            index,
+                            partial_json: pending.arguments,
+                        });
+                    }
+                }
+            }
+
+            // Finish reason on choice level
+            if let Some(ref reason) = choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
+                if chunk.usage.is_some() {
+                    self.final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
+                }
+            }
         }
 
-        let chunk: StreamChunk = match serde_json::from_str(data) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        Ok(out)
+    }
 
-        if let Some(ref err) = chunk.error {
+    pub fn finish(&mut self) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+        if !self.pending_tools.is_empty() {
             return Err(UpstreamStreamError {
                 kind: UpstreamErrorKind::Failed,
-                message: err
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "Upstream error".to_string()),
+                message: "Kimi stream ended with incomplete tool metadata".into(),
                 retry_after_seconds: None,
             });
         }
-
-        if chunk.usage.is_some() && chunk.choices.as_ref().map(|c| c.is_empty()).unwrap_or(true) {
-            final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
-            continue;
+        let mut out = Vec::new();
+        // Close any open blocks
+        if let Some(ti) = self.thinking_index.take() {
+            out.push(ReducerEvent::ThinkingStop { index: ti });
         }
-
-        let choice = match chunk.choices.as_ref().and_then(|c| c.first()) {
-            Some(c) => c,
-            None => continue,
-        };
-        let delta = match choice.delta.as_ref() {
-            Some(d) => d,
-            None => {
-                if choice.finish_reason.is_some() {
-                    finish_reason = choice.finish_reason.clone();
-                    if chunk.usage.is_some() {
-                        final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
-                    }
-                }
-                continue;
-            }
-        };
-
-        // Reasoning content
-        if let Some(ref reasoning) = delta.reasoning_content
-            && !reasoning.is_empty()
-        {
-            if thinking_index.is_none() {
-                thinking_index = Some(next_block_index);
-                next_block_index += 1;
-                out.push(ReducerEvent::ThinkingStart {
-                    index: thinking_index.unwrap(),
-                });
-            }
-            out.push(ReducerEvent::ThinkingDelta {
-                index: thinking_index.unwrap(),
-                text: reasoning.clone(),
+        if let Some(ti) = self.text_index.take() {
+            out.push(ReducerEvent::TextStop { index: ti });
+        }
+        for slot in self.tool_slots.iter() {
+            out.push(ReducerEvent::ToolStop {
+                index: slot.block_index,
             });
         }
 
-        // Content text
-        if let Some(ref content) = delta.content
-            && !content.is_empty()
-        {
-            // Close thinking before text
-            if let Some(ti) = thinking_index.take() {
-                out.push(ReducerEvent::ThinkingStop { index: ti });
-            }
-            if text_index.is_none() {
-                text_index = Some(next_block_index);
-                next_block_index += 1;
-                out.push(ReducerEvent::TextStart {
-                    index: text_index.unwrap(),
-                });
-            }
-            out.push(ReducerEvent::TextDelta {
-                index: text_index.unwrap(),
-                text: content.clone(),
-            });
-        }
+        let stop_reason = match self.finish_reason.as_deref() {
+            Some("length") => StopReason::MaxTokens,
+            Some("tool_calls") => StopReason::ToolUse,
+            _ if self.saw_tool_calls => StopReason::ToolUse,
+            _ => StopReason::EndTurn,
+        };
 
-        // Tool calls
-        if let Some(ref tool_calls) = delta.tool_calls
-            && !tool_calls.is_empty()
-        {
-            // Close thinking and text before tools
-            if let Some(ti) = thinking_index.take() {
-                out.push(ReducerEvent::ThinkingStop { index: ti });
-            }
-            if let Some(ti) = text_index.take() {
-                out.push(ReducerEvent::TextStop { index: ti });
-            }
-
-            for tc in tool_calls {
-                let existing_pos = tool_slots.iter().position(|s| s.tc_index == tc.index);
-                let block_index = if let Some(pos) = existing_pos {
-                    tool_slots[pos].block_index
-                } else {
-                    let id = tc.id.clone().unwrap_or_default();
-                    let name = tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_default();
-                    if id.is_empty() || name.is_empty() {
-                        continue;
-                    }
-                    saw_tool_calls = true;
-                    let bi = next_block_index;
-                    next_block_index += 1;
-                    tool_slots.push(ToolSlot {
-                        tc_index: tc.index,
-                        block_index: bi,
-                        id: id.clone(),
-                        name: name.clone(),
-                    });
-                    out.push(ReducerEvent::ToolStart {
-                        index: bi,
-                        id,
-                        name,
-                    });
-                    bi
-                };
-
-                if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_ref())
-                    && !args.is_empty()
-                {
-                    out.push(ReducerEvent::ToolDelta {
-                        index: block_index,
-                        partial_json: args.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Finish reason on choice level
-        if let Some(ref reason) = choice.finish_reason {
-            finish_reason = Some(reason.clone());
-            if chunk.usage.is_some() {
-                final_usage = chunk.usage.map(|u| kimi_usage_from_stream(&u));
-            }
-        }
-    }
-
-    // Close any open blocks
-    if let Some(ti) = thinking_index.take() {
-        out.push(ReducerEvent::ThinkingStop { index: ti });
-    }
-    if let Some(ti) = text_index.take() {
-        out.push(ReducerEvent::TextStop { index: ti });
-    }
-    for slot in tool_slots.iter() {
-        out.push(ReducerEvent::ToolStop {
-            index: slot.block_index,
+        out.push(ReducerEvent::Finish {
+            stop_reason,
+            usage: self.final_usage.take(),
         });
+
+        Ok(out)
     }
+}
 
-    let stop_reason = match finish_reason.as_deref() {
-        Some("length") => StopReason::MaxTokens,
-        Some("tool_calls") => StopReason::ToolUse,
-        _ if saw_tool_calls => StopReason::ToolUse,
-        _ => StopReason::EndTurn,
-    };
-
-    out.push(ReducerEvent::Finish {
-        stop_reason,
-        usage: final_usage,
-    });
-
+pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    let mut reducer = KimiReducer::default();
+    let mut out = reducer.push(input)?;
+    out.extend(reducer.finish()?);
     Ok(out)
 }
 
@@ -401,7 +454,7 @@ mod tests {
         let upstream = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\"\"}}]}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\"\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"rust\\\"}\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
             "data: [DONE]\n\n"
@@ -470,21 +523,13 @@ mod tests {
     }
 
     #[test]
-    fn reducer_ignores_invalid_json() {
+    fn reducer_rejects_invalid_json() {
         let upstream = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"valid\"}}]}\n\n",
             "data: not json\n\n",
             "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
         );
-        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
-        let texts: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                ReducerEvent::TextDelta { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["valid"]);
+        assert!(reduce_upstream_bytes(upstream.as_bytes()).is_err());
     }
 
     #[test]

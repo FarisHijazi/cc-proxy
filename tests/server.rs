@@ -245,7 +245,7 @@ fn routed_registry() -> Arc<Registry> {
         vec![
             Arc::new(FakeProvider {
                 name: "kimi",
-                models: vec!["kimi-k2.6".to_string()],
+                models: vec!["kimi-k3".to_string()],
             }) as Arc<dyn Provider>,
             Arc::new(FakeProvider {
                 name: "grok",
@@ -1055,7 +1055,7 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
     for (uri, request, expected) in [
         (
             "/v1/chat/completions",
-            json!({"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"kimi-k3","messages":[{"role":"user","content":"hello"}]}),
             "kimi",
         ),
         (
@@ -1106,16 +1106,16 @@ async fn openai_routes_preserve_serial_tool_calls_upstream() {
     for (provider, model, uri, body, expected_choice) in [
         (
             "kimi",
-            "kimi-k2.6",
+            "kimi-k3",
             "/v1/chat/completions",
             json!({
-                "model":"kimi-k2.6",
+                "model":"kimi-k3",
                 "messages":[{"role":"user","content":"look up x"}],
                 "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
                 "tool_choice":{"type":"function","function":{"name":"lookup"}},
                 "parallel_tool_calls":false
             }),
-            json!({"type":"function","function":{"name":"lookup"}}),
+            json!("required"),
         ),
         (
             "grok",
@@ -1163,7 +1163,7 @@ async fn routed_openai_streams_use_surface_specific_events() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"model":"kimi-k2.6","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
+                    r#"{"model":"kimi-k3","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
                 ))
                 .unwrap(),
         )
@@ -1216,7 +1216,7 @@ async fn non_codex_validation_uses_openai_errors_before_generation() {
                 .header("content-type", "application/json")
                 .header("x-client-request-id", "invalid-routed-request")
                 .body(body_string(
-                    r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
+                    r#"{"model":"kimi-k3","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
                 ))
                 .unwrap(),
         )

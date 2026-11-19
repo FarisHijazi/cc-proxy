@@ -36,7 +36,7 @@ try {
   let releaseSessions;
   const sessionsGate = new Promise((resolve) => { releaseSessions = resolve; });
   const state = () => ({
-    accounts: [], balance: { strategy: "session" }, strategies: ["session"], fallback: {tiers}, fallback_defaults: null,
+    accounts: [], balance: { strategy: "session" }, strategies: ["session"], fallback: {tiers}, fallback_defaults: {tiers: [{name: "opus-sol", match: ["opus", "sol"], models: {anthropic: "claude-opus-5-5", codex: "gpt-6.1-sol"}}]},
     providers: { reachable: true, models: { anthropic: ["claude-opus-4-7"], codex: ["gpt-6.1-sol-fast", "gpt-6.1-sol", "gpt-6-luna"], "cursor-cli": ["cursor-cli:auto"] } },
     proxy: { address: "x:1", up: true }, db: { path: "/t.db", bytes: 0, disk_free: 1 }, traffic_days: null, session_models: forced,
   });

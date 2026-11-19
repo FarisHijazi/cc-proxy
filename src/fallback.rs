@@ -104,7 +104,7 @@ pub struct Tier {
     pub models: HashMap<String, String>,
 }
 
-fn builtin(name: &str, keys: &[&str], models: [(&str, &str); 3]) -> Tier {
+fn builtin(name: &str, keys: &[&str], models: [(&str, &str); 4]) -> Tier {
     Tier {
         name: name.into(),
         match_keys: keys.iter().map(|key| key.to_string()).collect(),
@@ -121,29 +121,47 @@ fn default_tiers() -> &'static [Tier] {
         vec![
             builtin(
                 "opus-sol",
-                &["opus", "sol"],
+                &[
+                    "opus",
+                    "sol",
+                    "kimi-k3.1-pro-highspeed",
+                    "k3.1-pro-highspeed",
+                ],
                 [
                     ("anthropic", "claude-opus-5-5"),
                     ("codex", "gpt-6.1-sol"),
                     ("cursor", "cursor:claude-opus-5"),
+                    ("kimi", "kimi-k3.1-pro-highspeed"),
                 ],
             ),
             builtin(
                 "fable-astra",
-                &["fable", "astra"],
+                &["fable", "astra", "kimi-k3.1-pro", "k3.1-pro"],
                 [
                     ("anthropic", "claude-fable-5-1"),
                     ("codex", "gpt-6-astra"),
                     ("cursor", "cursor:claude-fable-5"),
+                    ("kimi", "kimi-k3.1-pro"),
                 ],
             ),
             builtin(
                 "sonnet-luna",
-                &["sonnet", "haiku", "luna"],
+                &[
+                    "sonnet",
+                    "haiku",
+                    "luna",
+                    "kimi-for-coding",
+                    "kimi-for-coding-highspeed",
+                    "kimi-k3",
+                    "k3",
+                    "kimi-k3-256k",
+                    "k3-256k",
+                ],
                 [
                     ("anthropic", "claude-sonnet-5-5"),
                     ("codex", "gpt-6-luna"),
                     ("cursor", "cursor:claude-sonnet-5"),
+                    ("kimi", "kimi-k3"),
                 ],
             ),
         ]
@@ -185,7 +203,7 @@ fn normalize(model: &str) -> String {
 /// The router's own defaults, for dashboards to show and edit from.
 pub fn defaults() -> Value {
     json!({
-        "chains": {"claude": DEFAULT_CLAUDE, "codex": DEFAULT_CODEX},
+        "chains": {"claude": DEFAULT_CLAUDE, "codex": DEFAULT_CODEX, "kimi": DEFAULT_KIMI},
         "tiers": default_tiers(),
     })
 }
@@ -202,6 +220,7 @@ enum Step {
 
 const DEFAULT_CLAUDE: &[&str] = &["accounts", "codex"];
 const DEFAULT_CODEX: &[&str] = &["codex", "accounts"];
+const DEFAULT_KIMI: &[&str] = &["kimi", "accounts", "codex"];
 
 /// The ordered chain for a request first routed to `provider`.
 fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<Step> {
@@ -214,6 +233,7 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
         Some(targets) => targets.iter().map(String::as_str).collect(),
         None if family == "claude" => DEFAULT_CLAUDE.to_vec(),
         None if family == "codex" => DEFAULT_CODEX.to_vec(),
+        None if family == "kimi" => DEFAULT_KIMI.to_vec(),
         None => Vec::new(),
     };
     let tier = policy.tier(model);
@@ -240,6 +260,7 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
             }
             "codex" => tier.and_then(|t| t.models.get("codex").cloned()),
             "cursor" => tier.and_then(|t| t.models.get("cursor").cloned()),
+            "kimi" => tier.and_then(|t| t.models.get("kimi").cloned()),
             id => Some(id.to_string()),
         };
         let Some(substitute) = substitute else {
@@ -613,18 +634,87 @@ mod tests {
     }
 
     #[test]
+    fn every_kimi_source_has_one_exact_tier_and_routes_both_directions() {
+        let policy = Policy::default();
+        for id in crate::providers::kimi::translate::model_allowlist::all_public_model_ids() {
+            let exact: Vec<_> = policy
+                .tiers()
+                .iter()
+                .filter(|tier| tier.match_keys.iter().any(|key| key == id))
+                .collect();
+            assert_eq!(exact.len(), 1, "{id} needs one canonical source tier");
+            let tier = exact[0];
+            assert_eq!(policy.tier(&format!("{id}[1m]")).unwrap().name, tier.name);
+            for destination in ["codex", "cursor", "kimi"] {
+                let configured = super::tests::policy(json!({"chains": {"kimi": [destination]}}));
+                let expected = if destination == "kimi" {
+                    Step::Original
+                } else {
+                    sub(&tier.models[destination])
+                };
+                assert_eq!(
+                    chain("kimi", id, 1, &configured),
+                    [expected],
+                    "{id} -> {destination}"
+                );
+            }
+            assert_eq!(
+                chain("kimi", id, 1, &policy),
+                [
+                    Step::Original,
+                    Step::Account(0, tier.models["anthropic"].clone()),
+                    sub(&tier.models["codex"])
+                ]
+            );
+            for source in ["anthropic", "codex", "cursor"] {
+                let family = if source == "anthropic" {
+                    "claude"
+                } else {
+                    source
+                };
+                let configured = super::tests::policy(json!({"chains": {family: ["kimi"]}}));
+                assert_eq!(
+                    chain(source, &tier.models[source], 1, &configured),
+                    [sub(&tier.models["kimi"])]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn defaults_expose_the_chains_and_tiers_the_router_uses() {
         let defaults = defaults();
         assert_eq!(defaults["chains"]["claude"], json!(["accounts", "codex"]));
         assert_eq!(defaults["chains"]["codex"], json!(["codex", "accounts"]));
         let tiers = defaults["tiers"].as_array().unwrap();
         assert_eq!(tiers.len(), 3);
-        assert_eq!(tiers[0]["match"], json!(["opus", "sol"]));
+        assert_eq!(
+            tiers[0]["match"],
+            json!([
+                "opus",
+                "sol",
+                "kimi-k3.1-pro-highspeed",
+                "k3.1-pro-highspeed"
+            ])
+        );
         assert_eq!(tiers[0]["models"]["codex"], "gpt-6.1-sol");
         let round_trip = policy(json!({"tiers": defaults["tiers"]}));
         assert_eq!(
             chain("anthropic", "claude-haiku-5-5", 1, &round_trip),
             default_chain("anthropic", "claude-haiku-5-5", 1)
+        );
+    }
+
+    #[test]
+    fn current_fable_source_keeps_pinned_reverse_destination() {
+        let configured = policy(json!({"chains": {"claude": ["kimi"]}}));
+        assert_eq!(
+            chain("anthropic", "claude-fable-5-2", 1, &configured),
+            [sub("kimi-k3.1-pro")]
+        );
+        assert_eq!(
+            Policy::default().tier("k3.1-pro").unwrap().models["anthropic"],
+            "claude-fable-5-1"
         );
     }
 

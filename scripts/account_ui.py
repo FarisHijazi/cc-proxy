@@ -32,8 +32,8 @@ STRATEGIES = ["session", "prefer", "round-robin", "least-sessions"]
 WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
 CACHE_S = 60
 # Equivalence groups travel in a request header, so keep them small. Defaults come from the router (src/fallback.rs).
-TIER_PROVIDERS = ["anthropic", "codex", "cursor"]
-MAX_TIERS, MAX_TIER_KEYS, MAX_TIER_BYTES = 24, 8, 8192
+TIER_PROVIDERS = ["anthropic", "codex", "cursor", "kimi"]
+MAX_TIERS, MAX_TIER_KEYS, MAX_TIER_BYTES = 24, 16, 8192
 TRIGGERS = ["rate_limit", "auth", "server_error", "model_unavailable"]
 # Same patterns account_inject.py accepts for "session_models" (they become a request header).
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -48,6 +48,7 @@ PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "gr
 _providers = runpy.run_path(str(HERE / "account_providers.py"), run_name="account_providers")
 provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cursor_card_quota"]
 cursor_quota = runpy.run_path(str(HERE / "account_cursor_quota.py"), run_name="account_cursor_quota")["cursor_quota"]
+kimi_quota = runpy.run_path(str(HERE / "account_kimi_quota.py"), run_name="account_kimi_quota")["kimi_quota"]
 codex_quota = runpy.run_path(str(HERE / "account_codex_quota.py"), run_name="account_codex_quota")["codex_quota"]
 RemoteLinks = runpy.run_path(str(HERE / "account_remote_links.py"), run_name="account_remote_links")["RemoteLinks"]
 MCPRelay = runpy.run_path(str(HERE / "account_mcp_relay.py"), run_name="account_mcp_relay")["MCPRelay"]
@@ -224,15 +225,17 @@ class Dashboard:
                 # The --serve proxy sends every api.anthropic.com path, this one included, to the router.
                 with self.opener.open("https://api.anthropic.com/v1/models", timeout=10) as response:
                     body = json.load(response)
-                listed = ([m["display_name"] for m in body["data"]], body.get("fallback_defaults"))
+                listed = (body["data"], body.get("fallback_defaults"), body.get("provider_catalog", {}))
             except Exception:  # noqa: BLE001 - shown as "router unreachable"
                 listed = None
             hit = self.cache["models"] = (time.time(), listed)
         models = {name: [] for name in PROVIDERS}
-        for display in hit[1][0] if hit[1] else []:
-            model, _, provider = display.rpartition(" (")
-            models.setdefault(provider.rstrip(")"), []).append(model)
-        return {"reachable": hit[1] is not None, "models": models, "fallback_defaults": hit[1][1] if hit[1] else None}
+        for entry in hit[1][0] if hit[1] else []:
+            model, _, legacy_provider = entry.get("display_name", "").rpartition(" (")
+            provider = entry.get("provider") or legacy_provider.rstrip(")")
+            models.setdefault(provider, []).append(entry.get("id") or model)
+        return {"reachable": hit[1] is not None, "models": models, "fallback_defaults": hit[1][1] if hit[1] else None,
+                "catalog": hit[1][2] if hit[1] else {}}
 
     def last_reply(self, alias, cfg):
         db = self.database(cfg)
@@ -273,15 +276,17 @@ class Dashboard:
         """Each non-Claude backend's last 24 h from the traffic database; None (unknown) without one."""
         hit = self.cache.get("provider_usage")
         if not hit or time.time() - hit[0] >= CACHE_S:
-            hit = self.cache["provider_usage"] = (time.time(), provider_usage(self.database(cfg)))
+            hit = self.cache["provider_usage"] = (time.time(), provider_usage(self.database(cfg), catalog=self.providers().get("catalog")))
         return hit[1]
 
     def provider_quota(self):
-        """Vendor-reported quota per backend: the Codex CLI's and cursor-agent's own logins. The
-        `cursor` API backend may hold a different Cursor login, so it gets no snapshot."""
+        """Read-only vendor snapshots. Kimi credit uses the router's endpoint metadata;
+        Cursor API may hold a different login, so only cursor-agent receives CLI quota."""
+        base = self.providers().get("catalog", {}).get("kimi", {}).get("balance_base_url")
         hit = self.cache.get("provider_quota")
-        if not hit or time.time() - hit[0] >= QUOTA_CACHE_S:
-            readers = {"codex": codex_quota, "cursor-cli": lambda: cursor_card_quota(cursor_quota())}
+        if not hit or time.time() - hit[0] >= QUOTA_CACHE_S or hit[2] != base:
+            readers = {"codex": codex_quota, "cursor-cli": lambda: cursor_card_quota(cursor_quota()),
+                       "kimi": lambda: kimi_quota(base_url=base)}
             with ThreadPoolExecutor(len(readers)) as pool:
                 futures = {name: pool.submit(read) for name, read in readers.items()}
             snapshots = {}
@@ -290,7 +295,7 @@ class Dashboard:
                     snapshots[name] = future.result()
                 except Exception as error:  # noqa: BLE001 - optional provider data cannot take down the dashboard
                     snapshots[name] = {"error": f"{name} quota: {type(error).__name__}"}
-            hit = self.cache["provider_quota"] = (time.time(), snapshots)
+            hit = self.cache["provider_quota"] = (time.time(), snapshots, base)
         return hit[1]
 
     def database(self, cfg):

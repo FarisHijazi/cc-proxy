@@ -17,11 +17,9 @@ use crate::provider::{
     RequestContext,
 };
 use crate::providers::kimi::auth::token_store::file_store;
-use crate::providers::kimi::translate::accumulate::accumulate_response;
+use crate::providers::kimi::translate::model_allowlist::public_model_ids;
 use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, resolve_model};
 use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
-use crate::providers::kimi::translate::stream::translate_stream_bytes;
-use crate::registry::KIMI_MODELS;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -58,7 +56,7 @@ impl Provider for KimiProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        KIMI_MODELS.iter().map(|s| s.to_string()).collect()
+        public_model_ids().iter().map(|s| s.to_string()).collect()
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -66,113 +64,69 @@ impl Provider for KimiProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("kimi-for-coding");
-        let resolved = resolve_model(model);
-
-        if let Err(e) = assert_allowed_model(&resolved) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Model \"{model}\" resolves to unsupported model \"{}\"",
-                    e.model
-                ),
-            );
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
-
-        let translated = match translate_request(
-            &body,
-            TranslateOptions {
-                session_id: ctx.session_id.clone(),
-            },
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
-        };
-
-        // KimiHttpClient uses a blocking client whose lifecycle belongs on a
-        // blocking thread.
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = match tokio::task::spawn_blocking(move || {
-            let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
-            drop(client);
-            result
-        })
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                return map_kimi_error_to_response(&e);
-            }
-            Err(join_err) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Blocking task join error: {join_err}"),
-                );
-            }
-        };
-
-        if want_stream {
-            let sse_bytes = match translate_stream_bytes(&upstream.body, &message_id, model) {
-                Ok(b) => b,
-                Err(e) => {
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        format!("Stream translation error: {e}"),
-                    );
-                }
-            };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
-        } else {
-            match accumulate_response(&upstream.body, &message_id, model) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
+        let model = body
+            .model
+            .clone()
+            .unwrap_or_else(|| "kimi-for-coding".into());
+        match self.generate_anthropic_stream(body, ctx).await {
+            Ok(generation) => {
+                let body = match generation.body {
+                    GenerationBody::LiveSse(body) => body,
+                    GenerationBody::BufferedSse(bytes) => axum::body::Body::from(bytes),
+                };
+                if want_stream {
+                    (
+                        [
+                            (http::header::CONTENT_TYPE, "text/event-stream"),
+                            (http::header::CACHE_CONTROL, "no-cache"),
+                        ],
+                        body,
+                    )
+                        .into_response()
+                } else {
+                    match axum::body::to_bytes(body, usize::MAX).await {
+                        Ok(bytes) => {
+                            if crate::anthropic::sse::parse_sse_events(&bytes)
+                                .iter()
+                                .any(|event| event.event.as_deref() == Some("error"))
+                            {
+                                return json_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    "api_error",
+                                    "Kimi upstream stream failed",
+                                );
+                            }
+                            match crate::anthropic::accumulate::accumulate_response(
+                                &bytes,
+                                &format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                                &model,
+                            ) {
+                                Ok(json) => Json(json).into_response(),
+                                Err(error) => json_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    "api_error",
+                                    error.to_string(),
+                                ),
+                            }
+                        }
+                        Err(error) => {
+                            json_error(StatusCode::BAD_GATEWAY, "api_error", error.to_string())
+                        }
                     }
-                    (StatusCode::OK, Json(json)).into_response()
                 }
-                Err(e) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Accumulation error: {e}"),
-                ),
+            }
+            Err(error) => {
+                let mut response = json_error(error.status, error.error_type(), error.message);
+                if let Some(retry_after) = error
+                    .retry_after
+                    .and_then(|value| value.parse::<http::HeaderValue>().ok())
+                {
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, retry_after);
+                }
+                response
             }
         }
     }
@@ -242,48 +196,70 @@ impl Provider for KimiProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = tokio::task::spawn_blocking(move || {
-            let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
-            drop(client);
-            result
-        })
-        .await
-        .map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_GATEWAY,
-                ProviderErrorKind::Api,
-                format!("Blocking task join error: {error}"),
-            )
-        })?
-        .map_err(kimi_provider_error)?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("032-upstream-response-body.sse", &upstream.body);
-        }
+        let upstream = client::KimiHttpClient::new()
+            .post_kimi(&translated)
+            .await
+            .map_err(kimi_provider_error)?;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let sse =
-            translate_stream_bytes(&upstream.body, &message_id, &requested).map_err(|error| {
-                ProviderError::new(
-                    StatusCode::BAD_GATEWAY,
-                    ProviderErrorKind::Api,
-                    format!("Stream translation error: {error}"),
-                )
-            })?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("050-anthropic-intermediate.sse", &sse);
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse);
-            monitor.stream_progress(
-                &ctx.req_id,
-                sse.len() as u64,
-                count_sse_events(&sse),
-                input_tokens,
-                output_tokens,
-            );
-        }
+        let translator = translate::stream::LiveTranslator::new(&message_id, &requested);
+        use futures_util::StreamExt;
+        let stream = futures_util::stream::unfold(
+            (upstream.body.bytes_stream(), translator, ctx, false),
+            |(mut upstream, mut translator, ctx, terminal)| async move {
+                use futures_util::StreamExt;
+                if terminal {
+                    return None;
+                }
+                loop {
+                    let result = match upstream.next().await {
+                        Some(Ok(bytes)) => translator.push(&bytes),
+                        Some(Err(error)) => Err(anyhow::anyhow!(error)),
+                        None => translator.finish(),
+                    };
+                    match result {
+                        Ok(bytes) if bytes.is_empty() && !translator.finished => continue,
+                        Ok(bytes) => {
+                            let terminal = translator.finished;
+                            if let Some(monitor) = ctx.monitor.as_ref() {
+                                let (input, output) = usage_from_anthropic_sse(&bytes);
+                                monitor.stream_progress(
+                                    &ctx.req_id,
+                                    bytes.len() as u64,
+                                    count_sse_events(&bytes),
+                                    input,
+                                    output,
+                                );
+                            }
+                            return Some((
+                                Ok::<bytes::Bytes, ProviderError>(bytes.into()),
+                                (upstream, translator, ctx, terminal),
+                            ));
+                        }
+                        Err(error) => {
+                            let error = ProviderError::new(
+                                StatusCode::BAD_GATEWAY,
+                                ProviderErrorKind::Api,
+                                error.to_string(),
+                            );
+                            return Some((Err(error), (upstream, translator, ctx, true)));
+                        }
+                    }
+                }
+            },
+        );
+        let mut stream = Box::pin(stream);
+        let first = stream.next().await.transpose()?;
+        let stream = futures_util::stream::iter(first.map(Ok))
+            .chain(stream)
+            .map(|result| {
+                let bytes = result.unwrap_or_else(|error| {
+                    let data = serde_json::json!({"type":"error", "error":{"type":error.error_type(), "message":error.message}});
+                    crate::anthropic::sse::encode_sse_event(Some("error"), &data.to_string()).into()
+                });
+                Ok::<_, std::convert::Infallible>(bytes)
+            });
         Ok(Generation {
-            body: GenerationBody::BufferedSse(sse.into()),
+            body: GenerationBody::LiveSse(axum::body::Body::from_stream(stream)),
             resolved_model: resolved,
         })
     }
@@ -295,7 +271,9 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
 
 fn kimi_provider_error(err: client::KimiError) -> ProviderError {
     let (status, kind) = match err.status {
-        401 | 403 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        400 | 404 | 422 => (StatusCode::BAD_REQUEST, ProviderErrorKind::InvalidRequest),
+        401 => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
+        403 => (StatusCode::FORBIDDEN, ProviderErrorKind::Permission),
         429 => (StatusCode::TOO_MANY_REQUESTS, ProviderErrorKind::RateLimit),
         _ => (StatusCode::BAD_GATEWAY, ProviderErrorKind::Api),
     };
@@ -304,32 +282,6 @@ fn kimi_provider_error(err: client::KimiError) -> ProviderError {
         error.retry_after = Some(err.retry_after.unwrap_or_else(|| "5".to_string()));
     }
     error
-}
-
-fn map_kimi_error_to_response(err: &client::KimiError) -> Response {
-    match err.status {
-        401 | 403 => json_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            err.detail.as_deref().unwrap_or("Authentication failed"),
-        ),
-        429 => {
-            let retry_after = err.retry_after.as_deref().unwrap_or("5");
-            let resp = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                &err.message,
-            );
-            // Forward retry-after header
-            let headers = [(http::header::RETRY_AFTER, retry_after)];
-            (headers, resp).into_response()
-        }
-        _ => json_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            err.detail.as_deref().unwrap_or("Upstream error"),
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
