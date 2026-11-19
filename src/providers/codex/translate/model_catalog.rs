@@ -329,6 +329,9 @@ fn discover_models(
 mod tests {
     use super::*;
 
+    /// `cached_catalog` keys its cache on `CCP_CODEX_BASE_URL`, which the alias test sets.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn mock_models(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -394,6 +397,7 @@ mod tests {
 
     #[test]
     fn ttl_refresh_advances_family_and_failure_retains_read_only_fallback() {
+        let _env = ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models_cache.json");
         let raw =
@@ -440,6 +444,7 @@ mod tests {
 
     #[test]
     fn credential_replacement_invalidates_before_ttl_and_rejects_old_fallback() {
+        let _env = ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.json");
         let path = dir.path().join("models_cache.json");
@@ -481,6 +486,7 @@ mod tests {
 
     #[test]
     fn opaque_cli_cache_identity_is_not_assumed_to_match_current_account() {
+        let _env = ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models_cache.json");
         let raw = r#"{"identity":"opaque-other-provider-account-digest","models":[{"slug":"gpt-6.9-astra","supported_in_api":true,"visibility":"list"}]}"#;
@@ -498,6 +504,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn claude_alias_on_codex_prepares_effective_override_and_advances_after_ttl() {
+        let _env = ENV_LOCK.lock().await;
         use super::super::model_allowlist::resolve_model_request;
         use crate::{config::AliasProvider, registry::Registry, server::app};
         use axum::{

@@ -1904,7 +1904,12 @@ async fn dispatch_request(
 
     let fallback_pool = account_pool.filter(|pool| {
         auto_review_route.is_none()
-            && crate::fallback::handles(provider.name(), &normalized_model, &pool.policy)
+            && crate::fallback::handles(
+                provider.name(),
+                &normalized_model,
+                &pool.policy,
+                &crate::fallback::provider_targets(&state.registry),
+            )
     });
     let used_fallback = fallback_pool.is_some();
     let mut response = if let Some(pool) = fallback_pool {
