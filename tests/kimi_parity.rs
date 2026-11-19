@@ -18,9 +18,15 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc};
 
-struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct Env {
+    old: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 impl Env {
     fn set(values: &[(&'static str, String)]) -> Self {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut old = Vec::new();
         for (key, value) in values {
             old.push((*key, std::env::var_os(key)));
@@ -28,12 +34,12 @@ impl Env {
                 std::env::set_var(key, value);
             }
         }
-        Self(old)
+        Self { old, _lock: guard }
     }
 }
 impl Drop for Env {
     fn drop(&mut self) {
-        for (key, value) in &self.0 {
+        for (key, value) in &self.old {
             unsafe {
                 match value {
                     Some(value) => std::env::set_var(key, value),

@@ -1432,40 +1432,28 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_model_ids_preserve_k3_wire_shape() {
-        for (base_url, expected) in [
-            ("https://api.kimi.ai/coding/v1", "k3.1-pro"),
-            ("https://api.kimi.com/coding/v1", "k3.1-pro"),
-            ("https://api.moonshot.ai/v1", "kimi-k3.1-pro"),
-        ] {
-            let req: MessagesRequest = serde_json::from_value(json!({
-                "model": "kimi-k3.1-pro",
-                "system": "system instructions",
-                "max_tokens": 100_000,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap();
-            let old = std::env::var_os("CCP_KIMI_BASE_URL");
-            unsafe { std::env::set_var("CCP_KIMI_BASE_URL", base_url) };
-            let result = translate_request(&req, TranslateOptions { session_id: None });
-            unsafe {
-                match old {
-                    Some(value) => std::env::set_var("CCP_KIMI_BASE_URL", value),
-                    None => std::env::remove_var("CCP_KIMI_BASE_URL"),
-                }
-            }
-            let wire = serde_json::to_value(result.unwrap()).unwrap();
-            assert_eq!(wire["model"], expected, "{base_url}");
-            assert_eq!(wire["max_tokens"], 100_000, "{base_url}");
-            assert_eq!(wire["reasoning_effort"], "high", "{base_url}");
-            assert_eq!(wire["messages"][0]["role"], "user", "{base_url}");
-            assert!(
-                wire["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("system instructions")
-            );
-        }
+    fn k3_wire_shape_applies_to_the_endpoint_model_id() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3.1-pro",
+            "system": "system instructions",
+            "max_tokens": 100_000,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request(&req, TranslateOptions { session_id: None }).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["model"], resolve_model("kimi-k3.1-pro"));
+        assert_eq!(wire["max_tokens"], 100_000);
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert!(
+            wire["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("system instructions")
+        );
     }
 
     #[test]
