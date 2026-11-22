@@ -1,4 +1,3 @@
-use base64::Engine;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
@@ -235,9 +234,8 @@ fn selected_context(images: &[CursorSelectedImage]) -> Option<Vec<u8>> {
 
     let mut context = Vec::new();
     for image in images {
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&image.data)
-            .unwrap_or_default();
+        let data = crate::providers::translate_shared::decode_image_data(&image.data)
+            .expect("image data validated before Cursor request serialization");
         let mut selected = field_string(2, &image.uuid);
         selected.extend(field_string(3, &image.path));
         selected.extend(field_string(7, &image.mime_type));
@@ -450,3 +448,46 @@ impl std::fmt::Display for CursorError {
 }
 
 impl std::error::Error for CursorError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::cursor::request::{cursor_selected_images, render_cursor_prompt};
+    use serde_json::json;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct WireContext {
+        #[prost(message, repeated, tag = "1")]
+        images: Vec<WireImage>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct WireImage {
+        #[prost(string, tag = "7")]
+        media_type: String,
+        #[prost(bytes = "vec", tag = "8")]
+        data: Vec<u8>,
+    }
+
+    #[test]
+    fn accepted_base64_spellings_reach_selected_context_as_the_actual_image_bytes() {
+        for data in ["QQ", "Q Q==", "QQ==\n"] {
+            for nested in [false, true] {
+                let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}});
+                let content = if nested {
+                    json!([{"type":"tool_result","tool_use_id":"t","content":[image]}])
+                } else {
+                    json!([image])
+                };
+                let req = serde_json::from_value(json!({"model":"cursor:gpt-5.5","messages":[{"role":"user","content":content}]})).unwrap();
+                render_cursor_prompt(&req).unwrap();
+                let images = cursor_selected_images(&req);
+                let serialized = selected_context(&images).unwrap();
+                let wire = WireContext::decode(serialized.as_slice()).unwrap();
+                assert_eq!(wire.images.len(), 1, "{data} nested={nested}");
+                assert_eq!(wire.images[0].media_type, "image/png");
+                assert_eq!(wire.images[0].data, b"A", "{data} nested={nested}");
+            }
+        }
+    }
+}

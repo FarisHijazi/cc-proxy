@@ -484,9 +484,14 @@ available. Hidden or non-API discovery rows are excluded. Existing explicit
 baseline IDs need no discovery request. Async requests await a shared refresh
 without blocking Tokio timers or health checks.
 
-Reasoning is carried across a switch. When you move a conversation from one plan
-to the other, the earlier turn's thinking is kept and shown to the next model as
-plain tagged text, so context is not lost.
+Switching providers keeps public answers and supported tool history. Private
+reasoning is never injected as ordinary assistant text: another provider's
+thinking is dropped. Native continuation is replayed only in its own backend's
+reasoning channel when its proxy marker matches. Genuine signed/redacted Claude
+thinking stays byte-exact on the Anthropic path. Unsupported document, audio,
+video, unknown content, and unsupported images return explicit translation
+errors rather than silently disappearing. Cursor CLI is text-only and owns its
+own tools; it does not return Claude Code tool calls.
 
 ## Usage and account selection
 

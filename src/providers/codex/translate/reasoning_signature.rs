@@ -1,7 +1,9 @@
 use base64::Engine;
 use serde_json::Value;
 
-const PREFIX: &str = "ccp:codex:v1:";
+use crate::providers::translate_shared::ProxyReasoning;
+
+const PREFIX: &str = ProxyReasoning::Codex.prefix();
 const MAX_ID_BYTES: usize = 4 * 1024;
 const MAX_ENCRYPTED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 

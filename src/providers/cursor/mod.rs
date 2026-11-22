@@ -97,6 +97,16 @@ impl Provider for CursorProvider {
             Some(Err(error)) => return messages::config_error(error),
             None => {}
         }
+        let prompt = match render_cursor_prompt(&body) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("cursor");
@@ -162,7 +172,6 @@ impl Provider for CursorProvider {
 
         let token = auth.access_token;
 
-        let prompt = render_cursor_prompt(&body);
         let images = request::cursor_selected_images(&body);
 
         let client = CursorHttpClient::new();
@@ -255,7 +264,16 @@ impl Provider for CursorProvider {
             Some(Err(error)) => return messages::config_error(error),
             None => {}
         }
-        let prompt = render_cursor_prompt(&body);
+        let prompt = match render_cursor_prompt(&body) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
         let tokens = (prompt.len() / 4) as u64; // rough estimate
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
@@ -285,6 +303,13 @@ impl Provider for CursorProvider {
             }
             None => {}
         }
+        let prompt = render_cursor_prompt(&body).map_err(|error| {
+            ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         body.stream = true;
         let requested = body.model.clone().unwrap_or_else(|| "cursor".to_string());
         let resolved = resolve_cursor_model(&requested).map_err(|error| {
@@ -331,7 +356,6 @@ impl Provider for CursorProvider {
                 expired_auth_message(&auth),
             ));
         }
-        let prompt = render_cursor_prompt(&body);
         let images = request::cursor_selected_images(&body);
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_json(

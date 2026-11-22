@@ -10,15 +10,20 @@
 //! Claude-account 401 moves on before output, as does an account answering 404 for
 //! a model it does not offer (5xx too when enabled). Nothing is
 //! replayed after the client saw a token. Token counts walk only the same model
-//! across the accounts, with the same triggers and no cooldowns.
+//! across the accounts, with the same triggers and no cooldowns. A conversation whose
+//! turn completed on a fallback keeps trying that target first until its requested
+//! model changes, so a recovered earlier target never switches it back mid-task.
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::Logger;
 use crate::provider::{Provider, RequestContext};
 use crate::registry::Registry;
 use crate::request_identity::ConversationIdentity;
+use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Body as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -31,6 +36,8 @@ pub const POLICY_HEADER: &str = "x-claude-codex-fallback";
 /// Response header naming the account or backend that served the request.
 pub const SERVED_BY_HEADER: &str = "x-claude-codex-served-by";
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
+const ROUTE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_ROUTES: usize = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolAccount {
@@ -337,6 +344,242 @@ pub fn handles(provider: &str, model: &str, policy: &Policy, providers: &[String
 #[derive(Default)]
 pub(crate) struct Cooldowns(Mutex<HashMap<(String, String), u64>>);
 
+#[derive(Debug, Clone, PartialEq)]
+enum Served {
+    Original,
+    Account(String, String),
+    Substitute(String),
+}
+
+impl Served {
+    fn of(step: &Step, pool: &[PoolAccount]) -> Self {
+        match step {
+            Step::Original => Self::Original,
+            Step::Account(index, model) => Self::Account(pool[*index].alias.clone(), model.clone()),
+            Step::Substitute(model) => Self::Substitute(model.clone()),
+        }
+    }
+}
+
+struct Route {
+    requested: String,
+    served: Option<Served>,
+    seen: u64,
+    generation: u64,
+}
+
+type RouteKey = ConversationIdentity;
+
+#[derive(Default)]
+struct RouteStore {
+    entries: HashMap<RouteKey, Route>,
+    generation: u64,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct Routes(Arc<Mutex<RouteStore>>);
+
+pub struct RouteAttempt {
+    key: RouteKey,
+    pinned: Option<Served>,
+    generation: u64,
+}
+
+impl Routes {
+    pub(crate) fn begin(
+        &self,
+        identity: Option<&ConversationIdentity>,
+        pool: Option<&Pool>,
+        requested: &str,
+    ) -> Option<RouteAttempt> {
+        pool?;
+        let key = identity?.clone();
+        let mut store = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        store.generation += 1;
+        let generation = store.generation;
+        let routes = &mut store.entries;
+        let now = now();
+        let fresh = |route: &Route| now.saturating_sub(route.seen) < ROUTE_IDLE.as_secs();
+        if routes.len() >= MAX_ROUTES && !routes.contains_key(&key) {
+            routes.retain(|_, route| fresh(route));
+            let oldest = routes
+                .iter()
+                .min_by_key(|(_, route)| route.seen)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest.filter(|_| routes.len() >= MAX_ROUTES) {
+                routes.remove(&oldest);
+            }
+        }
+        let route = routes.entry(key.clone()).or_insert_with(|| Route {
+            requested: requested.to_string(),
+            served: None,
+            seen: now,
+            generation: 0,
+        });
+        if route.requested != requested || !fresh(route) {
+            route.requested = requested.to_string();
+            route.served = None;
+        }
+        route.seen = now;
+        route.generation = generation;
+        Some(RouteAttempt {
+            key,
+            pinned: route.served.clone(),
+            generation,
+        })
+    }
+
+    fn complete(&self, key: &RouteKey, generation: u64, served: Served) {
+        let mut store = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(route) = store
+            .entries
+            .get_mut(key)
+            .filter(|route| route.generation == generation)
+        {
+            route.served = Some(served);
+        }
+    }
+}
+
+enum Completion {
+    Stream {
+        decoder: crate::openai_compat::stream::SseDecoder,
+        stop_reason: Option<String>,
+        stopped: bool,
+    },
+    Message(Vec<u8>),
+}
+
+fn completes(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|reason| reason != "refusal")
+}
+
+impl Completion {
+    fn new(headers: &HeaderMap) -> Self {
+        let streamed = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
+        if streamed {
+            Self::Stream {
+                decoder: Default::default(),
+                stop_reason: None,
+                stopped: false,
+            }
+        } else {
+            Self::Message(Vec::new())
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> bool {
+        match self {
+            Self::Stream {
+                decoder,
+                stop_reason,
+                stopped,
+            } => {
+                let Ok(events) = decoder.push(data) else {
+                    return false;
+                };
+                for event in events {
+                    match event.data["type"].as_str() {
+                        Some("error") => return false,
+                        Some("message_delta") => {
+                            *stop_reason = event.data["delta"]["stop_reason"]
+                                .as_str()
+                                .map(str::to_string)
+                        }
+                        Some("message_stop") => *stopped = true,
+                        _ => {}
+                    }
+                }
+                true
+            }
+            Self::Message(body) => {
+                body.extend_from_slice(data);
+                body.len() <= crate::openai_compat::MAX_SSE_EVENT_BYTES
+            }
+        }
+    }
+
+    fn finished(&self) -> bool {
+        match self {
+            Self::Stream {
+                decoder,
+                stop_reason,
+                stopped,
+            } => *stopped && completes(stop_reason.as_deref()) && decoder.finish().is_ok(),
+            Self::Message(body) => serde_json::from_slice::<Value>(body)
+                .is_ok_and(|message| completes(message["stop_reason"].as_str())),
+        }
+    }
+}
+
+fn remember_on_completion(response: Response, route: (Routes, RouteKey, u64, Served)) -> Response {
+    let completion = Completion::new(response.headers());
+    let (parts, body) = response.into_parts();
+    let state = (body, completion, Some(route));
+    let stream =
+        futures_util::stream::unfold(state, |(mut body, mut completion, mut route)| async move {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let (Some(data), Some(_)) = (frame.data_ref(), route.as_ref())
+                        && !completion.push(data)
+                    {
+                        route = None;
+                    }
+                    // HTTP/1 may stop polling after Content-Length bytes, without a None poll.
+                    if (body.is_end_stream() || body.size_hint().exact() == Some(0))
+                        && let Some((routes, key, generation, served)) = route.take()
+                        && completion.finished()
+                    {
+                        routes.complete(&key, generation, served);
+                    }
+                    Some((Ok(frame), (body, completion, route)))
+                }
+                Some(Err(err)) => Some((Err(err), (body, completion, None))),
+                None => {
+                    if let Some((routes, key, generation, served)) = route
+                        && completion.finished()
+                    {
+                        routes.complete(&key, generation, served);
+                    }
+                    None
+                }
+            }
+        });
+    Response::from_parts(parts, Body::new(StreamBody::new(stream)))
+}
+
+/// A cross-provider substitute keeps the caller's effort but replaces a thinking mode its
+/// destination rejects: the built-in Claude tier models take adaptive thinking, not a
+/// budget or `disabled`, and Kimi K3 cannot disable it. `disabled` becomes low effort
+/// unless the caller chose one.
+fn fit_thinking(request: &mut Map<String, Value>, destination: &str) {
+    use crate::providers::kimi::translate::model_allowlist::{all_public_model_ids, is_k3};
+    let adaptive_only = default_tiers().iter().any(|tier| {
+        tier.models
+            .get("anthropic")
+            .is_some_and(|m| m == destination)
+    });
+    let k3 = all_public_model_ids().contains(&destination) && is_k3(destination);
+    let mode = request
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+    match mode {
+        Some("disabled") if adaptive_only || k3 => {
+            let config = request.entry("output_config").or_insert_with(|| json!({}));
+            if let Some(config) = config.as_object_mut() {
+                config.entry("effort").or_insert_with(|| json!("low"));
+            }
+        }
+        Some("enabled") if adaptive_only => {}
+        _ => return,
+    }
+    request.insert("thinking".into(), json!({"type": "adaptive"}));
+}
+
 /// Remove the pool and policy headers so they can never be relayed or recorded, and
 /// parse them. An unreadable policy keeps the default chains.
 pub fn take_pool(headers: &mut HeaderMap) -> Option<Pool> {
@@ -403,10 +646,15 @@ fn is_thread_continue(body: &MessagesRequest) -> bool {
         == Some(&json!("continue"))
 }
 
-/// The passthrough relays raw bytes, so a Claude substitute rewrites `model` there.
-fn with_model(raw: &axum::body::Bytes, model: &str) -> Option<axum::body::Bytes> {
+/// The passthrough relays raw bytes, so a Claude substitute rewrites `model` there,
+/// and its thinking mode too when it stands in for another provider.
+fn with_model(raw: &axum::body::Bytes, model: &str, cross: bool) -> Option<axum::body::Bytes> {
     let mut value: Value = serde_json::from_slice(raw).ok()?;
-    value.as_object_mut()?.insert("model".into(), json!(model));
+    let request = value.as_object_mut()?;
+    request.insert("model".into(), json!(model));
+    if cross {
+        fit_thinking(request, model);
+    }
     serde_json::to_vec(&value).ok().map(Into::into)
 }
 
@@ -438,6 +686,7 @@ pub async fn dispatch(
     log: &Logger,
     thread_unsupported: fn() -> Response,
     count_tokens: bool,
+    route: Option<RouteAttempt>,
 ) -> Response {
     let requested = body.model.clone().unwrap_or_default();
     let threaded = is_thread_continue(&body);
@@ -459,6 +708,19 @@ pub async fn dispatch(
             return provider.handle_count_tokens(body, ctx).await;
         }
     }
+    if let Some(index) = route
+        .as_ref()
+        .and_then(|route| route.pinned.as_ref())
+        .and_then(|pinned| {
+            steps
+                .iter()
+                .position(|step| &Served::of(step, &pool) == pinned)
+        })
+    {
+        let step = steps.remove(index);
+        steps.insert(0, step);
+    }
+    let cross = provider.name() != "anthropic";
     let last = steps.len().saturating_sub(1);
     for (position, step) in steps.into_iter().enumerate() {
         let (owner, model, target, attempt_body) = match &step {
@@ -474,6 +736,9 @@ pub async fn dispatch(
                 };
                 let mut substitute = body.clone();
                 substitute.model = Some(model.clone());
+                if cross {
+                    fit_thinking(&mut substitute.extra, model);
+                }
                 (
                     pool[*index].alias.clone(),
                     model.clone(),
@@ -492,6 +757,9 @@ pub async fn dispatch(
                 let mut substitute = body.clone();
                 substitute.model = Some(model.clone());
                 substitute.bypass_provider_model_override = true;
+                if target.name() != provider.name() {
+                    fit_thinking(&mut substitute.extra, model);
+                }
                 (target.name().to_string(), model.clone(), target, substitute)
             }
         };
@@ -518,7 +786,7 @@ pub async fn dispatch(
             if let Some(passthrough) = attempt.passthrough.as_mut() {
                 passthrough.headers.insert("authorization", authorization);
                 if *model != requested {
-                    match with_model(&passthrough.raw_body, model) {
+                    match with_model(&passthrough.raw_body, model, cross) {
                         Some(raw) => passthrough.raw_body = raw,
                         None => continue,
                     }
@@ -559,7 +827,18 @@ pub async fn dispatch(
             if let Ok(value) = HeaderValue::from_str(&served) {
                 response.headers_mut().insert(SERVED_BY_HEADER, value);
             }
-            return response;
+            return match route.filter(|_| response.status().is_success()) {
+                Some(route) => remember_on_completion(
+                    response,
+                    (
+                        registry.routes.clone(),
+                        route.key,
+                        route.generation,
+                        Served::of(&step, &pool),
+                    ),
+                ),
+                None => response,
+            };
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
         if !count_tokens && !server_error && !unavailable {
@@ -1071,7 +1350,7 @@ mod tests {
     fn substitute_model_is_rewritten_in_the_raw_body() {
         let raw = axum::body::Bytes::from_static(br#"{"model":"gpt-6-luna","max_tokens":1}"#);
         let rewritten: Value =
-            serde_json::from_slice(&with_model(&raw, "claude-sonnet-5-5").unwrap()).unwrap();
+            serde_json::from_slice(&with_model(&raw, "claude-sonnet-5-5", false).unwrap()).unwrap();
         assert_eq!(rewritten["model"], "claude-sonnet-5-5");
         assert_eq!(rewritten["max_tokens"], 1);
     }
@@ -1113,6 +1392,40 @@ mod tests {
         assert!(pool.policy.on.server_error && pool.policy.on.rate_limit);
         assert!(!headers.contains_key(POOL_HEADER));
         assert!(!headers.contains_key(POLICY_HEADER));
+    }
+
+    #[test]
+    fn a_completion_from_an_evicted_route_cannot_overwrite_its_replacement() {
+        let routes = Routes::default();
+        let pool = Pool {
+            accounts: vec![PoolAccount {
+                alias: "owner".into(),
+                authorization: "Bearer token".into(),
+                primary: true,
+            }],
+            policy: Policy::default(),
+        };
+        let identity = ConversationIdentity::Main("session".into());
+        let older = routes.begin(Some(&identity), Some(&pool), "opus").unwrap();
+        routes.0.lock().unwrap().entries.clear();
+        let newer = routes.begin(Some(&identity), Some(&pool), "opus").unwrap();
+        routes.complete(
+            &newer.key,
+            newer.generation,
+            Served::Substitute("new".into()),
+        );
+        routes.complete(
+            &older.key,
+            older.generation,
+            Served::Substitute("old".into()),
+        );
+        assert_eq!(
+            routes
+                .begin(Some(&identity), Some(&pool), "opus")
+                .unwrap()
+                .pinned,
+            Some(Served::Substitute("new".into()))
+        );
     }
 
     #[test]

@@ -243,6 +243,10 @@ session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages` and
 plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
 still reaches other vendors. The explicit primary-account marker prevents a filtered
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
+Completed fallback routes are keyed only by conversation identity (session plus optional agent),
+not by the temporarily usable pool or its primary alias. A remembered account is tried only
+if it remains in the current authorized pool and policy chain. Changing the requested model
+clears the route; count, title, compaction and auto-review requests do not change it.
 Claude model: accounts, then Codex. Codex model: Codex, then Claude accounts.
 Cursor is never a default target; it requires an explicitly configured chain. The accounts file's
 `fallback` section overrides these defaults (`chains` per family `claude`/`codex`/provider name;

@@ -114,10 +114,7 @@ fn kimi_request_wire_controls_and_replay_are_not_silently_lost() {
         translate_request(&req, TranslateOptions { session_id: None }).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        value["messages"][0]["content"],
-        "<previous_reasoning>\nnative\n</previous_reasoning>"
-    );
+    assert_eq!(value["messages"][0]["content"], "");
     assert!(value["messages"][0].get("reasoning_content").is_none());
     assert_eq!(
         value["messages"][0]["tool_calls"][0]["function"]["arguments"],

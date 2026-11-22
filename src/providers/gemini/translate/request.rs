@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
-    wrap_reasoning,
+    ContentBlock, ImageInput, InputSupport, ProxyReasoning, flatten_system_text,
+    image_block_to_url, image_source_to_url, normalize_content, parallel_tool_calls,
+    tool_reference_text,
 };
 
 /// Anthropic allows an unbounded reply; OpenAI wants a number. Large enough not
@@ -97,15 +98,22 @@ pub fn translate_request(
     translate_request_with(req, resolved_model, false)
 }
 
-/// `native_reasoning` sends prior thinking as `reasoning_content`, so a local
-/// server's own chat template decides what to keep (Qwen drops turns before the
-/// last user message). Replaying it as tagged text instead fills the context
-/// and the model starts echoing the tags.
+/// `native_reasoning` sends this backend's own prior thinking as
+/// `reasoning_content`, so a local server's chat template decides what to keep
+/// (Qwen drops turns before the last user message). Reasoning another backend
+/// wrote, and all reasoning without `native_reasoning`, is dropped: as text the
+/// model echoes it back into its public answer.
 pub fn translate_request_with(
     req: &MessagesRequest,
     resolved_model: &str,
     native_reasoning: bool,
 ) -> Result<GeminiChatRequest, anyhow::Error> {
+    InputSupport {
+        backend: if native_reasoning { "local" } else { "gemini" },
+        images: ImageInput::Any,
+        tool_result_images: ImageInput::Any,
+    }
+    .ensure(req)?;
     let mut messages = Vec::new();
 
     if let Some(system) = flatten_system_text(req.extra.get("system")) {
@@ -140,9 +148,12 @@ pub fn translate_request_with(
 fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value, native_reasoning: bool) {
     let blocks = normalize_content(content, json!({}));
 
+    let mut image_parts: Vec<Value> = Vec::new();
+
     // Tool results are their own `tool` turns in the OpenAI format and must be
     // emitted before the text of the same Anthropic user message, so each
-    // result lands adjacent to the assistant turn that requested it.
+    // result lands adjacent to the assistant turn that requested it. A `tool`
+    // turn carries text only, so its images move into the user turn after it.
     for block in &blocks {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -155,11 +166,18 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value, nativ
                 tool_call_id: tool_use_id.clone(),
                 content: tool_result_text(content, *is_error),
             });
+            for image in content.as_array().into_iter().flatten() {
+                if image.get("type").and_then(Value::as_str) == Some("image") {
+                    image_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": image_block_to_url(image) },
+                    }));
+                }
+            }
         }
     }
 
     let mut text = String::new();
-    let mut image_parts: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<GeminiToolCall> = Vec::new();
     let mut reasoning = String::new();
 
@@ -171,10 +189,10 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value, nativ
                 }
                 text.push_str(value);
             }
-            // Gemini has no native reasoning channel on input. Prior-turn
-            // thinking is rehydrated as tagged text, the same shape the codex
-            // and anthropic paths use, so a mid-conversation switch keeps it.
-            ContentBlock::Thinking { thinking, .. } if native_reasoning => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } if native_reasoning && ProxyReasoning::Gemini.wrote(signature.as_deref()) => {
                 if !thinking.trim().is_empty() {
                     if !reasoning.is_empty() {
                         reasoning.push_str("\n\n");
@@ -182,14 +200,7 @@ fn push_message(out: &mut Vec<GeminiMessage>, role: &str, content: &Value, nativ
                     reasoning.push_str(thinking);
                 }
             }
-            ContentBlock::Thinking { thinking, .. } => {
-                if !thinking.trim().is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
-                    }
-                    text.push_str(&wrap_reasoning(thinking));
-                }
-            }
+            ContentBlock::Thinking { .. } => {}
             ContentBlock::Image { source } => {
                 image_parts.push(json!({
                     "type": "image_url",
@@ -252,22 +263,19 @@ fn tool_result_text(content: &Value, is_error: Option<bool>) -> String {
         Value::Array(blocks) => {
             let texts: Vec<String> = blocks
                 .iter()
-                .filter_map(|block| {
-                    block
+                .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("text") => block
                         .get("text")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| match block.get("type").and_then(Value::as_str) {
-                            Some("image") => Some("[image omitted]".to_string()),
-                            _ => None,
-                        })
+                        .map(str::to_string),
+                    Some("tool_reference") => block
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .map(tool_reference_text),
+                    _ => None,
                 })
                 .collect();
-            if texts.is_empty() {
-                content.to_string()
-            } else {
-                texts.join("\n")
-            }
+            texts.join("\n")
         }
         Value::Null => String::new(),
         other => other.to_string(),
@@ -454,47 +462,80 @@ mod tests {
         assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
     }
 
-    #[test]
-    fn prior_thinking_is_rehydrated_as_tagged_text() {
-        let messages = vec![Message {
+    fn assistant(thinking: Value) -> Message {
+        Message {
             role: "assistant".into(),
-            content: json!([
-                { "type": "thinking", "thinking": "step one" },
-                { "type": "text", "text": "answer" }
-            ]),
-        }];
-        let out = translate_request(&request(messages, serde_json::Map::new()), "gemini-3-pro")
-            .expect("translate");
-        let GeminiMessage::Assistant { content, .. } = &out.messages[0] else {
-            panic!("expected assistant message");
-        };
-        let content = content.as_deref().expect("content");
-        assert!(content.contains("<previous_reasoning>"), "{content}");
-        assert!(content.contains("step one"), "{content}");
-        assert!(content.contains("answer"), "{content}");
+            content: json!([thinking, { "type": "text", "text": "answer <thinking>x</thinking>" }]),
+        }
     }
 
-    #[test]
-    fn local_prior_thinking_goes_to_reasoning_content() {
-        let messages = vec![Message {
-            role: "assistant".into(),
-            content: json!([
-                { "type": "thinking", "thinking": "step one" },
-                { "type": "text", "text": "answer" }
-            ]),
-        }];
-        let out = translate_request_with(&request(messages, serde_json::Map::new()), "local", true)
-            .expect("translate");
+    fn translated_assistant(thinking: Value, local: bool) -> (Option<String>, Option<String>) {
+        let req = request(vec![assistant(thinking)], serde_json::Map::new());
+        let out = translate_request_with(&req, "any-model", local).expect("translate");
         let GeminiMessage::Assistant {
             content,
             reasoning_content,
             ..
-        } = &out.messages[0]
+        } = out.messages[0].clone()
         else {
             panic!("expected assistant message");
         };
-        assert_eq!(content.as_deref(), Some("answer"));
-        assert_eq!(reasoning_content.as_deref(), Some("step one"));
+        (content, reasoning_content)
+    }
+
+    #[test]
+    fn prior_thinking_never_becomes_visible_text() {
+        let own = ProxyReasoning::Gemini.sign("msg_1", 0);
+        for local in [false, true] {
+            for signature in [json!(own), json!("EqQBsig=="), json!(""), Value::Null] {
+                let thinking =
+                    json!({ "type": "thinking", "thinking": "step one", "signature": signature });
+                let (content, reasoning) = translated_assistant(thinking, local);
+                assert_eq!(content.as_deref(), Some("answer <thinking>x</thinking>"));
+                let native = local && signature == json!(own);
+                assert_eq!(
+                    reasoning.as_deref(),
+                    native.then_some("step one"),
+                    "{signature}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_images_follow_their_tool_turn_and_tool_references_stay_text() {
+        let messages = vec![user(json!([
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                { "type": "text", "text": "shot" },
+                { "type": "tool_reference", "tool_name": "Read" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } }
+            ]},
+            { "type": "text", "text": "what is it" }
+        ]))];
+        let out = translate_request(&request(messages, serde_json::Map::new()), "gemini-3-pro")
+            .expect("translate");
+        assert_eq!(
+            serde_json::to_value(&out.messages).unwrap(),
+            json!([
+                { "role": "tool", "tool_call_id": "toolu_1",
+                  "content": format!("shot\n{}", tool_reference_text("Read")) },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "what is it" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } }
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn unsupported_content_is_refused() {
+        let messages = vec![user(json!([{ "type": "audio", "source": {} }]))];
+        let error = translate_request(&request(messages, serde_json::Map::new()), "gemini-3-pro")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "gemini does not support audio content in user messages"
+        );
     }
 
     #[test]

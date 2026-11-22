@@ -53,6 +53,9 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
+/// Claude Code's session-titling prompt (`generate_session_title`, observed in 2.1.329).
+const CLAUDE_SESSION_TITLE_SYSTEM_PREFIX: &str =
+    "You are naming a coding session so the user can pick it out of a long list of sessions.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
 /// A dashboard-forced model for this session, set only by `scripts/account_inject.py`
 /// (which strips any client copy) and removed here before logging or relaying.
@@ -111,6 +114,10 @@ fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesReques
         return false;
     }
 
+    system_starts_with(body, CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX)
+}
+
+fn system_starts_with(body: &crate::anthropic::schema::MessagesRequest, prefix: &str) -> bool {
     body.extra
         .get("system")
         .and_then(Value::as_array)
@@ -119,9 +126,15 @@ fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesReques
                 block
                     .get("text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| text.starts_with(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX))
+                    .is_some_and(|text| text.starts_with(prefix))
             })
         })
+}
+
+fn is_side_request(body: &crate::anthropic::schema::MessagesRequest) -> bool {
+    is_claude_auto_review_request(body)
+        || crate::providers::codex::translate::request::is_compact_messages_request(body)
+        || system_starts_with(body, CLAUDE_SESSION_TITLE_SYSTEM_PREFIX)
 }
 
 fn apply_auto_review_model(
@@ -1902,6 +1915,15 @@ async fn dispatch_request(
         }),
     };
 
+    let route = if count_tokens || is_side_request(&body) {
+        None
+    } else {
+        state.registry.routes.begin(
+            conversation_identity.as_ref(),
+            account_pool.as_ref(),
+            &normalized_model,
+        )
+    };
     let fallback_pool = account_pool.filter(|pool| {
         auto_review_route.is_none()
             && crate::fallback::handles(
@@ -1923,6 +1945,7 @@ async fn dispatch_request(
             &log,
             thread_unsupported_response,
             count_tokens,
+            route,
         )
         .await
     } else if count_tokens {

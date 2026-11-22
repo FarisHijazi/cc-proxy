@@ -10,13 +10,27 @@
 //! Claude Code's `tools` are deliberately **not** rendered. `cursor-agent`
 //! brings its own tools; advertising Claude Code's would invite it to describe
 //! calls that nothing will execute.
+//!
+//! Prior reasoning is not rendered either: the agent does not need it to
+//! continue, and as prompt text it can be echoed into a public answer.
 
 use serde_json::Value;
 
 use crate::anthropic::schema::MessagesRequest;
-use crate::providers::translate_shared::{ContentBlock, flatten_system_text, normalize_content};
+use crate::providers::translate_shared::{
+    ContentBlock, ImageInput, InputSupport, flatten_system_text, normalize_content,
+    tool_reference_text,
+};
 
-pub fn render_prompt(req: &MessagesRequest) -> String {
+/// `cursor-agent` takes a text prompt, so images cannot reach it.
+const INPUT_SUPPORT: InputSupport = InputSupport {
+    backend: "cursor-cli",
+    images: ImageInput::Unsupported,
+    tool_result_images: ImageInput::Unsupported,
+};
+
+pub fn render_prompt(req: &MessagesRequest) -> anyhow::Result<String> {
+    INPUT_SUPPORT.ensure(req)?;
     let mut sections: Vec<String> = Vec::new();
 
     if let Some(system) = flatten_system_text(req.extra.get("system")) {
@@ -30,7 +44,7 @@ pub fn render_prompt(req: &MessagesRequest) -> String {
         }
     }
 
-    sections.join("\n\n")
+    Ok(sections.join("\n\n"))
 }
 
 fn render_message(role: &str, content: &Value) -> Option<String> {
@@ -40,15 +54,7 @@ fn render_message(role: &str, content: &Value) -> Option<String> {
     for block in blocks {
         match block {
             ContentBlock::Text { text } if !text.trim().is_empty() => parts.push(text),
-            ContentBlock::Text { .. } => {}
-            // Prior reasoning is context, not instruction; tag it so the agent
-            // can tell the difference.
-            ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                parts.push(crate::providers::translate_shared::wrap_reasoning(
-                    &thinking,
-                ));
-            }
-            ContentBlock::Thinking { .. } => {}
+            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => {}
             // A tool call from an earlier turn is history: it says what was
             // already done, so the agent does not repeat it.
             ContentBlock::ToolUse { name, input, .. } => {
@@ -65,11 +71,7 @@ fn render_message(role: &str, content: &Value) -> Option<String> {
                 };
                 parts.push(format!("[{label}]\n{body}"));
             }
-            // cursor-agent takes a text prompt; an image cannot be passed
-            // through, so say so rather than dropping it silently.
-            ContentBlock::Image { .. } => {
-                parts.push("[image omitted: cursor-agent takes text only]".to_string())
-            }
+            ContentBlock::Image { .. } => unreachable!("images refused by INPUT_SUPPORT"),
         }
     }
 
@@ -84,18 +86,19 @@ fn tool_result_text(content: &Value) -> String {
         Value::Array(blocks) => {
             let texts: Vec<String> = blocks
                 .iter()
-                .filter_map(|block| {
-                    block
+                .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("text") => block
                         .get("text")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .map(str::to_string),
+                    Some("tool_reference") => block
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .map(tool_reference_text),
+                    _ => None,
                 })
                 .collect();
-            if texts.is_empty() {
-                content.to_string()
-            } else {
-                texts.join("\n")
-            }
+            texts.join("\n")
         }
         Value::Null => String::new(),
         other => other.to_string(),
@@ -106,6 +109,7 @@ fn tool_result_text(content: &Value) -> String {
 mod tests {
     use super::*;
     use crate::anthropic::schema::Message;
+    use crate::providers::translate_shared::ProxyReasoning;
     use serde_json::json;
 
     fn request(messages: Vec<Message>, extra: serde_json::Map<String, Value>) -> MessagesRequest {
@@ -137,7 +141,7 @@ mod tests {
                 content: json!("third"),
             },
         ];
-        let prompt = render_prompt(&request(messages, extra));
+        let prompt = render_prompt(&request(messages, extra)).unwrap();
         assert!(prompt.contains("<system>\nbe terse\n</system>"), "{prompt}");
         assert!(prompt.contains("<user>\nfirst\n</user>"), "{prompt}");
         assert!(
@@ -166,7 +170,8 @@ mod tests {
                 content: json!("hi"),
             }],
             extra,
-        ));
+        ))
+        .unwrap();
         assert!(!prompt.contains("<tools>"), "{prompt}");
         assert!(!prompt.contains("Bash"), "{prompt}");
     }
@@ -187,7 +192,7 @@ mod tests {
                 ]),
             },
         ];
-        let prompt = render_prompt(&request(messages, serde_json::Map::new()));
+        let prompt = render_prompt(&request(messages, serde_json::Map::new())).unwrap();
         assert!(prompt.contains("[called tool read with"), "{prompt}");
         assert!(prompt.contains("[tool result]\nhello world"), "{prompt}");
     }
@@ -203,20 +208,23 @@ mod tests {
                 "content": [{ "type": "text", "text": "no such file" }]
             }]),
         }];
-        let prompt = render_prompt(&request(messages, serde_json::Map::new()));
+        let prompt = render_prompt(&request(messages, serde_json::Map::new())).unwrap();
         assert!(prompt.contains("[tool error]\nno such file"), "{prompt}");
     }
 
     #[test]
-    fn images_are_reported_rather_than_silently_dropped() {
+    fn images_are_refused_rather_than_replaced() {
         let messages = vec![Message {
             role: "user".into(),
             content: json!([
                 { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } }
             ]),
         }];
-        let prompt = render_prompt(&request(messages, serde_json::Map::new()));
-        assert!(prompt.contains("[image omitted"), "{prompt}");
+        let error = render_prompt(&request(messages, serde_json::Map::new())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cursor-cli does not support image content"
+        );
     }
 
     #[test]
@@ -231,22 +239,25 @@ mod tests {
                 content: json!("only this"),
             },
         ];
-        let prompt = render_prompt(&request(messages, serde_json::Map::new()));
+        let prompt = render_prompt(&request(messages, serde_json::Map::new())).unwrap();
         assert!(!prompt.contains("<assistant>"), "{prompt}");
         assert!(prompt.contains("only this"), "{prompt}");
     }
 
     #[test]
-    fn prior_thinking_is_tagged() {
+    fn prior_thinking_is_not_rendered() {
         let messages = vec![Message {
             role: "assistant".into(),
             content: json!([
-                { "type": "thinking", "thinking": "considering" },
-                { "type": "text", "text": "answer" }
+                { "type": "thinking", "thinking": "considering", "signature": ProxyReasoning::CursorCli.sign("m", 0) },
+                { "type": "redacted_thinking", "data": "EmwKAhgBEgy=" },
+                { "type": "text", "text": "answer <thinking>x</thinking>" }
             ]),
         }];
-        let prompt = render_prompt(&request(messages, serde_json::Map::new()));
-        assert!(prompt.contains("<previous_reasoning>"), "{prompt}");
-        assert!(prompt.contains("considering"), "{prompt}");
+        let prompt = render_prompt(&request(messages, serde_json::Map::new())).unwrap();
+        assert_eq!(
+            prompt,
+            "<assistant>\nanswer <thinking>x</thinking>\n</assistant>"
+        );
     }
 }

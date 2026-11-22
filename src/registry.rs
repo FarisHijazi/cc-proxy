@@ -46,6 +46,7 @@ pub struct Registry {
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
     pub(crate) cooldowns: crate::fallback::Cooldowns,
+    pub(crate) routes: crate::fallback::Routes,
 }
 
 impl Registry {
@@ -109,6 +110,7 @@ impl Registry {
             models,
             handlers,
             cooldowns: crate::fallback::Cooldowns::default(),
+            routes: crate::fallback::Routes::default(),
         }
     }
 
@@ -132,6 +134,7 @@ impl Registry {
             models,
             handlers,
             cooldowns: crate::fallback::Cooldowns::default(),
+            routes: crate::fallback::Routes::default(),
         }
     }
 

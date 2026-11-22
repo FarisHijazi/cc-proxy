@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
-    read_effort, wrap_reasoning,
+    ContentBlock, ImageInput, InputSupport, flatten_system_text, image_source_to_url,
+    normalize_content, parallel_tool_calls, read_effort, tool_reference_text,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -449,11 +449,18 @@ pub fn translate_openai_compatible_request(
     )
 }
 
+const INPUT_SUPPORT: InputSupport = InputSupport {
+    backend: "codex",
+    images: ImageInput::Any,
+    tool_result_images: ImageInput::Base64,
+};
+
 fn translate_request_inner(
     req: &MessagesRequest,
     opts: TranslateOptions,
     apply_codex_config: bool,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    INPUT_SUPPORT.ensure(req)?;
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
@@ -898,10 +905,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 arguments: args,
                             });
                         }
-                        ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        } => {
+                        ContentBlock::Thinking { signature, .. } => {
                             if let Some(replay) =
                                 signature.as_deref().and_then(decode_reasoning_signature)
                             {
@@ -910,10 +914,6 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     id: replay.id,
                                     summary: Vec::new(),
                                     encrypted_content: replay.encrypted_content,
-                                });
-                            } else if !thinking.is_empty() {
-                                text_parts.push(ResponsesContentPart::OutputText {
-                                    text: wrap_reasoning(thinking),
                                 });
                             }
                         }
@@ -1056,11 +1056,7 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
             .get("tool_name")
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
-            .map(|name| {
-                RenderedToolResultPart::Text(format!(
-                    "Tool available: {name}. Use its registered function schema."
-                ))
-            })
+            .map(|name| RenderedToolResultPart::Text(tool_reference_text(name)))
             .unwrap_or_else(|| {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
@@ -1076,9 +1072,6 @@ fn render_tool_result_image(block: &Value) -> RenderedToolResultPart {
         return RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block));
     };
     match source.get("type").and_then(Value::as_str) {
-        Some("url") if source.get("url").and_then(Value::as_str).is_some() => {
-            RenderedToolResultPart::Text("[image omitted: url]".to_string())
-        }
         Some("base64") => {
             let media_type = source.get("media_type").and_then(Value::as_str);
             let data = source.get("data").and_then(Value::as_str);
@@ -1855,7 +1848,7 @@ mod tests {
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content": [
                 {"type":"text", "text":"describe"},
-                {"type":"image", "source": {"type":"base64", "media_type":"image/jpeg", "data":"xyz"}}
+                {"type":"image", "source": {"type":"base64", "media_type":"image/jpeg", "data":"QUJD"}}
             ]}]
         }))
         .unwrap();
@@ -1884,36 +1877,44 @@ mod tests {
     }
 
     #[test]
-    fn translate_assistant_thinking_becomes_tagged_reasoning() {
-        // Symmetric with the anthropic passthrough: on an opus->codex switch a replayed
-        // thinking block has no Responses container, so it is carried as tagged text
-        // rather than dropped.
-        use crate::providers::translate_shared::{REASONING_CLOSE, REASONING_OPEN};
+    fn foreign_thinking_is_dropped_and_visible_text_is_untouched() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "messages": [{"role":"assistant", "content": [
-                {"type":"thinking", "thinking":"opus reasoning", "signature":"sig"},
-                {"type":"text", "text":"the answer"}
+                {"type":"thinking", "thinking":"opus reasoning", "signature":"EqQBsig=="},
+                {"type":"redacted_thinking", "data":"EmwKAhgBEgy="},
+                {"type":"text", "text":"the <previous_reasoning>answer</previous_reasoning>"}
             ]}]
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
-        assert_eq!(out.input.len(), 1);
-        let ResponsesInputItem::Message { role, content } = &out.input[0] else {
-            panic!("expected Message");
-        };
-        assert_eq!(role, "assistant");
-        assert_eq!(content.len(), 2);
-        let ResponsesContentPart::OutputText { text: reasoning } = &content[0] else {
-            panic!("expected reasoning OutputText");
-        };
-        assert!(reasoning.starts_with(REASONING_OPEN), "{reasoning}");
-        assert!(reasoning.contains("opus reasoning"), "{reasoning}");
-        assert!(reasoning.ends_with(REASONING_CLOSE), "{reasoning}");
-        let ResponsesContentPart::OutputText { text: answer } = &content[1] else {
-            panic!("expected answer OutputText");
-        };
-        assert_eq!(answer, "the answer");
+        assert_eq!(
+            serde_json::to_value(&out.input).unwrap(),
+            json!([{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"the <previous_reasoning>answer</previous_reasoning>"}
+            ]}])
+        );
+    }
+
+    #[test]
+    fn unsupported_user_content_is_refused_before_upstream() {
+        for (content, needle) in [
+            (
+                json!([{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]),
+                "document content",
+            ),
+            (
+                json!([{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}]}]),
+                "url image content in tool results",
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5", "messages": [{"role":"user", "content": content}]
+            }))
+            .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 
     #[test]
@@ -2174,7 +2175,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(function_call_output(rendered)).unwrap(),
             json!(
-                "before\n[image omitted: url]\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\nafter"
+                "before\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\nafter"
             )
         );
     }

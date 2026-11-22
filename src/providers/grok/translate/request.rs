@@ -5,7 +5,9 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config::GrokToolImageMode;
-use crate::providers::translate_shared::{ImageSource, image_source_to_url, parallel_tool_calls};
+use crate::providers::translate_shared::{
+    ImageSource, image_source_to_url, parallel_tool_calls, public_history_text,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -547,6 +549,14 @@ fn parse_message(
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("content block type is invalid"))?;
+        if let Some(text) = public_history_text(&block) {
+            content.push(if message.role == "assistant" {
+                GrokContentPart::OutputText { text }
+            } else {
+                GrokContentPart::InputText { text }
+            });
+            continue;
+        }
         match (message.role.as_str(), typ) {
             (_, "thinking") | (_, "redacted_thinking") => {}
             (_, "text") => {
@@ -708,7 +718,9 @@ fn parse_message(
                                 }
                                 match image_mode {
                                     GrokToolImageMode::Reject => {
-                                        anyhow::bail!("tool result supports text children only");
+                                        anyhow::bail!(
+                                            "Grok does not support image content in tool results in reject mode"
+                                        );
                                     }
                                     GrokToolImageMode::Omit => {
                                         let placeholder =
@@ -783,7 +795,13 @@ fn parse_message(
                                 })
                                 || !valid_cache_control(part.get("cache_control"))
                             {
-                                anyhow::bail!("tool result supports text children only");
+                                let kind = part
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("untyped");
+                                anyhow::bail!(
+                                    "Grok does not support {kind} content in tool results"
+                                );
                             }
                             let text = part
                                 .get("text")
@@ -1139,10 +1157,14 @@ mod tests {
         .unwrap();
         let translated = translate_request(&request, "grok-4.5".into()).unwrap();
         let value = serde_json::to_value(translated).unwrap();
-        assert!(value["input"].as_array().unwrap().iter().any(|item| {
-            item["role"] == "assistant" && item["content"][0]["text"] == "Found it"
-        }));
-        assert!(!value.to_string().contains("srvtoolu_1"));
+        let assistant = value["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["content"][2]["text"], "Found it");
+        assert_eq!(value.to_string().matches("srvtoolu_1").count(), 2);
     }
 
     #[test]
@@ -1956,7 +1978,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("tool result supports text children only")
+                .contains("image content in tool results")
         );
     }
 

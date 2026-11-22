@@ -324,7 +324,7 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
 /// Extract an estimate of input tokens from a MessagesRequest for usage
 /// reporting. This is a rough heuristic based on JSON string length.
 pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
-    let prompt = super::request::render_cursor_prompt(req);
+    let prompt = super::request::render_cursor_prompt(req).unwrap_or_default();
     (prompt.len() / 4).max(1) as u64
 }
 

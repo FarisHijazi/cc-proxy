@@ -124,7 +124,16 @@ impl Provider for CursorCliProvider {
         }
 
         let options = RunOptions::from_request(&parsed, &body);
-        let prompt = render_prompt(&body);
+        let prompt = match render_prompt(&body) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_bytes("020-cursor-cli-prompt.txt", prompt.as_bytes());
         }
@@ -188,6 +197,13 @@ impl Provider for CursorCliProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        if let Err(error) = render_prompt(&body) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
         let tokens = crate::providers::kimi::count_tokens::count_tokens(&body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
@@ -210,7 +226,13 @@ impl Provider for CursorCliProvider {
         let parsed = parse_model(requested);
         check_write_permission(&parsed)?;
         let options = RunOptions::from_request(&parsed, &body);
-        let prompt = render_prompt(&body);
+        let prompt = render_prompt(&body).map_err(|error| {
+            ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         let agent = spawn(&options, &prompt).map_err(|error| {
             ProviderError::new(
                 StatusCode::SERVICE_UNAVAILABLE,

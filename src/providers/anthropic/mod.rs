@@ -18,7 +18,6 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
 use crate::provider::{CliHandlers, Provider, RequestContext};
-use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
 
 /// How long a model list Anthropic gave a signed-in caller stays fresh.
@@ -67,16 +66,15 @@ pub fn record_live_models(body: &[u8]) -> bool {
 }
 
 /// Rewrite an outgoing Anthropic request body so it survives a mid-conversation switch
-/// away from the codex backend.
+/// away from another backend.
 ///
-/// Claude Code stores the codex backend's reconstructed reasoning as `thinking` blocks
-/// carrying an empty signature. Anthropic rejects those on replay (400
-/// `Invalid signature in thinking block`), so every post-switch turn would otherwise pay
-/// a failed round-trip plus Claude Code's strip-and-retry. A native Anthropic turn does
-/// carry prior-turn reasoning forward, so instead of dropping it we convert each
-/// signature-less `thinking` block into a tagged `text` block: Anthropic accepts text
-/// without a signature and the reasoning stays in context. Genuine Anthropic reasoning
-/// (a non-empty signature) is left untouched.
+/// Claude Code stores another backend's reasoning as `thinking` blocks whose signature
+/// is empty or a proxy `ccp:` marker. Anthropic rejects those on replay (400
+/// `Invalid signature in thinking block`), and replaying them as visible assistant text
+/// can trip Opus's `reasoning_extraction` refusal, so they are dropped. Genuine Anthropic
+/// `thinking` and `redacted_thinking` blocks, and all text and tool blocks, stay as sent.
+/// An assistant turn left empty is removed; Anthropic merges the neighbours it leaves
+/// adjacent.
 ///
 /// Returns rewritten bytes only when something changed; `None` forwards the body
 /// verbatim, keeping the byte-identical cache prefix for pure-Anthropic conversations.
@@ -88,46 +86,47 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> Option<Vec<u8>> {
 
     let messages = obj.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
-    for message in messages.iter_mut() {
+    messages.retain_mut(|message| {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
+            return true;
         }
         let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
+            return true;
         };
+        let before = content.len();
+        content.retain(|block| !is_foreign_thinking(block));
+        let mut rewritten = content.len() != before;
         for block in content.iter_mut() {
-            changed |= rehydrate_unsigned_thinking(block);
+            let foreign_search = block.get("type").and_then(Value::as_str)
+                == Some("x_search_tool_result")
+                || (block.get("type").and_then(Value::as_str) == Some("server_tool_use")
+                    && block.get("name").and_then(Value::as_str) == Some("x_search"));
+            if foreign_search
+                && let Some(text) = crate::providers::translate_shared::public_history_text(block)
+            {
+                *block = serde_json::json!({"type": "text", "text": text});
+                rewritten = true;
+            }
         }
-    }
+        changed |= rewritten;
+        !rewritten || !content.is_empty()
+    });
 
     changed.then(|| serde_json::to_vec(&doc).unwrap_or_else(|_| raw.to_vec()))
 }
 
-/// Convert one signature-less `thinking` block into a tagged `text` block in place.
-/// Returns whether the block was rewritten.
-fn rehydrate_unsigned_thinking(block: &mut Value) -> bool {
-    let Some(map) = block.as_object() else {
-        return false;
-    };
-    if map.get("type").and_then(Value::as_str) != Some("thinking") {
+/// A `thinking` block Anthropic did not sign: no signature, an empty one, or a proxy
+/// marker from another backend.
+fn is_foreign_thinking(block: &Value) -> bool {
+    if block.get("type").and_then(Value::as_str) != Some("thinking") {
         return false;
     }
-    let signed = map
+    block
         .get("signature")
         .and_then(Value::as_str)
-        .is_some_and(|sig| {
-            !sig.is_empty()
-                && crate::providers::translate_shared::foreign_reasoning_provider(sig).is_none()
-        });
-    if signed {
-        return false;
-    }
-    let reasoning = map.get("thinking").and_then(Value::as_str).unwrap_or("");
-    *block = serde_json::json!({
-        "type": "text",
-        "text": wrap_reasoning(reasoning),
-    });
-    true
+        .is_none_or(|sig| {
+            sig.is_empty() || crate::providers::translate_shared::ProxyReasoning::of(sig).is_some()
+        })
 }
 
 /// Regression tripwire. Claude Code drives its `WebSearch` tool through an isolated,
@@ -327,8 +326,8 @@ impl AnthropicProvider {
             monitor.upstream_started(&req_id);
         }
 
-        // Rehydrate signature-less codex `thinking` blocks so a mid-conversation switch
-        // to Anthropic does not 400. Unchanged bodies are forwarded verbatim.
+        // Drop another backend's `thinking` blocks so a mid-conversation switch to
+        // Anthropic does not 400. Unchanged bodies are forwarded verbatim.
         let outgoing = match sanitize_anthropic_request(&passthrough.raw_body, &req_id) {
             Some(bytes) => Body::from(bytes),
             None => Body::from(passthrough.raw_body),
@@ -496,7 +495,7 @@ impl CliHandlers for AnthropicCli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::translate_shared::{REASONING_CLOSE, REASONING_OPEN};
+    use crate::providers::translate_shared::ProxyReasoning;
 
     #[test]
     fn strips_hop_by_hop_and_encoding_from_request() {
@@ -538,73 +537,104 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    fn sanitize(body: Value) -> Value {
+        let raw = serde_json::to_vec(&body).unwrap();
+        parse(&sanitize_anthropic_request(&raw, "req").expect("should rewrite"))
+    }
+
+    const CODEX_SIG: &str = "ccp:codex:v1:abc";
+    const KIMI_B64_SIG: &str = "Y2NwOmtpbWk6djE6bXNnXzE6MA";
+
     #[test]
-    fn unsigned_thinking_becomes_tagged_text() {
-        let body = serde_json::json!({
-            "messages": [
+    fn foreign_and_unsigned_thinking_are_dropped_not_turned_into_text() {
+        let mut signatures = vec![serde_json::json!(""), Value::Null];
+        for origin in ProxyReasoning::ALL {
+            signatures.push(serde_json::json!(origin.sign("msg_1", 0)));
+            signatures.push(serde_json::json!(format!("{}msg_1:0", origin.prefix())));
+        }
+        for signature in signatures {
+            let thinking = serde_json::json!({"type": "thinking", "thinking": "foreign r", "signature": signature});
+            let out = sanitize(serde_json::json!({"messages": [
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "codex reasoning", "signature": ""},
-                    {"type": "text", "text": "391"}
-                ]}
-            ]
-        });
-        let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req1").expect("should rewrite");
-        let doc = parse(&out);
-        let blocks = doc["messages"][1]["content"].as_array().unwrap();
-        // the thinking block is gone, replaced by tagged text; the real answer survives
-        assert!(blocks.iter().all(|b| b["type"] != "thinking"));
-        let tagged = blocks[0]["text"].as_str().unwrap();
-        assert!(tagged.starts_with(REASONING_OPEN), "{tagged}");
-        assert!(tagged.contains("codex reasoning"), "{tagged}");
-        assert!(tagged.ends_with(REASONING_CLOSE), "{tagged}");
-        assert_eq!(blocks[1]["text"], "391");
+                {"role": "assistant", "content": [thinking.clone(), {"type": "text", "text": "391"}]}
+            ]}));
+            assert_eq!(
+                out["messages"][1]["content"],
+                serde_json::json!([{"type": "text", "text": "391"}]),
+                "{thinking}"
+            );
+            assert!(!out.to_string().contains("foreign r"), "{thinking}");
+        }
     }
 
     #[test]
-    fn signed_thinking_is_forwarded_verbatim() {
-        // A genuine Anthropic reasoning block (non-empty signature) must not be touched,
-        // so a pure-Anthropic conversation keeps its byte-identical cache prefix.
-        let body = serde_json::json!({
-            "messages": [
-                {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "opus reasoning", "signature": "abc123"}
-                ]}
-            ]
-        });
-        let raw = serde_json::to_vec(&body).unwrap();
-        assert!(sanitize_anthropic_request(&raw, "req2").is_none());
-    }
-
-    #[test]
-    fn proxy_kimi_thinking_signature_becomes_tagged_text() {
-        let body = serde_json::json!({"messages": [{"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "kimi reasoning", "signature": "Y2NwOmtpbWk6djE6bXNnXzE6MA"}
-        ]}]});
-        let out =
-            sanitize_anthropic_request(&serde_json::to_vec(&body).unwrap(), "req-kimi").unwrap();
-        let out: Value = serde_json::from_slice(&out).unwrap();
+    fn mixed_turn_keeps_genuine_reasoning_and_tool_flow_in_order() {
+        let signed =
+            serde_json::json!({"type": "thinking", "thinking": "opus r", "signature": "EqQBsig=="});
+        let redacted = serde_json::json!({"type": "redacted_thinking", "data": "EmwKAhgBEgy="});
+        let tool_use = serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}});
+        let tool_result = serde_json::json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"});
+        let out = sanitize(serde_json::json!({"messages": [
+            {"role": "user", "content": "list files"},
+            {"role": "assistant", "content": [
+                signed.clone(),
+                {"type": "thinking", "thinking": "codex r", "signature": CODEX_SIG},
+                redacted.clone(),
+                {"type": "text", "text": "Listing."},
+                {"type": "thinking", "thinking": "kimi r", "signature": KIMI_B64_SIG},
+                tool_use.clone()
+            ]},
+            {"role": "user", "content": [tool_result.clone()]}
+        ]}));
         assert_eq!(
-            out["messages"][0]["content"][0],
-            serde_json::json!({
-                "type": "text", "text": wrap_reasoning("kimi reasoning")
-            })
+            out["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "list files"},
+                {"role": "assistant", "content": [
+                    signed, redacted, {"type": "text", "text": "Listing."}, tool_use
+                ]},
+                {"role": "user", "content": [tool_result]}
+            ])
         );
     }
 
     #[test]
-    fn missing_signature_is_treated_as_unsigned() {
-        let body = serde_json::json!({
-            "messages": [
-                {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "r"}
-                ]}
-            ]
-        });
+    fn assistant_turn_left_empty_is_removed() {
+        let out = sanitize(serde_json::json!({"messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "codex r", "signature": CODEX_SIG}
+            ]},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "unsigned r", "signature": ""}
+            ]}
+        ]}));
+        assert_eq!(
+            out["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "user", "content": "third"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ordinary_text_mentioning_reasoning_tags_is_left_alone() {
+        let body = serde_json::json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "<previous_reasoning>x</previous_reasoning>"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "opus r", "signature": "EqQBsig=="},
+                {"type": "redacted_thinking", "data": "EmwKAhgBEgy="},
+                {"type": "text", "text": "<previous_reasoning>y</previous_reasoning>"}
+            ]}
+        ]});
         let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req3").expect("should rewrite");
-        assert_eq!(parse(&out)["messages"][0]["content"][0]["type"], "text");
+        assert!(sanitize_anthropic_request(&raw, "req").is_none());
     }
 
     #[test]
@@ -635,6 +665,18 @@ mod tests {
             a, b,
             "rewrite must be byte-stable to preserve the cache prefix"
         );
+    }
+
+    #[test]
+    fn native_signed_reasoning_and_hosted_web_search_stay_byte_exact() {
+        let raw = br#"{ "model": "claude-opus-4-7", "messages": [{"role":"assistant", "content":[
+            {"type":"thinking","thinking":"native","signature":"EqQBsig=="},
+            {"type":"redacted_thinking","data":"EmwKAhgBEgy="},
+            {"type":"server_tool_use","id":"s","name":"web_search","input":{"query":"q"}},
+            {"type":"web_search_tool_result","tool_use_id":"s","content":[{"type":"web_search_result","url":"https://example.invalid","title":"result"}]},
+            {"type":"text","text":"answer"}
+        ]}] }"#;
+        assert!(sanitize_anthropic_request(raw, "native").is_none());
     }
 
     #[test]
