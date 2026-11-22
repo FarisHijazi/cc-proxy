@@ -20,14 +20,18 @@ const ACCOUNTS = [
   { alias: "c@example.com", email: "c@example.com", slot: 3, usage: {} },
 ];
 
-async function open(browser, size, { failSave = false } = {}) {
+const MODELS = { anthropic: ["claude-opus-5"], codex: ["gpt-6.1-sol"], cursor: ["cursor-agent"], kimi: ["kimi-k3"], gemini: ["gemini-3-pro"] };
+const CATALOG = Object.fromEntries(Object.entries(MODELS).map(([p, models]) => [p, { label: p === "anthropic" ? "Claude" : p[0].toUpperCase() + p.slice(1), family: p === "anthropic" ? "claude" : p, models }]));
+
+async function open(browser, size, { failSave = false, initial = {}, reachable = true } = {}) {
   const ctx = await browser.newContext({ viewport: size });
   const page = await ctx.newPage();
   const posts = [];
-  let accounts = structuredClone(ACCOUNTS), fallback = {};
+  let accounts = structuredClone(ACCOUNTS), fallback = structuredClone(initial);
   const state = () => ({
     accounts, balance: { strategy: "prefer", prefer: "c@example.com" }, strategies: ["session", "prefer"], fallback,
-    fallback_defaults: { chains: { claude: ["accounts", "codex", "cursor"] }, tiers: [] }, providers: { reachable: true, models: { codex: ["gpt-6.1-sol"], cursor: ["cursor-agent"] } },
+    fallback_defaults: reachable ? { chains: { claude: ["accounts", "codex", "cursor"] }, tiers: [] } : null,
+    providers: reachable ? { reachable: true, models: MODELS, catalog: CATALOG } : { reachable: false, models: {} },
     proxy: { address: "x:1", up: true },
     db: { path: null, bytes: 0, disk_free: 1 }, traffic_days: null,
   });
@@ -78,7 +82,7 @@ try {
     await page.locator("#accounts .card").nth(0).locator(".name").dragTo(page.locator("#accounts .card").nth(2));
     await page.waitForFunction(() => document.querySelector("#accounts .name").textContent === "b@example.com");
     assert.deepEqual(posts.map((p) => p.order), [["b@example.com", "c@example.com", "a@example.com"]], `${label}: drag POST`);
-    assert.equal(posts[0].fallback.chains.claude, undefined, `${label}: default chain kept`);
+    assert.deepEqual(posts[0].fallback.chains, { "*": ["accounts", "codex", "cursor"] }, `${label}: one global chain`);
     assert.deepEqual(await names(page), ["b@example.com", "c@example.com", "a@example.com"]);
 
     // Arrow still works and posts the same shape.
@@ -94,25 +98,53 @@ try {
     posts.splice(3, 1);
 
     // Codex moved between the accounts: one enabled account (c; b is off), then Codex, then the rest.
-    assert.deepEqual(await listed(page), ["c@example.com", "b@example.com", "a@example.com", "codex", "cursor"]);
+    assert.deepEqual(await listed(page), ["c@example.com", "b@example.com", "a@example.com", "codex", "cursor", "kimi", "gemini"]);
     await dragHandle(page, 3, 1);
     await page.waitForFunction(() => document.querySelectorAll("#accounts .card")[1].dataset.target === "codex");
-    assert.deepEqual(posts[3].fallback.chains.claude, ["accounts:1", "codex", "accounts", "cursor"], `${label}: interleaved chain`);
-    assert.deepEqual(await listed(page), ["c@example.com", "codex", "b@example.com", "a@example.com", "cursor"]);
+    assert.deepEqual(posts[3].fallback.chains["*"], ["accounts:1", "codex", "accounts", "cursor"], `${label}: interleaved chain`);
+    assert.deepEqual(await listed(page), ["c@example.com", "codex", "b@example.com", "a@example.com", "cursor", "kimi", "gemini"]);
     assert.match(await page.locator("#accounts").innerText(), /#2 of 5/);
 
     // Cursor switched off drops out of the chain and stays listed, dimmed, at the end; on again rejoins last.
     await page.locator('#accounts [data-target="cursor"] .switch span').click();
     await page.waitForFunction(() => document.querySelector('#accounts [data-target="cursor"]').classList.contains("off"));
-    assert.deepEqual(posts[4].fallback.chains.claude, ["accounts:1", "codex", "accounts"], `${label}: cursor off`);
+    assert.deepEqual(posts[4].fallback.chains["*"], ["accounts:1", "codex", "accounts"], `${label}: cursor off`);
     await page.locator('#accounts [data-target="codex"] [data-up]').click();
     await page.waitForFunction(() => document.querySelectorAll("#accounts .card")[0].dataset.target === "codex");
-    assert.deepEqual(posts[5].fallback.chains.claude, ["codex", "accounts"], `${label}: codex first`);
+    assert.deepEqual(posts[5].fallback.chains["*"], ["codex", "accounts"], `${label}: codex first`);
     await page.locator('#accounts [data-target="cursor"] .switch span').click();
     await page.waitForFunction(() => !document.querySelector('#accounts [data-target="cursor"]').classList.contains("off"));
-    assert.deepEqual(posts[6].fallback.chains.claude, ["codex", "accounts", "cursor"], `${label}: cursor back on, last`);
+    assert.deepEqual(posts[6].fallback.chains["*"], ["codex", "accounts", "cursor"], `${label}: cursor back on, last`);
+
+    // Any provider joins the one order and can go above every Claude account.
+    await page.locator('#accounts [data-target="kimi"] .switch span').click();
+    await page.waitForFunction(() => !document.querySelector('#accounts [data-target="kimi"]').classList.contains("off"));
+    assert.deepEqual(posts[7].fallback.chains["*"], ["codex", "accounts", "cursor", "kimi"], `${label}: kimi on`);
+    await dragHandle(page, 5, 0);
+    await page.waitForFunction(() => document.querySelectorAll("#accounts .card")[0].dataset.target === "kimi");
+    assert.deepEqual(posts[8].fallback.chains["*"], ["kimi", "codex", "accounts", "cursor"], `${label}: kimi above Claude`);
+    assert.deepEqual(posts[8].order, ["c@example.com", "b@example.com", "a@example.com"], `${label}: account order kept`);
+    await page.reload();
+    await page.locator("#accounts .card").first().waitFor();
+    assert.deepEqual(await listed(page), ["kimi", "codex", "c@example.com", "b@example.com", "a@example.com", "cursor", "gemini"], `${label}: reload keeps the order`);
+    assert.match(await page.locator('#accounts [data-target="kimi"]').innerText(), /#1 of 6/);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${label}: no horizontal scroll after reorder`);
+    await page.goto("http://dash.test/#routing");
+    assert.match(await page.locator('[data-family="codex"]').innerText(), /inherits the Accounts order[\s\S]*as requested[\s\S]*Kimi/, `${label}: Routing shows the inherited order`);
     await close();
     console.log(`ok ${label}`);
+  }
+
+  // The claude chain the Accounts list used to save becomes the global order; other families' overrides stay.
+  {
+    const { page, posts, close } = await open(browser, { width: 1280, height: 2400 },
+      { initial: { chains: { claude: ["accounts:1", "codex", "accounts"], codex: ["codex", "accounts"] } } });
+    assert.deepEqual(await listed(page), ["a@example.com", "codex", "b@example.com", "c@example.com", "cursor", "kimi", "gemini"]);
+    await page.locator('#accounts [data-target="gemini"] .switch span').click();
+    await page.waitForFunction(() => !document.querySelector('#accounts [data-target="gemini"]').classList.contains("off"));
+    assert.deepEqual(posts[0].fallback.chains, { "*": ["accounts:1", "codex", "accounts", "gemini"], codex: ["codex", "accounts"] });
+    await close();
+    console.log("ok migration");
   }
 
   // Touch drags only from the handle, so a finger on the card body still scrolls the page.
@@ -133,6 +165,19 @@ try {
     assert.deepEqual(posts[0].order, ["b@example.com", "c@example.com", "a@example.com"], "touch drag from the handle");
     await close();
     console.log("ok touch");
+  }
+
+  // With the router unreachable its default order is unknown, so a reorder must not save a guessed one.
+  {
+    const { page, posts, close } = await open(browser, { width: 1280, height: 2400 }, { reachable: false });
+    const before = await names(page);
+    await dragHandle(page, 0, 2);
+    await page.locator("#error .error").waitFor();
+    assert.equal(posts.length, 0, "unreachable: nothing saved");
+    assert.deepEqual(await names(page), before, "unreachable: order unchanged");
+    assert.match(await page.locator("#error").innerText(), /default failover order is unknown/);
+    await close();
+    console.log("ok unreachable");
   }
 
   // A failed save must not reorder the list or look like success.

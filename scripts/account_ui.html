@@ -201,10 +201,8 @@
 
   <section data-view="accounts" hidden>
   <h2>Accounts &amp; providers</h2>
-  <div class="subhead">Fallback order for Claude models: a session starts on its own account (or the preferred one), then walks this list. Drag a card or use the arrows.</div>
-  <div class="grid" id="accounts"><div class="skeleton">Loading accounts and live usage…</div></div>
-  <div class="subhead">Other backends: used when one of their models is requested, or from a Failover chain in Routing</div>
-  <div class="grid" id="provider-cards"><div class="skeleton">Loading providers…</div></div>
+  <div class="subhead">One failover order for every model. A request starts on its own provider (a Claude model on its session's account, or the preferred one), then walks this list from the top. Drag a card or use the arrows. Switch a provider off to never use it as a fallback; it still serves its own models. A model family can override this order in Routing.</div>
+  <div class="grid" id="accounts"><div class="skeleton">Loading accounts, providers and live usage…</div></div>
   </section>
 
   <section data-view="routing" hidden>
@@ -340,11 +338,15 @@ function meter(name, w) {
     <div class="small muted" style="margin:-6px 0 0 72px">${esc(until(w.resets_at))}</div>`;
 }
 
-// One list in the order a Claude-model request tries things: the accounts (the `order`) interleaved with the
-// other backends of the `claude` failover chain, where `accounts:N` stands for the next N enabled accounts.
-const LISTED_BACKENDS = ["codex", "cursor"];
+// One flat list, the global chain "*": Claude accounts (the `order`) interleaved with every backend in the
+// router's catalog, where `accounts:N` stands for the next N enabled accounts.
+const isRun = (t) => t === "accounts" || /^accounts:\d+$/.test(t);
+function globalChain() {
+  const chains = state.fallback.chains || {};
+  return chains["*"] ?? chains.claude ?? defaultChains().claude;
+}
 function fallbackItems() {
-  const accounts = state.accounts, items = [];
+  const accounts = state.accounts, items = [], chain = globalChain() ?? ["accounts"];
   let next = 0;
   const take = (n) => {
     for (let taken = 0; next < accounts.length && taken < n; next++) {
@@ -352,16 +354,14 @@ function fallbackItems() {
       items.push({a: accounts[next]});
     }
   };
-  const chain = chainOf("claude");
-  for (const t of chain) {
-    const n = t === "accounts" ? Infinity : /^accounts:\d+$/.test(t) ? +t.slice(9) : null;
-    n === null ? items.push({target: t}) : take(n);
-  }
+  for (const t of chain) isRun(t) ? take(t === "accounts" ? Infinity : +t.slice(9)) : items.push({target: t});
   take(Infinity);
-  LISTED_BACKENDS.filter((t) => !chain.includes(t)).forEach((t) => items.push({target: t, off: true}));
+  Object.keys(state.providers.catalog || {}).filter((p) => p !== "anthropic" && !chain.includes(p))
+    .forEach((target) => items.push({target, off: true}));
   return items;
 }
 function saveItems(items) {
+  if (!globalChain()) return showError("Router unreachable: the default failover order is unknown, so this order cannot be saved yet.");
   const runs = [];
   for (const x of items.filter((x) => !x.off)) {
     if (!x.a) runs.push(x.target);
@@ -372,8 +372,8 @@ function saveItems(items) {
   const chain = runs.flatMap((r, i) => typeof r !== "number" ? [r] : i === lastRun ? ["accounts"] : r ? [`accounts:${r}`] : []);
   if (lastRun < 0) chain.unshift("accounts");
   const f = failover();
-  if (JSON.stringify(chain) === JSON.stringify(defaultChains().claude)) delete f.chains.claude;
-  else f.chains.claude = chain;
+  if (!Object.hasOwn(f.chains, "*")) delete f.chains.claude;
+  f.chains["*"] = chain;
   save({order: items.filter((x) => x.a).map((x) => x.a.alias), fallback: f});
 }
 
@@ -391,16 +391,16 @@ function renderAccounts() {
   $("accounts").innerHTML = items.map((x, i) => {
     const a = x.a, off = x.off || a?.disabled, n = x.off ? null : ++rank;
     if (!a) {
-      const provider = providerOf(x.target, "claude");
+      const provider = providerOf(x.target, "*"), named = Object.hasOwn(PROVIDER, x.target) && !state.providers.catalog?.[x.target]?.models.includes(x.target);
       return `<div class="card provider-card p-${esc(provider || "none")} ${off ? "off" : ""}" data-i="${i}" data-target="${esc(x.target)}" data-provider="${esc(provider || "")}">
       <div class="card-head">
-        ${off ? "" : `<span class="handle" role="img" aria-label="Drag to reorder ${esc(targetLabel(x.target, "claude"))}" title="Drag to reorder (or use the arrows)">⠿</span>`}
+        ${off ? "" : `<span class="handle" role="img" aria-label="Drag to reorder ${esc(PROVIDER[x.target] || x.target)}" title="Drag to reorder (or use the arrows)">⠿</span>`}
         <span class="dot"></span><span class="name">${esc(PROVIDER[x.target] || x.target)}</span><span class="spacer"></span>
-        <span class="badge">${esc(tierProviderKeys().includes(x.target) ? "same tier as the requested Claude model" : "exact model")}</span>
+        <span class="badge" title="${named ? "What another model's request runs on this provider" : "Always this exact model"}">${esc(tierProviderKeys().includes(x.target) ? "same tier" : named ? "only its own models (no equivalent mapping)" : "exact model")}</span>
       </div>
-      ${provider && PROVIDER[provider] && provider !== "anthropic" ? providerBody(provider, true) : ""}
+      ${provider && PROVIDER[provider] && provider !== "anthropic" ? providerBody(provider) : ""}
       <div class="card-foot">
-        <span class="small muted">${off ? "off: Claude-model requests never fall back to it" : `#${n} of ${live}`}</span><span class="spacer"></span>
+        <span class="small muted">${off ? "off: never used as a fallback for other models" : `#${n} of ${live}`}</span><span class="spacer"></span>
         ${off ? "" : `<button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>
         <button data-down="${i}" ${n === live ? "disabled" : ""} title="Try later">↓</button>`}
         <label class="switch" title="${off ? "Off: never tried" : "In the fallback order"}"><input type="checkbox" data-backend="${i}" ${off ? "" : "checked"}><span></span></label>
@@ -425,7 +425,7 @@ function renderAccounts() {
         <button data-down="${i}" ${n === live || i === items.length - 1 ? "disabled" : ""} title="Try later">↓</button>
         <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>
       </div></div>`;
-  }).join("");
+  }).join("") + (state.providers.reachable ? "" : `<div class="small muted">Router unreachable: providers that are switched off appear once it answers.</div>`);
   const moveTo = (from, to) => { const next = [...items], [moved] = next.splice(from, 1); next.splice(to, 0, moved); saveItems(next); };
   // Pointer drag works for mouse and touch alike. A mouse drags from anywhere on the card except its controls;
   // touch drags only from the handle, so the page still scrolls. Drops save like the arrows and re-render from
@@ -549,7 +549,11 @@ function failover() {
 }
 const defaultChains = () => state.fallback_defaults?.chains ?? {};
 function chainOf(family) {
-  return (state.fallback.chains || {})[family] ?? defaultChains()[family] ?? [own(family)];
+  const chains = state.fallback.chains || {}, global = chains["*"];
+  if (chains[family]) return chains[family];
+  if (!global) return defaultChains()[family] ?? [own(family)];
+  const i = global.findIndex((t) => family === "claude" ? isRun(t) : t === family);
+  return [i < 0 ? own(family) : global[i], ...global.filter((_, j) => j !== i)];
 }
 function providerOf(target, family) {
   if (target === "accounts" || /^accounts:\d+$/.test(target)) return "anthropic";
@@ -563,7 +567,8 @@ function targetLabel(target, family) {
   if (target === "accounts") return family === "claude" ? "Claude accounts · as requested" : "Claude accounts · same tier";
   if (/^accounts:\d+$/.test(target)) return `next ${target.slice(9)} Claude account${target.slice(9) === "1" ? "" : "s"}`;
   if (target === family) return "as requested";
-  return tierProviderKeys().includes(target) ? `${PROVIDER[target] || target} · same tier` : target;
+  if (tierProviderKeys().includes(target)) return `${PROVIDER[target] || target} · same tier`;
+  return Object.hasOwn(PROVIDER, target) && !state.providers.catalog?.[target]?.models.includes(target) ? `${PROVIDER[target]} · no equivalent, skipped` : target;
 }
 function saveFailover(edit) { const f = failover(); edit(f); save({fallback: f}); }
 
@@ -587,8 +592,9 @@ const QUOTA = {codex: "no Codex CLI login found on the dashboard host",
                grok: "Grok reports no quota through the router"};
 const ESTIMATED = {gemini: "gemini-web-api reports no usage, so token counts are the router's estimate"};
 const compact = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
-function chainSpots(provider, skip) {
-  return FAMILIES.filter(([family]) => family !== skip).flatMap(([family, title]) => {
+function chainSpots(provider) {
+  const custom = state.fallback.chains || {};
+  return FAMILIES.filter(([family]) => custom[family]).flatMap(([family, title]) => {
     const chain = chainOf(family), i = chain.findIndex((t) => providerOf(t, family) === provider);
     return i < 0 ? [] : [`#${i + 1} of ${chain.length} for ${title}`];
   });
@@ -622,19 +628,12 @@ function providerQuota(name, q) {
       : `<div class="small"><span class="muted">${esc(w.label)}</span> ${w.used != null ? `${esc(w.used)} ${esc(w.unit || "")} used, limit not reported` : "unknown"}</div>`).join("") +
     `<div class="small muted">${q.note ? esc(q.note) + ". " : ""}Quota from ${esc(q.source)}, as of ${esc(new Date(q.at * 1000).toLocaleTimeString())}.</div>`;
 }
-function renderProviderCards() {
-  const p = state.providers, u = state.provider_usage ?? null;
-  $("provider-cards").innerHTML = Object.keys(PROVIDER).filter((name) => name !== "anthropic" && !LISTED_BACKENDS.includes(name)).map((name) =>
-    `<div class="card provider-card p-${esc(name)}" data-provider="${esc(name)}">
-      <div class="card-head"><span class="dot"></span><span class="name">${esc(PROVIDER[name])}</span></div>
-      ${providerBody(name)}</div>`).join("");
-}
-function providerBody(name, listed = false) {
-  const p = state.providers, u = state.provider_usage ?? null, ids = p.models[name] || [], spots = chainSpots(name, listed && "claude");
+function providerBody(name) {
+  const p = state.providers, u = state.provider_usage ?? null, ids = p.models[name] || [], spots = chainSpots(name);
   const [dot, status] = !p.reachable ? ["", "availability unknown: router unreachable"]
     : ids.length ? ["ok", `signed in · ${ids.length} model${ids.length === 1 ? "" : "s"}`] : ["bad", "unavailable on the proxy host"];
   return `<div class="small"><span title="${esc(ids.join("\n"))}"><span class="dot ${dot}" style="display:inline-block;width:6px;height:6px"></span> ${esc(status)}</span></div>
-      <div class="small">${spots.length ? `Failover: ${esc(spots.join(" · "))}` : `<span class="muted">${listed ? "In no other failover chain." : "In no failover chain: used only when one of its models is requested."}</span>`}</div>
+      ${spots.length ? `<div class="small">Routing overrides: ${esc(spots.join(" · "))}</div>` : ""}
       ${providerUsage(u, u?.providers[name] ? {name, ...u.providers[name]} : null)}
       ${providerQuota(name, (state.provider_quota || {})[name])}`;
 }
@@ -655,7 +654,7 @@ function renderChains() {
     const chain = chainOf(family);
     return `<div class="chain" data-family="${family}">
       <div><div style="font-weight:600">${esc(title)}</div>
-        <div class="small muted">${custom[family] ? `custom · <a href="#" data-reset>reset</a>` : defaultChains()[family] ? "default" : state.fallback_defaults ? "no failover" : "router defaults unknown"}</div></div>
+        <div class="small muted">${custom[family] ? `custom · <a href="#" data-reset>reset</a>` : custom["*"] ? `inherits the <a href="#accounts">Accounts order</a>` : defaultChains()[family] ? "default" : state.fallback_defaults ? "no failover" : "router defaults unknown"}</div></div>
       <div class="chips">${chain.map((t, i) => {
         const provider = providerOf(t, family);
         const up = !state.providers.reachable || (provider && (state.providers.models[provider] || []).length);
@@ -947,7 +946,7 @@ function render() {
     PROVIDER[name] = entry.label;
     if (!FAMILIES.some(([family]) => family === entry.family)) FAMILIES.push([entry.family, `${entry.label} models`]);
   }
-  renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderProviderCards(); renderSessions(); renderKeys(); }
+  renderHeader(); renderCatalog(); renderModels(); renderRouting(); renderProviders(); renderChains(); renderTriggers(); renderAccounts(); renderSessions(); renderKeys(); }
 
 async function loadState() {
   try { state = await api("/api/state"); hasLoaded = true; render(); showError(null); }

@@ -28,13 +28,17 @@ const USAGE = {
 async function open(browser, { reachable = true, usage = USAGE, stall = false, quota, hash = "accounts", onConfig, usageBreakdown } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   const page = await ctx.newPage();
+  const models = reachable ? { anthropic: ["claude-opus-5"], codex: ["gpt-6.1-sol"], gemini: ["gemini-3-pro"],
+                               cursor: [], "cursor-cli": [], kimi: [], grok: [] } : {};
+  const labels = { anthropic: "Claude", codex: "Codex", gemini: "Gemini", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI", kimi: "Kimi", grok: "Grok" };
+  const catalog = Object.fromEntries(Object.keys(models).map((p) => [p, { label: labels[p], family: p === "anthropic" ? "claude" : p, models: models[p] }]));
+  if (catalog["cursor-cli"]) catalog["cursor-cli"].models = ["cursor-cli"];
   const state = {
     accounts: [{ alias: "a@example.com", email: "a@example.com", slot: 1, usage: {} }],
     balance: { strategy: "session" }, strategies: ["session"], traffic_days: null,
-    fallback: { chains: { gemini: ["gemini", "codex"] } },
+    fallback: { chains: { gemini: ["gemini", "codex", "cursor-cli"] } },
     fallback_defaults: { chains: { claude: ["accounts", "codex", "cursor"], codex: ["codex", "accounts", "cursor"] }, tiers: [] },
-    providers: { reachable, models: reachable ? { anthropic: ["claude-opus-5"], codex: ["gpt-6.1-sol"], gemini: ["gemini-3-pro"],
-                                                  cursor: [], "cursor-cli": [], kimi: [], grok: [] } : {} },
+    providers: { reachable, models, catalog },
     provider_usage: usage, provider_quota: quota, proxy: { address: "x:1", up: true }, db: { path: usage ? "/x" : null, bytes: 0, disk_free: 1 },
   };
   await page.route("http://dash.test/**", async (route) => {
@@ -59,23 +63,23 @@ try {
   {
     const { page, close } = await open(browser);
     await card(page, "codex").waitFor();
-    const names = await page.locator("#provider-cards .card").evaluateAll((els) => els.map((e) => e.dataset.provider));
-    assert.deepEqual(names, ["cursor-cli", "gemini", "kimi", "grok"], "every backend outside the fallback order gets a card");
+    assert.equal(await page.locator("#provider-cards").count(), 0, "no separate provider section");
+    assert.doesNotMatch(await page.locator("main").innerText(), /Other backends/);
     const listed = await page.locator("#accounts .card").evaluateAll((els) => els.map((e) => e.dataset.target || e.querySelector(".name").textContent));
-    assert.deepEqual(listed, ["a@example.com", "codex", "cursor"], "Codex and Cursor sit in the fallback order after the Claude accounts");
-    const boxes = await page.locator("#provider-cards .card").evaluateAll(els => els.map(el => {
+    assert.deepEqual(listed, ["a@example.com", "codex", "cursor", "gemini", "cursor-cli", "kimi", "grok"],
+      "one flat list: the saved order, then every other catalog provider, switched off");
+    const boxes = await page.locator("#accounts .card").evaluateAll(els => els.map(el => {
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, bottom: r.bottom };
     }));
-    assert(boxes.every(b => Math.abs(b.x - boxes[0].x) < 1 && Math.abs(b.width - boxes[0].width) < 1), "provider cards are one vertical column");
-    assert(boxes.slice(1).every((b, i) => b.y >= boxes[i].bottom), "provider cards stack without overlap");
-    assert.equal(await page.locator("#provider-cards .switch, #provider-cards .handle, #provider-cards [data-up]").count(), 0,
-      "provider cards carry no account toggle, drag handle or arrows");
+    assert(boxes.every(b => Math.abs(b.x - boxes[0].x) < 1 && Math.abs(b.width - boxes[0].width) < 1), "cards are one vertical column");
+    assert(boxes.slice(1).every((b, i) => b.y >= boxes[i].bottom), "cards stack without overlap");
+    assert.equal(await page.locator("#accounts .card .switch").count(), 7, "every account and provider has an on/off switch");
 
     const codex = await card(page, "codex").innerText();
     assert.match(codex, /signed in · 1 model/);
-    assert.doesNotMatch(codex, /for Claude models/, "its Claude-model position is the list number"); assert.match(codex, /#2 of 3/); assert.match(codex, /#1 of 3 for Codex \/ GPT models/);
-    assert.match(codex, /#2 of 2 for Gemini models/);
+    assert.match(codex, /#2 of 3/); assert.doesNotMatch(codex, /for Codex/, "inherited chains are the list itself");
+    assert.match(codex, /Routing overrides: #2 of 3 for Gemini models/);
     assert.match(codex, /407/); assert.match(codex, /2\.5M \/ 90\.7M \/ 174\.3k/);
     assert.match(codex, /last answered 5m ago · gpt-6\.1-sol · HTTP 200/);
     assert.match(codex, /Recorded by the traffic database, last 24 h, as of/);
@@ -84,10 +88,16 @@ try {
 
     const kimi = await card(page, "kimi").innerText();
     assert.match(kimi, /unavailable on the proxy host/);
-    assert.match(kimi, /#1 of 1 for Kimi models/);
+    assert.match(kimi, /off: never used as a fallback for other models/);
+    assert.match(kimi, /only its own models \(no equivalent mapping\)/);
     assert.match(kimi, /no model calls answered in the last 24 h/);
     assert.match(await card(page, "gemini").innerText(), /router's estimate/);
     assert.match(await page.locator("#accounts").innerText(), /a@example\.com/, "Claude account cards still render");
+    assert.equal(await card(page, "cursor-cli").locator(".badge").innerText(), "exact model");
+    await page.goto("http://dash.test/#routing");
+    const geminiChain = await page.locator('[data-family="gemini"]').innerText();
+    assert.match(geminiChain, /cursor-cli/);
+    assert.equal(await page.locator('[data-family="gemini"] .chip[data-i="2"] > span').innerText(), "cursor-cli");
     await close();
     console.log("ok recorded usage");
   }
@@ -125,8 +135,8 @@ try {
   {
     const { page, close } = await open(browser, { stall: true });
     await page.waitForTimeout(300);
-    assert.equal(await page.locator("#provider-cards .card").count(), 0, "nothing rendered while state is in flight");
-    assert.match(await page.locator("#provider-cards").innerText(), /Loading/);
+    assert.equal(await page.locator("#accounts .card").count(), 0, "nothing rendered while state is in flight");
+    assert.match(await page.locator("#accounts").innerText(), /Loading/);
     await close();
     console.log("ok loading");
   }

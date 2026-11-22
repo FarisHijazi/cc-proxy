@@ -63,9 +63,10 @@ impl Default for Triggers {
 }
 
 /// Per family (`claude`, `codex`, or a provider name such as `gemini`), the ordered
-/// targets: `accounts` (each Claude account), `codex` / `cursor` (the same tier on
-/// that backend), the family's own name (the requested model untouched), or an
-/// exact model id (a `claude-*` id runs on each account).
+/// targets: `accounts` (each Claude account), a provider name (the same tier on that
+/// backend, skipped when the tier has no model there), the family's own name (the
+/// requested model untouched), or an exact model id (a `claude-*` id runs on each
+/// account). [`GLOBAL`] is the order every family without its own chain inherits.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Policy {
@@ -208,7 +209,7 @@ pub fn defaults() -> Value {
     })
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Step {
     /// Requested model on its own backend, untouched.
     Original,
@@ -218,23 +219,46 @@ enum Step {
     Substitute(String),
 }
 
+/// The chain key every family without its own chain uses, with its own provider first.
+pub const GLOBAL: &str = "*";
 const DEFAULT_CLAUDE: &[&str] = &["accounts", "codex"];
 const DEFAULT_CODEX: &[&str] = &["codex", "accounts"];
 const DEFAULT_KIMI: &[&str] = &["kimi", "accounts", "codex"];
 
-/// The ordered chain for a request first routed to `provider`.
-fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<Step> {
+/// Built-in tier providers retain their provider-target meaning, as do other backend
+/// names that are not routable model ids. `cursor-cli` remains a literal model.
+pub fn provider_targets(registry: &Registry) -> Vec<String> {
+    registry
+        .list_provider_names()
+        .into_iter()
+        .filter(|name| {
+            default_tiers().iter().any(|t| t.models.contains_key(name))
+                || registry.provider_for_model(name, None).is_none()
+        })
+        .collect()
+}
+
+/// The ordered chain for a request first routed to `provider`. `providers` are the
+/// backend names that mean tier targets, skipped when the tier has no cell.
+fn chain(
+    provider: &str,
+    model: &str,
+    accounts: usize,
+    policy: &Policy,
+    providers: &[String],
+) -> Vec<Step> {
     let family = if provider == "anthropic" {
         "claude"
     } else {
         provider
     };
-    let targets: Vec<&str> = match policy.chains.get(family) {
-        Some(targets) => targets.iter().map(String::as_str).collect(),
-        None if family == "claude" => DEFAULT_CLAUDE.to_vec(),
-        None if family == "codex" => DEFAULT_CODEX.to_vec(),
-        None if family == "kimi" => DEFAULT_KIMI.to_vec(),
-        None => Vec::new(),
+    let targets: Vec<&str> = match (policy.chains.get(family), policy.chains.get(GLOBAL)) {
+        (Some(targets), _) => targets.iter().map(String::as_str).collect(),
+        (None, Some(global)) => own_first(family, global, accounts),
+        (None, None) if family == "claude" => DEFAULT_CLAUDE.to_vec(),
+        (None, None) if family == "codex" => DEFAULT_CODEX.to_vec(),
+        (None, None) if family == "kimi" => DEFAULT_KIMI.to_vec(),
+        (None, None) => Vec::new(),
     };
     let tier = policy.tier(model);
     let mut steps = Vec::new();
@@ -258,9 +282,10 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
                 steps.push(Step::Original);
                 continue;
             }
-            "codex" => tier.and_then(|t| t.models.get("codex").cloned()),
-            "cursor" => tier.and_then(|t| t.models.get("cursor").cloned()),
-            "kimi" => tier.and_then(|t| t.models.get("kimi").cloned()),
+            name if tier.is_some_and(|t| t.models.contains_key(name)) => {
+                tier.and_then(|t| t.models.get(name).cloned())
+            }
+            name if providers.iter().any(|known| known == name) => None,
             id => Some(id.to_string()),
         };
         let Some(substitute) = substitute else {
@@ -275,6 +300,22 @@ fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<S
     steps
 }
 
+/// The global order with the request's own target moved to the front (for Claude, its
+/// first run of accounts), or added there when the order leaves it out or off.
+fn own_first<'a>(family: &'a str, global: &'a [String], accounts: usize) -> Vec<&'a str> {
+    let is_own = |target: &str| {
+        target == family || (family == "claude" && account_count(target, accounts).is_some())
+    };
+    let mut targets: Vec<&str> = global.iter().map(String::as_str).collect();
+    let own = match targets.iter().position(|target| is_own(target)) {
+        Some(index) => targets.remove(index),
+        None if family == "claude" => "accounts",
+        None => family,
+    };
+    targets.insert(0, own);
+    targets
+}
+
 /// `accounts` takes every Claude account not yet in the chain; `accounts:N` the next N in pool order,
 /// so another backend can sit between accounts while the session's own account stays first.
 fn account_count(target: &str, accounts: usize) -> Option<usize> {
@@ -286,8 +327,8 @@ fn account_count(target: &str, accounts: usize) -> Option<usize> {
 }
 
 /// Whether the chain does anything beyond serving the request as routed.
-pub fn handles(provider: &str, model: &str, policy: &Policy) -> bool {
-    chain(provider, model, 1, policy)
+pub fn handles(provider: &str, model: &str, policy: &Policy, providers: &[String]) -> bool {
+    chain(provider, model, 1, policy, providers)
         .iter()
         .any(|step| *step != Step::Original)
 }
@@ -405,7 +446,13 @@ pub async fn dispatch(
     let mut rejection: Option<Response> = None;
     let mut skipped_cooling = false;
 
-    let mut steps = chain(provider.name(), &requested, pool.len(), &policy);
+    let mut steps = chain(
+        provider.name(),
+        &requested,
+        pool.len(),
+        &policy,
+        &provider_targets(registry),
+    );
     if count_tokens {
         steps.retain(|step| matches!(step, Step::Account(_, model) if *model == requested));
         if steps.is_empty() {
@@ -542,6 +589,179 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROVIDERS: &[&str] = &[
+        "anthropic",
+        "codex",
+        "cursor",
+        "gemini",
+        "grok",
+        "kimi",
+        "local",
+    ];
+
+    fn names() -> Vec<String> {
+        PROVIDERS.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn chain(provider: &str, model: &str, accounts: usize, policy: &Policy) -> Vec<Step> {
+        super::chain(provider, model, accounts, policy, &names())
+    }
+
+    fn handles(provider: &str, model: &str, policy: &Policy) -> bool {
+        super::handles(provider, model, policy, &names())
+    }
+
+    fn opus(index: usize) -> Step {
+        Step::Account(index, "claude-opus-5-5".into())
+    }
+
+    #[test]
+    fn provider_targets_keep_builtin_tier_providers_but_not_cursor_cli() {
+        let registry = Registry::with_default_alias();
+        let mut expected = names();
+        expected.sort_unstable();
+        assert_eq!(provider_targets(&registry), expected);
+    }
+
+    #[test]
+    fn the_global_chain_is_every_familys_order_with_its_own_provider_first() {
+        let global = policy(json!({"chains": {"*": ["kimi", "accounts:1", "codex", "accounts"]}}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 2, &global),
+            [
+                opus(0),
+                sub("kimi-k3.1-pro-highspeed"),
+                sub("gpt-6.1-sol"),
+                opus(1)
+            ]
+        );
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 2, &global),
+            [
+                Step::Original,
+                sub("kimi-k3.1-pro-highspeed"),
+                opus(0),
+                opus(1)
+            ]
+        );
+        assert_eq!(
+            chain("kimi", "kimi-k3.1-pro-highspeed", 2, &global),
+            [Step::Original, opus(0), sub("gpt-6.1-sol"), opus(1)]
+        );
+    }
+
+    #[test]
+    fn reordering_the_global_chain_reorders_every_family_both_ways() {
+        let kimi_first =
+            policy(json!({"chains": {"*": ["accounts:1", "kimi", "codex", "accounts"]}}));
+        let codex_first =
+            policy(json!({"chains": {"*": ["accounts:1", "codex", "kimi", "accounts"]}}));
+        let kimi = sub("kimi-k3.1-pro-highspeed");
+        let sol = sub("gpt-6.1-sol");
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 2, &kimi_first),
+            [opus(0), kimi.clone(), sol.clone(), opus(1)]
+        );
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 2, &codex_first),
+            [opus(0), sol.clone(), kimi.clone(), opus(1)]
+        );
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 2, &kimi_first),
+            [Step::Original, opus(0), kimi.clone(), opus(1)]
+        );
+        assert_eq!(
+            chain("kimi", "kimi-k3.1-pro-highspeed", 2, &codex_first),
+            [Step::Original, opus(0), sol.clone(), opus(1)]
+        );
+        let claude_last = policy(json!({"chains": {"*": ["kimi", "codex", "accounts"]}}));
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 1, &claude_last),
+            [Step::Original, kimi.clone(), opus(0)]
+        );
+        let claude_first = policy(json!({"chains": {"*": ["accounts", "kimi", "codex"]}}));
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 1, &claude_first),
+            [Step::Original, opus(0), kimi]
+        );
+    }
+
+    #[test]
+    fn a_per_family_chain_overrides_the_global_chain() {
+        let configured = policy(json!({"chains": {
+            "*": ["accounts", "kimi", "codex"],
+            "codex": ["accounts", "codex"],
+        }}));
+        assert_eq!(
+            chain("codex", "gpt-6.1-sol", 1, &configured),
+            [opus(0), Step::Original]
+        );
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &configured),
+            [opus(0), sub("kimi-k3.1-pro-highspeed"), sub("gpt-6.1-sol")]
+        );
+    }
+
+    #[test]
+    fn the_requested_provider_runs_first_when_the_global_chain_omits_it() {
+        let configured = policy(json!({"chains": {"*": ["codex"]}}));
+        assert_eq!(
+            chain("kimi", "kimi-k3.1-pro-highspeed", 1, &configured),
+            [Step::Original, sub("gpt-6.1-sol")]
+        );
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 2, &configured),
+            [opus(0), opus(1), sub("gpt-6.1-sol")]
+        );
+        assert_eq!(chain("grok", "grok-4", 1, &configured), [Step::Original]);
+        assert!(!handles("grok", "grok-4", &configured));
+    }
+
+    #[test]
+    fn a_provider_without_a_tier_cell_is_skipped_never_a_model_id() {
+        for chains in [
+            json!({"*": ["accounts", "gemini", "grok", "local"]}),
+            json!({"claude": ["accounts", "gemini", "grok", "local"]}),
+        ] {
+            let configured = policy(json!({ "chains": chains }));
+            assert_eq!(
+                chain("anthropic", "claude-opus-5-5", 1, &configured),
+                [opus(0)]
+            );
+        }
+        let exact = policy(json!({"chains": {"*": ["accounts", "gemini-3-pro", "gpt-6-luna"]}}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &exact),
+            [opus(0), sub("gemini-3-pro"), sub("gpt-6-luna")]
+        );
+        let cursor = policy(json!({"chains": {"claude": ["accounts", "cursor"]}}));
+        assert_eq!(
+            chain("anthropic", "claude-unknown", 1, &cursor),
+            [Step::Account(0, "claude-unknown".into())]
+        );
+        let cursor_cli = policy(json!({"chains": {
+            "*": ["accounts", "cursor-cli"],
+            "gemini": ["gemini", "claude-sonnet-5", "cursor-cli"],
+        }}));
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &cursor_cli),
+            [opus(0), sub("cursor-cli")]
+        );
+        assert_eq!(
+            chain("gemini", "gemini-3-flash", 1, &cursor_cli),
+            [
+                Step::Original,
+                Step::Account(0, "claude-sonnet-5".into()),
+                sub("cursor-cli")
+            ]
+        );
+        let gemini = policy(json!({"chains": {"*": ["accounts", "gemini", "codex"]}}));
+        assert_eq!(
+            chain("gemini", "gemini-3-flash", 1, &gemini),
+            [Step::Original]
+        );
+    }
 
     fn default_chain(provider: &str, model: &str, accounts: usize) -> Vec<Step> {
         chain(provider, model, accounts, &Policy::default())
