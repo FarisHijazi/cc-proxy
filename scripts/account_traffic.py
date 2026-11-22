@@ -41,7 +41,9 @@ SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie"
 SECRET_KEYS = {
     "access_token", "refresh_token", "id_token", "oauth_token", "token",
     "api_key", "client_secret", "password", "code_verifier",
+    "syncToken", "assetToken", "cap",
 }
+WS_PROTOCOL = re.compile(r"[a-z][a-z0-9-]*\.v\d+")
 CWD = re.compile(r"(?:Primary working directory|Working directory|Current working directory):\s*([^\n<]+)")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flows (
@@ -131,10 +133,18 @@ def clean_body(raw, content_encoding=""):
     return zlib.compress(raw)
 
 
+def clean_header(name, value):
+    name = name.lower()
+    if name in SECRET_HEADERS:
+        return "[redacted]"
+    if name == "sec-websocket-protocol":
+        # Artifact watches send their token as a subprotocol after the protocol name.
+        return ",".join(p if WS_PROTOCOL.fullmatch(p.strip()) else "[redacted]" for p in value.split(","))
+    return value
+
+
 def clean_headers(headers):
-    return json.dumps(
-        [(k, "[redacted]" if k.lower() in SECRET_HEADERS else v) for k, v in headers.items(multi=True)]
-    )
+    return json.dumps([(k, clean_header(k, v)) for k, v in headers.items(multi=True)])
 
 
 PRUNE_EVERY_S = 3600

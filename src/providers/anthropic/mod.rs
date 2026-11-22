@@ -260,6 +260,9 @@ fn relay_headers(source: &HeaderMap, request: bool, websocket: bool) -> HeaderMa
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
+    /// WebSocket upgrades exist only in HTTP/1.1; an ALPN-negotiated h2 connection
+    /// would silently drop `Upgrade` and send a plain GET.
+    upgrade_client: reqwest::Client,
     base_url: String,
 }
 
@@ -279,30 +282,43 @@ impl AnthropicProvider {
     }
 
     fn build(base_url: String, direct: bool) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd();
-        if direct {
-            builder = builder
-                .no_proxy()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .read_timeout(std::time::Duration::from_secs(120));
-        } else if let Some((proxy, ca)) = crate::config::anthropic_upstream_proxy() {
-            let pem = std::fs::read(&ca).expect("failed to read CCP_ANTHROPIC_PROXY_CA");
-            builder = builder
-                .proxy(reqwest::Proxy::https(&proxy).expect("invalid CCP_ANTHROPIC_PROXY"))
-                .add_root_certificate(
-                    reqwest::Certificate::from_pem(&pem).expect("invalid CCP_ANTHROPIC_PROXY_CA"),
-                );
-        }
-        let client = builder
-            .build()
-            .expect("failed to build anthropic passthrough client");
+        let proxy = (!direct)
+            .then(crate::config::anthropic_upstream_proxy)
+            .flatten();
+        Self::from_builder(base_url, move || {
+            let mut builder = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd();
+            if direct {
+                builder = builder
+                    .no_proxy()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .read_timeout(std::time::Duration::from_secs(120));
+            } else if let Some((proxy, ca)) = &proxy {
+                let pem = std::fs::read(ca).expect("failed to read CCP_ANTHROPIC_PROXY_CA");
+                builder = builder
+                    .proxy(reqwest::Proxy::https(proxy).expect("invalid CCP_ANTHROPIC_PROXY"))
+                    .add_root_certificate(
+                        reqwest::Certificate::from_pem(&pem)
+                            .expect("invalid CCP_ANTHROPIC_PROXY_CA"),
+                    );
+            }
+            builder
+        })
+    }
+
+    fn from_builder(base_url: String, builder: impl Fn() -> reqwest::ClientBuilder) -> Self {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .build()
+                .expect("failed to build anthropic passthrough client")
+        };
         Self {
-            client,
+            client: build(builder()),
+            upgrade_client: build(builder().http1_only()),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
@@ -373,12 +389,14 @@ impl AnthropicProvider {
         let url = format!("{}{path}", self.base_url);
         let headers = relay_headers(request.headers(), true, websocket);
         let (parts, body) = request.into_parts();
-        let mut outgoing = self.client.request(parts.method, url).headers(headers);
+        let client = if websocket {
+            &self.upgrade_client
+        } else {
+            &self.client
+        };
+        let mut outgoing = client.request(parts.method, url).headers(headers);
         if let Some(length) = body.size_hint().exact() {
             outgoing = outgoing.header(http::header::CONTENT_LENGTH, length);
-        }
-        if websocket {
-            outgoing = outgoing.version(http::Version::HTTP_11);
         }
         let upstream = match outgoing
             .body(reqwest::Body::wrap(http_body_util::StreamBody::new(
@@ -682,5 +700,54 @@ mod tests {
     #[test]
     fn non_json_body_is_forwarded_verbatim() {
         assert!(sanitize_anthropic_request(b"not json", "req5").is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_stays_http1_when_the_origin_offers_h2() {
+        use std::sync::Arc;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let root = reqwest::Certificate::from_pem(cert.cert.pem().as_bytes()).unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+        )
+        .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            if stream.get_ref().1.alpn_protocol() == Some(b"http/1.1") {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+        let provider = AnthropicProvider::from_builder(format!("https://localhost:{port}"), || {
+            reqwest::Client::builder().add_root_certificate(root.clone())
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/frame/sync?slug=toy")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.handle_account_request(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        origin.abort();
     }
 }
