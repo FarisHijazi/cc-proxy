@@ -56,6 +56,7 @@ def test_inference_is_recorded_with_its_sender_and_no_credential(tmp_path):
     flow.metadata["api_key"] = "laptop"
     flow.response = http.Response.make(200, b'{"ok": true}', {"x-claude-codex-served-by": "user@example.com/claude-opus-5-5"})
     traffic.response(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert row["account"] == "proxy-account-user@example.com+rc=other"
     assert (row["client_host"], row["client_user"]) == ("laptop", "dev")
@@ -81,6 +82,7 @@ def test_api_key_name_survives_an_upstream_connection_error(tmp_path):
     flow.response = None
     flow.error = Error("upstream disconnected")
     traffic.error(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert row["api_key"] == "laptop"
     assert row["error"] == "upstream disconnected"
@@ -105,6 +107,7 @@ def test_streamed_replies_are_captured_whole(tmp_path):
     assert flow.response.stream(b"event: a\n") == b"event: a\n"
     flow.response.stream(b"event: b\n")
     traffic.response(flow)
+    traffic.flush()
     assert zlib.decompress(rows(tmp_path)[0]["response_body"]) == b"event: a\nevent: b\n"
 
 
@@ -117,6 +120,7 @@ def test_credential_fields_are_redacted_but_token_counts_are_kept(tmp_path):
         200, json.dumps({"access_token": "a-secret", "refresh_token": "r-secret", "usage": {"output_tokens": 5}})
     )
     traffic.response(flow)
+    traffic.flush()
     body = json.loads(zlib.decompress(rows(tmp_path)[0]["response_body"]))
     assert body == {"access_token": "[redacted]", "refresh_token": "[redacted]", "usage": {"output_tokens": 5}}
 
@@ -133,6 +137,7 @@ def test_websocket_subprotocol_tokens_are_redacted_but_the_protocol_name_is_kept
     traffic.requestheaders(flow)
     flow.response = http.Response.make(101, b"", {"sec-websocket-protocol": "frame-sync.v1"})
     traffic.response(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert "toy-watch-secret" not in row["request_headers"]
     assert ["sec-websocket-protocol", "frame-sync.v1,[redacted]"] in json.loads(row["request_headers"])
@@ -147,6 +152,7 @@ def test_a_lone_watch_token_subprotocol_is_redacted(tmp_path):
     )
     traffic.requestheaders(flow)
     traffic.response(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert "toy-watch-secret" not in row["request_headers"]
 
@@ -158,6 +164,7 @@ def test_artifact_watch_tokens_in_boot_replies_and_refresh_frames_are_redacted(t
     frame = {"type": "ctrl:token_refresh", "cap": "toy-cap-secret", "exp": 1}
     flow.websocket.messages.append(websocket.WebSocketMessage(1, False, json.dumps(frame).encode()))
     traffic.websocket_message(flow)
+    traffic.flush()
     [row] = rows(tmp_path, "websocket_messages")
     assert json.loads(zlib.decompress(row["body"])) == {"type": "ctrl:token_refresh", "cap": "[redacted]", "exp": 1}
     boot = {"syncToken": "toy-sync-secret", "assetToken": "toy-asset-secret", "slug": "toy"}
@@ -171,6 +178,7 @@ def test_websocket_frames_are_recorded_without_tokens(tmp_path):
     frame = {"type": "connect", "oauth_token": "proxy-account-user@example.com"}
     flow.websocket.messages.append(websocket.WebSocketMessage(1, True, json.dumps(frame).encode()))
     traffic.websocket_message(flow)
+    traffic.flush()
     [row] = rows(tmp_path, "websocket_messages")
     assert json.loads(zlib.decompress(row["body"])) == {"type": "connect", "oauth_token": "[redacted]"}
 
@@ -180,6 +188,7 @@ def test_nothing_is_recorded_without_a_database(tmp_path):
     flow = inference_flow()
     traffic.requestheaders(flow)
     traffic.response(flow)
+    traffic.flush()
     assert "x-claude-client-host" in flow.request.headers
     assert not (tmp_path / "traffic.sqlite3").exists()
 
@@ -193,6 +202,7 @@ def test_repeated_conversation_parts_are_stored_once_and_restored(tmp_path):
         traffic.requestheaders(flow)
         flow.response = http.Response.make(200, b"{}")
         traffic.response(flow)
+        traffic.flush()
     db = sqlite3.connect(tmp_path / "traffic.sqlite3")
     assert db.execute("SELECT count(*) FROM blobs").fetchone()[0] == 2  # system + one message
     reader = runpy.run_path(str(Path(__file__).parents[1] / "scripts/claude-traffic"))
@@ -208,12 +218,14 @@ def test_rows_and_unused_blobs_older_than_traffic_days_are_dropped(tmp_path, mon
     traffic.requestheaders(flow)
     flow.response = http.Response.make(200, b"{}")
     traffic.response(flow)
+    traffic.flush()
     now[0] += 31 * 86400
     flow = inference_flow()
     flow.request.content = json.dumps({"model": "m", "messages": [{"role": "user", "content": "new"}]}).encode()
     traffic.requestheaders(flow)
     flow.response = http.Response.make(200, b"{}")
     traffic.response(flow)
+    traffic.flush()
     db = sqlite3.connect(tmp_path / "traffic.sqlite3")
     assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 1
     assert db.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1  # only the new message
@@ -230,6 +242,7 @@ def test_reply_token_counts_are_stored_on_the_row(tmp_path):
     )
     flow.response = http.Response.make(200, stream, {"content-type": "text/event-stream"})
     traffic.response(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert (row["input_tokens"], row["cache_read_tokens"], row["output_tokens"]) == (8, 40, 9)
 
@@ -240,6 +253,7 @@ def test_a_reply_without_usage_has_unknown_not_zero_tokens(tmp_path):
     traffic.requestheaders(flow)
     flow.response = http.Response.make(529, b'{"error": "overloaded"}')
     traffic.response(flow)
+    traffic.flush()
     [row] = rows(tmp_path)
     assert (row["input_tokens"], row["cache_read_tokens"], row["output_tokens"]) == (None, None, None)
 
@@ -269,3 +283,39 @@ def test_backfill_fills_old_rows_and_leaves_unreported_ones_unknown(tmp_path):
     got = dict(db.execute("SELECT id, input_tokens FROM flows").fetchall())
     assert got == {"a": 2, "b": None, "c": None}
     assert db.execute("SELECT cache_read_tokens, output_tokens FROM flows WHERE id = 'a'").fetchone() == (7, 4)
+
+
+def test_a_slow_database_never_blocks_the_event_loop(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    traffic = recorder(tmp_path)
+    release = threading.Event()
+    slow = traffic.write_flow
+    monkeypatch.setattr(traffic, "write_flow", lambda meta: (release.wait(5), slow(meta)))
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"{}")
+    started = time.monotonic()
+    traffic.response(flow)
+    assert time.monotonic() - started < 0.1
+    release.set()
+    traffic.flush()
+    assert len(rows(tmp_path)) == 1
+
+
+def test_a_full_queue_drops_rows_instead_of_waiting(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "QUEUE_MAX", 1)
+    traffic = recorder(tmp_path)
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(traffic, "write_flow", lambda meta: release.wait(5))
+    for _ in range(3):
+        flow = inference_flow()
+        traffic.requestheaders(flow)
+        flow.response = http.Response.make(200, b"{}")
+        traffic.response(flow)
+    assert traffic.dropped >= 1
+    release.set()
+    traffic.flush()
