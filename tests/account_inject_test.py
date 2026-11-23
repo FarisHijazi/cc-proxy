@@ -871,3 +871,16 @@ def test_shared_login_mode_reloads_the_accounts_file_off_the_event_loop(monkeypa
     inject.reload_accounts()
     inject.reload_accounts()
     assert submitted == [(inject.reload_in_background, (path,))], "one background reload per change"
+
+
+def test_a_failed_background_reload_is_retried_on_the_next_request(monkeypatch, tmp_path):
+    submitted = []
+    inject = addon(monkeypatch, [])
+    inject.grants = object()
+    path = tmp_path / "accounts.json"
+    path.write_text("not json")
+    inject.accounts_file, inject.accounts_mtime = path, 0
+    monkeypatch.setattr(module.RELOADER, "submit", lambda fn, *args: submitted.append(args) or fn(*args))
+    inject.reload_accounts()
+    inject.reload_accounts()
+    assert submitted == [(path,), (path,)], "a torn read does not wait for the next edit"

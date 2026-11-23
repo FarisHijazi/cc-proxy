@@ -432,6 +432,7 @@ class AccountInject:
         try:
             self.read_accounts(path)
         except (OSError, ValueError, KeyError, AttributeError) as error:
+            self.accounts_mtime = None  # retried on the next request, as an inline reload was
             logging.warning(f"reloading the accounts file failed: {type(error).__name__}")
 
     def token(self, alias):
@@ -444,15 +445,17 @@ class AccountInject:
                 self.fetch(alias, wait=False)
             except ValueError:
                 pass  # the cached token is still valid; the background fetch replaces it
-            if self.cache[alias][1] - MARGIN_MS <= now:
-                self.renew(alias, None)
-            return self.cache[alias][0]
+            self.renew(alias, None)
+            return cached[0]
+        epoch, fetched = self.epoch.get(alias, 0), None
         try:
-            self.cache[alias] = self.fetch(alias)
+            fetched = self.fetch(alias)
+            if self.epoch.get(alias, 0) == epoch:
+                self.cache[alias] = fetched  # never a token rejected while this request waited
         finally:
-            if self.cache.get(alias, (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
+            if (fetched or (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
                 self.renew(alias, None)  # nothing on this host renews the live login before it dies
-        return self.cache[alias][0]
+        return fetched[0]
 
     def fetch(self, alias, wait=True):
         future = self.fetching.get(alias)

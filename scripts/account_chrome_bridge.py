@@ -111,7 +111,7 @@ class BridgeSession:
         return channel
 
     async def serve_channel(self, channel):
-        heartbeat = None
+        heartbeat, paired = None, False
         try:
             account_id = self.identity(channel.alias)
             access = self.token(channel.alias)
@@ -144,7 +144,7 @@ class BridgeSession:
                 "waiting",
             }:
                 raise ValueError("Chrome account authentication failed")
-            channel.available = True
+            channel.available = paired = True
             channel.ready.set()
             self.status()
             heartbeat = self.spawn(self.keepalive(channel))
@@ -162,7 +162,7 @@ class BridgeSession:
             raise
         except Exception:  # noqa: BLE001 - native payloads and credentials must not reach logs
             channel.error = True
-            if not channel.available:
+            if not paired:  # refused, not a paired channel closed after a discovery timeout
                 channel.refused_at = time.monotonic()
         finally:
             if heartbeat is not None:
