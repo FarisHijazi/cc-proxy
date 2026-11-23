@@ -705,3 +705,34 @@ def test_codex_export_writes_the_full_login_privately_and_never_overwrites(codex
     run_script("account_grants_export.py", monkeypatch, "--codex", "work", str(target), "--force")
     assert json.loads(target.read_text())["tokens"]["refresh_token"] == "codex-refresh-1"
     assert endpoint.posts == []
+
+
+def test_seed_never_overwrites_a_login_mid_refresh(db):
+    host, _, namespace, _ = db
+    a = host("a")
+    now = time.time() * 1000
+    a.seed("a", login("access-1", "refresh-1", now + HOUR_MS))
+    with connection() as conn:
+        conn.execute(
+            "UPDATE ccp_grants SET lease_holder = 'elsewhere', lease_until = now() + interval '60 seconds'"
+            " WHERE namespace = %s",
+            (namespace,),
+        )
+    for newer_only in (False, True):
+        with pytest.raises(module.GrantsUnavailable, match="being renewed"):
+            a.seed("a", login("access-2", "refresh-2", now + 3 * HOUR_MS), replace=True, newer_only=newer_only)
+    assert row(namespace)[1] == 1 and row(namespace)[3] == "elsewhere", "the lease holder's commit still lands"
+
+
+def test_a_refresh_that_raises_releases_the_lease(db):
+    host, provider, namespace, _ = db
+
+    def lost_response(credentials):
+        provider.posts.append("lost")
+        raise ConnectionResetError("response lost")
+
+    a = host("a", refresh=lost_response)
+    a.seed("a", provider.issue(1))
+    with pytest.raises(module.GrantsUnavailable, match="could not be renewed"):
+        a.token("a")
+    assert row(namespace)[1:] == (1, "ok", None), "transient: lease released, still in service"

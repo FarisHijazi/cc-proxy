@@ -42,11 +42,14 @@ SETUP_TOKEN_REREAD_MS = 60 * 1000
 # A rejected login is renewed at most this often, however many requests it fails.
 RENEW_EVERY_S = 60
 # mitmproxy serves every connection from one event loop, and reading an expired slot runs a
-# network refresh. Only the request that starts a fetch waits, this long; the fetch finishes in
-# the background, and a failed one is not retried for FETCH_RETRY_S.
+# network refresh. A token that is still valid keeps serving while its refresh runs in the
+# background; only a request with no valid token waits, this long, and a failed fetch is not
+# retried for FETCH_RETRY_S.
 FETCH_WAIT_S = 0.25
 FETCH_RETRY_S = 60
 FETCHER = ThreadPoolExecutor(max_workers=4, thread_name_prefix="slot-token")
+# Accounts file reloads in shared-login mode adopt the live login (database writes, fsyncs).
+RELOADER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="accounts-reload")
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
@@ -75,6 +78,10 @@ GrantsUnavailable, PostgresGrants, read_key, write_private_json = (
     _grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key", "write_private_json")
 )
 CodexKeeper, CODEX_NAME = _grants["CodexKeeper"], _grants["CODEX_NAME"]
+
+
+class StillFetching(GrantsUnavailable):
+    """The login is being fetched in the background: retry soon, the account is not broken."""
 
 
 def slot_token(slot):
@@ -291,6 +298,7 @@ class AccountInject:
         self.renewed = {}
         self.unusable = {}
         self.fetching = {}
+        self.epoch = {}
         self.strategy, self.prefer = "session", None
         self.sticky, self.turn = {}, -1
         self.chrome = None
@@ -409,15 +417,36 @@ class AccountInject:
         # Added accounts join the fallback pool without restarting the proxy.
         path = getattr(self, "accounts_file", None)
         try:
-            if path is not None and path.stat().st_mtime != self.accounts_mtime:
+            mtime = path is not None and path.stat().st_mtime
+            if path is None or mtime == self.accounts_mtime:
+                return
+            if self.grants is None:
                 self.read_accounts(path)
+            else:
+                self.accounts_mtime = mtime
+                RELOADER.submit(self.reload_in_background, path)
         except (OSError, ValueError, KeyError, AttributeError):
             pass
 
+    def reload_in_background(self, path):
+        try:
+            self.read_accounts(path)
+        except (OSError, ValueError, KeyError, AttributeError) as error:
+            logging.warning(f"reloading the accounts file failed: {type(error).__name__}")
+
     def token(self, alias):
         cached = self.cache.get(alias)
-        if cached and cached[1] - MARGIN_MS > time.time() * 1000:
+        now = time.time() * 1000
+        if cached and cached[1] - MARGIN_MS > now:
             return cached[0]
+        if cached and cached[1] > now:
+            try:
+                self.fetch(alias, wait=False)
+            except ValueError:
+                pass  # the cached token is still valid; the background fetch replaces it
+            if self.cache[alias][1] - MARGIN_MS <= now:
+                self.renew(alias, None)
+            return self.cache[alias][0]
         try:
             self.cache[alias] = self.fetch(alias)
         finally:
@@ -425,11 +454,11 @@ class AccountInject:
                 self.renew(alias, None)  # nothing on this host renews the live login before it dies
         return self.cache[alias][0]
 
-    def fetch(self, alias):
+    def fetch(self, alias, wait=True):
         future = self.fetching.get(alias)
         error = ValueError if self.grants is None else GrantsUnavailable
         if future is not None and not future.done():
-            raise error(f"login for {alias} is still being fetched")
+            raise StillFetching(f"login for {alias} is still being fetched")
         if future is not None and future.exception() is not None and time.time() < future.failed_at + FETCH_RETRY_S:
             raise error(f"login for {alias} is unavailable")
         if self.grants is None or alias in self.copyable:
@@ -437,18 +466,21 @@ class AccountInject:
         else:
             future = self.fetching[alias] = FETCHER.submit(self.grants.token, alias, self.stale.pop(alias, None))
         future.failed_at = float("inf")
+        epoch = self.epoch.get(alias, 0)
 
         def settle(done):
-            if done.exception() is None:
-                self.cache[alias] = done.result()
-            else:
+            if done.exception() is not None:
                 done.failed_at = time.time()
+            elif self.epoch.get(alias, 0) == epoch:
+                self.cache[alias] = done.result()  # never a token rejected after this fetch started
 
         future.add_done_callback(settle)
+        if not wait:
+            raise StillFetching(f"login for {alias} is still being fetched")
         try:
             return future.result(timeout=FETCH_WAIT_S)
         except FetchTimeout:
-            raise error(f"login for {alias} is still being fetched") from None
+            raise StillFetching(f"login for {alias} is still being fetched") from None
 
     def name(self, alias):
         return self.renamed.get(alias, alias)
@@ -492,14 +524,18 @@ class AccountInject:
         # Accounts at the usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
         names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
-        pool = []
+        pool, fetching = [], None
         for name in names:
             if self.unusable.get(name, 0) > time.time():
                 continue
             try:
                 pool.append({"alias": name, "authorization": "Bearer " + self.token(name), "primary": name == alias})
+            except StillFetching as error:
+                fetching = error  # not broken: it joins the pool once its fetch lands
             except Exception:  # noqa: BLE001 - one broken slot must not block the rest
                 self.unusable[name] = time.time() + UNUSABLE_RETRY_S
+        if not pool and fetching is not None:
+            raise fetching
         return pool
 
     def hot(self, alias):
@@ -561,6 +597,7 @@ class AccountInject:
         if not cached or cached[0] != sent:
             return  # already replaced since this request went out
         del self.cache[alias]
+        self.epoch[alias] = self.epoch.get(alias, 0) + 1
         self.renew(alias, sent)
 
     def renew(self, alias, stale):

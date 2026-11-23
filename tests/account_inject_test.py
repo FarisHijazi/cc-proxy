@@ -34,6 +34,20 @@ def addon(monkeypatch, calls):
     return inject
 
 
+def record_renewals(monkeypatch, renewals):
+    """Record renewal threads inline; every other thread (the fetch pool's) still starts for real."""
+    import types
+
+    real = module.threading.Thread
+
+    def thread(*args, target=None, **kw):
+        if target is module.renew_in_background:
+            return types.SimpleNamespace(start=lambda: renewals.append(kw["args"]))
+        return real(*args, target=target, **kw)
+
+    monkeypatch.setattr(module.threading, "Thread", thread)
+
+
 def request(authorization):
     flow = tflow.tflow()
     flow.request = http.Request.make(
@@ -666,15 +680,7 @@ def test_real_anthropic_api_keys_pass_through(monkeypatch, tmp_path):
 def test_a_rejected_injected_token_is_dropped_and_renewed_once_a_minute(monkeypatch):
     calls, renewals = [], []
     inject = addon(monkeypatch, calls)
-
-    class Thread:
-        def __init__(self, target, args, daemon):
-            self.run = lambda: renewals.append(args)
-
-        def start(self):
-            self.run()
-
-    monkeypatch.setattr(module.threading, "Thread", Thread)
+    record_renewals(monkeypatch, renewals)
     for _ in range(2):
         flow = request("Bearer proxy-account-personal")
         inject.requestheaders(flow)
@@ -749,21 +755,15 @@ def test_renew_acts_only_on_the_rejected_or_expiring_credential(monkeypatch):
 
 def test_an_expiring_or_expired_login_is_renewed_once_a_minute(monkeypatch):
     renewals = []
-
-    class Thread:
-        def __init__(self, target, args, daemon):
-            self.run = lambda: renewals.append(args)
-
-        def start(self):
-            self.run()
-
-    monkeypatch.setattr(module.threading, "Thread", Thread)
+    record_renewals(monkeypatch, renewals)
     inject = addon(monkeypatch, [])
     monkeypatch.setattr(module, "slot_token", lambda slot: ("soon", time.time() * 1000 + 60_000))
     for _ in range(3):
         assert inject.token("personal") == "soon", "the token is still served until it expires"
     assert renewals == [("1", None)]
     inject.renewed.clear()
+    inject.fetching.clear()
+    inject.cache["personal"] = ("gone", time.time() * 1000 - 1)
     monkeypatch.setattr(module, "slot_token", lambda slot: (_ for _ in ()).throw(ValueError("expired")))
     with pytest.raises(ValueError):
         inject.token("personal")
@@ -780,3 +780,94 @@ def test_claude_code_renews_the_live_login_without_the_proxy_env(monkeypatch):
     assert argv[:2] == ["claude", "-p"]
     assert not module.PROXY_ENV & set(kw["env"]), "Claude Code must reach Anthropic directly"
     assert kw["check"] and kw["timeout"]
+
+
+def test_an_expiring_token_keeps_serving_while_it_refreshes_in_the_background(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slow(slot):
+        release.wait(10)
+        return "fresh", time.time() * 1000 + 3_600_000
+
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "renew", lambda alias, stale: None)
+    inject.cache["personal"] = ("expiring", time.time() * 1000 + 60_000)
+    monkeypatch.setattr(module, "slot_token", slow)
+    started = time.monotonic()
+    assert inject.token("personal") == "expiring", "a still-valid token is served, never waited on"
+    assert inject.token("personal") == "expiring"
+    assert time.monotonic() - started < 0.1
+    release.set()
+    inject.fetching["personal"].result(timeout=5)
+    assert inject.token("personal") == "fresh"
+
+
+def test_a_slow_fetch_leaves_an_account_out_of_one_pool_without_marking_it_unusable(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slot_token(slot):
+        if slot == "2":
+            release.wait(10)
+        return f"real-{slot}", time.time() * 1000 + 3_600_000
+
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"personal": "1", "work": "2"}
+    monkeypatch.setattr(module, "slot_token", slot_token)
+    monkeypatch.setattr(module, "FETCH_WAIT_S", 0.05)
+    assert [entry["alias"] for entry in inject.pool("personal")] == ["personal"]
+    assert "work" not in inject.unusable, "still fetching is not broken"
+    release.set()
+    inject.fetching["work"].result(timeout=5)
+    assert [entry["alias"] for entry in inject.pool("personal")] == ["personal", "work"]
+
+
+def test_a_pool_with_every_login_still_fetching_asks_the_client_to_retry(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(module, "slot_token", lambda slot: release.wait(10) and ("late", 0))
+    monkeypatch.setattr(module, "FETCH_WAIT_S", 0.05)
+    with pytest.raises(module.StillFetching):
+        inject.pool("personal")
+    release.set()
+    assert not inject.unusable
+
+
+def test_a_fetch_started_before_a_rejection_never_restores_the_rejected_token(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slow(slot):
+        release.wait(10)
+        return "rejected", time.time() * 1000 + 3_600_000
+
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "renew", lambda alias, stale: None)
+    inject.cache["personal"] = ("rejected", time.time() * 1000 + 60_000)
+    monkeypatch.setattr(module, "slot_token", slow)
+    assert inject.token("personal") == "rejected"
+    inject.rejected("personal", "rejected")
+    release.set()
+    inject.fetching["personal"].result(timeout=5)
+    time.sleep(0.05)
+    assert "personal" not in inject.cache, "the late fetch must not cache a token Anthropic refused"
+
+
+def test_shared_login_mode_reloads_the_accounts_file_off_the_event_loop(monkeypatch, tmp_path):
+    submitted = []
+    inject = addon(monkeypatch, [])
+    inject.grants = object()
+    path = tmp_path / "accounts.json"
+    path.write_text("{}")
+    inject.accounts_file, inject.accounts_mtime = path, 0
+    monkeypatch.setattr(inject, "read_accounts", lambda p: pytest.fail("read inline on the event loop"))
+    monkeypatch.setattr(module.RELOADER, "submit", lambda fn, *args: submitted.append((fn, args)))
+    inject.reload_accounts()
+    inject.reload_accounts()
+    assert submitted == [(inject.reload_in_background, (path,))], "one background reload per change"

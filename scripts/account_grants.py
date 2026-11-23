@@ -287,9 +287,13 @@ class PostgresGrants:
         if not rows:
             return None  # another host holds G; wait for its commit instead of POSTing
         credentials = unseal(self.key, self.namespace, account, generation, rows[0][0])
-        outcome = self.refresh(credentials)
-        if outcome.error is not None or outcome.credentials is None:
-            dead = outcome.error in DEAD
+        try:
+            outcome = self.refresh(credentials)
+        except Exception as error:  # noqa: BLE001 - a lost response is transient; release the lease
+            logging.warning(f"renewing shared login for {account} failed: {type(error).__name__}")
+            outcome = None
+        if outcome is None or outcome.error is not None or outcome.credentials is None:
+            dead = outcome is not None and outcome.error in DEAD
             self.transaction([(
                 "UPDATE ccp_grants SET lease_holder = NULL, lease_until = NULL,"
                 " state = CASE WHEN %s THEN 'needs-reconcile' ELSE state END"
@@ -303,8 +307,8 @@ class PostgresGrants:
         sealed = seal(self.key, self.namespace, account, generation + 1, outcome.credentials)
         try:
             self.write_journal(account, generation + 1, expires, sealed)
-        except OSError:
-            pass  # G is already spent: committing G+1 matters more than the local copy
+        except OSError as error:  # G is already spent: committing G+1 matters more than the local copy
+            logging.warning(f"journal for {account} not written: {type(error).__name__}")
         try:
             self.commit(account, generation, sealed, expires)
         except GrantsUnavailable:
@@ -406,11 +410,14 @@ class PostgresGrants:
         if not login.refresh:
             raise GrantsUnavailable("a shared login needs a refresh token")
         (rows, _), = self.transaction([(
-            "SELECT generation FROM ccp_grants WHERE namespace = %s AND account = %s",
+            "SELECT generation, lease_until > now() FROM ccp_grants WHERE namespace = %s AND account = %s",
             (self.namespace, account),
         )])
         if rows and not replace:
             raise GrantsUnavailable(f"{account} already has a shared login; pass --replace")
+        if rows and rows[0][1]:
+            # Overwriting G mid-refresh would make the lease holder's G+1 fail its commit and be lost.
+            raise GrantsUnavailable(f"{account} is being renewed; run it again")
         generation = rows[0][0] + 1 if rows else 1
         sealed = seal(self.key, self.namespace, account, generation, credentials)
         (_, written), = self.transaction([(
@@ -419,12 +426,14 @@ class PostgresGrants:
             " ON CONFLICT (namespace, account) DO UPDATE SET ciphertext = excluded.ciphertext,"
             " generation = excluded.generation, expires_at = excluded.expires_at,"
             " lease_holder = NULL, lease_until = NULL, state = 'ok'"
-            " WHERE ccp_grants.generation = %s AND (NOT %s OR ccp_grants.expires_at < excluded.expires_at)",
+            " WHERE ccp_grants.generation = %s AND (NOT %s OR ccp_grants.expires_at < excluded.expires_at)"
+            " AND (ccp_grants.lease_until IS NULL OR ccp_grants.lease_until < now())",
             (self.namespace, account, sealed, generation, login.expires / 1000, generation - 1, newer_only),
         )])
         if not written:
-            if newer_only:
-                return None
+            _, stored, _, leased = self.row(account)
+            if newer_only and stored == generation - 1 and not leased:
+                return None  # the stored login is the newer one
             raise GrantsUnavailable(f"{account} changed while seeding; run it again")
         return generation
 

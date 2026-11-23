@@ -153,6 +153,8 @@ scripts/account_grants_export.py --codex work ~/.codex/auth.json   # full file, 
   stop the cswap usage collector and auto-switcher for that account, and log out any CLI copy at
   cutover. Removing the slot also drops the sequence entry the Chrome bridge reads for the
   account's UUID.
+- Seeding (and so adoption) refuses while another host holds a live lease on the row, so a refresh in
+  flight always commits its G+1; the next reload adopts again.
 - Adoption runs on start and on accounts file reload, not when someone runs `/login` on the host
   later. A process that keeps refreshing the live login forks the refresh token each time, so find
   and stop it. ftower logs every writer of the file through `ccp-cred-watch.service` (bpftrace).
