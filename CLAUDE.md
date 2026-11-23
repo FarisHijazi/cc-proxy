@@ -56,8 +56,9 @@ Local Rust proxy that speaks the Anthropic Messages API and routes each request
 to a backend based on the model name. Repo: `FarisHijazi/cc-proxy`. It started as a
 GitHub fork of [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex)
 and was republished on 2026-10-27 as a standalone repo.
-Local checkouts and deployed copies keep the directory name `claude-code-with-codex`, because
-launchers and the ftower unit reference that path. Upstream conventions live in
+Local checkouts keep the directory name `claude-code-with-codex`, because launchers reference
+that path. The ftower deployment runs from a git checkout at `~/src/cc-proxy`, detached at the
+deployed `main` commit, which the `claude-account-proxy` unit's ExecStart points at. Upstream conventions live in
 [AGENTS.md](AGENTS.md) and still apply.
 
 Interactive session programmability reuses HQ's existing native command owner.
