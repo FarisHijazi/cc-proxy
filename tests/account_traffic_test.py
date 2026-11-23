@@ -319,3 +319,10 @@ def test_a_full_queue_drops_rows_instead_of_waiting(tmp_path, monkeypatch):
     assert traffic.dropped >= 1
     release.set()
     traffic.flush()
+
+
+def test_a_console_api_key_header_or_the_pool_carrying_it_is_never_stored():
+    pool = '[{"alias":"console","kind":"api_key","api_key":"sk-ant-api03-fake-test-key"}]'
+    assert module.clean_header("X-Api-Key", "sk-ant-api03-fake-test-key") == "[redacted]"
+    stored = module.clean_headers([("x-api-key", "sk-ant-api03-fake-test-key"), ("x-claude-codex-account-pool", pool)])
+    assert "sk-ant-api03-fake" not in stored

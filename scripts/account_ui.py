@@ -10,6 +10,7 @@ bind it to the same private address as the proxy.
 import argparse
 import hashlib
 import json
+import os
 import re
 import runpy
 import secrets
@@ -188,6 +189,15 @@ def usage_size(entry):
     return sum(entry["tokens"].values()), entry["requests"]
 
 
+def private_write(path, data):
+    """Replace `path` with a file that is private from its first byte: it may hold a Console API key."""
+    tmp = path.with_name(path.name + ".ui-tmp")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(data)
+    tmp.replace(path)
+
+
 class Dashboard:
     def __init__(self, accounts_file, proxy, ca, hq=None, hq_public=None, api_base=None):
         self.accounts_file = accounts_file
@@ -276,6 +286,16 @@ class Dashboard:
             "disabled": alias in cfg.get("disabled", []),
         }
 
+    @staticmethod
+    def key_account(alias, cfg):
+        """A Console API key in the pool: shown and switchable like an account, its key never leaves the file."""
+        return {
+            "alias": alias, "kind": "api_key", "slot": None, "email": None, "plan": "api key",
+            "preferred": cfg["api_key_accounts"][alias].get("preferred") is True,
+            "usage": {}, "usage_at": None, "token_only": False, "error": None,
+            "disabled": alias in cfg.get("disabled", []),
+        }
+
     def recorded_provider_usage(self, cfg):
         """Each non-Claude backend's last 24 h from the traffic database; None (unknown) without one."""
         hit = self.cache.get("provider_usage")
@@ -315,6 +335,7 @@ class Dashboard:
         with ThreadPoolExecutor(8) as pool:
             quota = pool.submit(self.provider_quota)
             accounts = list(pool.map(lambda item: self.account(*item, cfg), cfg["accounts"].items()))
+            accounts += [self.key_account(alias, cfg) for alias in cfg.get("api_key_accounts", {})]
             quota = quota.result()
         db_path = Path(cfg["traffic_db"]).expanduser() if cfg.get("traffic_db") else None
         try:
@@ -510,7 +531,7 @@ class Dashboard:
                 raise ValueError("prefer must name an account")
             cfg["balance"] = {k: v for k, v in balance.items() if k in ("strategy", "prefer")}
         if "disabled" in change:
-            if not set(change["disabled"]) <= set(aliases):
+            if not set(change["disabled"]) <= {*aliases, *cfg.get("api_key_accounts", {})}:
                 raise ValueError("disabled must name accounts")
             cfg["disabled"] = sorted(change["disabled"])
         if "traffic_days" in change:
@@ -537,11 +558,9 @@ class Dashboard:
                 cfg.pop("fallback", None)
             else:
                 cfg["fallback"] = fallback
-        shutil.copy2(self.accounts_file, self.accounts_file.with_name(self.accounts_file.name + ".before-ui"))
-        tmp = self.accounts_file.with_suffix(".ui-tmp")
-        tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-        tmp.chmod(0o600)
-        tmp.replace(self.accounts_file)
+        private_write(self.accounts_file.with_name(self.accounts_file.name + ".before-ui"),
+                      self.accounts_file.read_bytes())
+        private_write(self.accounts_file, (json.dumps(cfg, indent=2) + "\n").encode())
         state = self.state()
         return {**state, "created_key": created} if created else state
 

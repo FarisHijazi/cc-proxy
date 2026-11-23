@@ -78,6 +78,8 @@ Claude Code subscription, the Codex CLI login, `cursor-agent login`, a
 signed-in Google account. Before adding a backend, check it can work without a
 per-token-billed key — if it cannot, it does not belong here. The owner explicitly authorized
 Moonshot Open Platform API-key use for Kimi on 2026-11-19; this is a Kimi-only exception.
+On 2026-11-23 the owner also authorized one Anthropic Console API key as a pool member tried before
+the subscriptions; its workspace spend limit is the hard stop (see the quota fallback paragraph).
 
 ## Architecture
 
@@ -273,6 +275,15 @@ emails (pattern shared by the three launcher scripts); the proxy file's `renamed
 that running sessions still send. A client's `main` sets the login claude.ai sees (artifacts,
 Remote Control, `/usage`); `balance.prefer` only picks inference. Read
 `docs/devlog/claude_20261024-quota-fallback.md` on demand (plain path).
+Console API keys: the `--serve` accounts file's `api_key_accounts` (`{alias: {"key", "preferred"}}`, never in the
+repo or a client) adds pool members of kind `api_key`. A `preferred` key leads every unpinned pool and owns the
+thread (`primary`); `balance` still orders the subscriptions after it; other keys go after them. `account_inject`
+never puts a key on the request itself, only in the pool; `PoolAccount::sign` sends it as `x-api-key` without
+`Authorization` (Claude Code's OAuth betas and body fields were measured to work with a key). A key's 402
+`billing_error`, or a 400 saying its credit is too low or its (workspace) API usage limit is reached, falls back
+under `on.rate_limit` and cools that key for every model until the 1st of next month, 00:00 UTC. Cooldowns are
+in memory, so after a restart an exhausted key is tried once more. See
+`docs/devlog/claude_20261123-console-api-key-pool.md` (plain path).
 
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
 spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
@@ -345,7 +356,7 @@ The Nix-pinned compiler still needs atomic `fetch_update`; keep its deprecation 
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys` in the accounts file; usage comes through the proxy with placeholders. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys` in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 The dashboard has hash-routed sidebar views and locally vendored Pico conditional CSS (no build step).
 `src/fallback.rs::defaults()` owns the only default chains and equivalence groups, exposed through
