@@ -121,6 +121,49 @@ def test_credential_fields_are_redacted_but_token_counts_are_kept(tmp_path):
     assert body == {"access_token": "[redacted]", "refresh_token": "[redacted]", "usage": {"output_tokens": 5}}
 
 
+def test_websocket_subprotocol_tokens_are_redacted_but_the_protocol_name_is_kept(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = tflow.tflow(resp=True)
+    flow.request = http.Request.make(
+        "GET",
+        "https://api.anthropic.com/api/frame/sync?slug=toy",
+        b"",
+        {"upgrade": "websocket", "sec-websocket-protocol": "frame-sync.v1,toy-watch-secret"},
+    )
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(101, b"", {"sec-websocket-protocol": "frame-sync.v1"})
+    traffic.response(flow)
+    [row] = rows(tmp_path)
+    assert "toy-watch-secret" not in row["request_headers"]
+    assert ["sec-websocket-protocol", "frame-sync.v1,[redacted]"] in json.loads(row["request_headers"])
+    assert ["sec-websocket-protocol", "frame-sync.v1"] in json.loads(row["response_headers"])
+
+
+def test_a_lone_watch_token_subprotocol_is_redacted(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = tflow.tflow(resp=True)
+    flow.request = http.Request.make(
+        "GET", "https://api.anthropic.com/api/frame/sync?slug=toy", b"", {"sec-websocket-protocol": "toy-watch-secret"}
+    )
+    traffic.requestheaders(flow)
+    traffic.response(flow)
+    [row] = rows(tmp_path)
+    assert "toy-watch-secret" not in row["request_headers"]
+
+
+def test_artifact_watch_tokens_in_boot_replies_and_refresh_frames_are_redacted(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = tflow.tflow()
+    flow.websocket = websocket.WebSocketData()
+    frame = {"type": "ctrl:token_refresh", "cap": "toy-cap-secret", "exp": 1}
+    flow.websocket.messages.append(websocket.WebSocketMessage(1, False, json.dumps(frame).encode()))
+    traffic.websocket_message(flow)
+    [row] = rows(tmp_path, "websocket_messages")
+    assert json.loads(zlib.decompress(row["body"])) == {"type": "ctrl:token_refresh", "cap": "[redacted]", "exp": 1}
+    boot = {"syncToken": "toy-sync-secret", "assetToken": "toy-asset-secret", "slug": "toy"}
+    assert module.redact(boot) == {"syncToken": "[redacted]", "assetToken": "[redacted]", "slug": "toy"}
+
+
 def test_websocket_frames_are_recorded_without_tokens(tmp_path):
     traffic = recorder(tmp_path)
     flow = tflow.tflow()
