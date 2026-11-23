@@ -884,3 +884,73 @@ def test_a_failed_background_reload_is_retried_on_the_next_request(monkeypatch, 
     inject.reload_accounts()
     inject.reload_accounts()
     assert submitted == [(path,), (path,)], "a torn read does not wait for the next edit"
+
+
+FAKE_KEY = "sk-ant-api03-fake-test-key"
+
+
+def with_key(monkeypatch, tmp_path, key_account, **config):
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"a": 1, "b": 2}, "api_key_accounts": {"console": key_account}, **config}))
+    inject.read_accounts(path)
+    return inject
+
+
+def pool_of(inject, placeholder="Bearer proxy-account-a", session="s1"):
+    flow = inference(placeholder)
+    flow.request.headers[module.SESSION_HEADER] = session
+    inject.requestheaders(flow)
+    return flow, json.loads(flow.request.headers[module.POOL_HEADER])
+
+
+def test_a_preferred_api_key_leads_every_pool_and_the_balance_orders_the_rest(monkeypatch, tmp_path):
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True},
+                      balance={"strategy": "prefer", "prefer": "b"})
+    for session in ("s1", "s1", "s2"):
+        flow, pool = pool_of(inject, session=session)
+        assert [e["alias"] for e in pool] == ["console", "b", "a"]
+        assert pool[0] == {"alias": "console", "kind": "api_key", "api_key": FAKE_KEY, "primary": True}
+        assert [e["primary"] for e in pool] == [True, False, False]
+        # Only the router puts the key on an attempt; the request itself carries a subscription login.
+        assert flow.request.headers["authorization"] == "Bearer real-2"
+        assert "x-api-key" not in flow.request.headers
+
+
+def test_a_key_that_is_not_preferred_or_a_pinned_session_tries_subscriptions_first(monkeypatch, tmp_path):
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY})
+    assert [e["alias"] for e in pool_of(inject)[1]] == ["a", "b", "console"]
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True})
+    _, pool = pool_of(inject, "Bearer proxy-account-b+pin")
+    assert [(e["alias"], e["primary"]) for e in pool] == [("b", True), ("a", False), ("console", False)]
+
+
+def test_a_disabled_key_is_left_out(monkeypatch, tmp_path):
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True}, disabled=["console"])
+    assert [e["alias"] for e in pool_of(inject)[1]] == ["a", "b"]
+
+
+def test_a_key_alone_still_reaches_the_router_without_a_login_on_the_request(monkeypatch, tmp_path):
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True})
+    monkeypatch.setattr(module, "slot_token", lambda slot: (_ for _ in ()).throw(ValueError("gone")))
+    flow, pool = pool_of(inject)
+    assert [e["alias"] for e in pool] == ["console"]
+    assert "authorization" not in flow.request.headers and "x-api-key" not in flow.request.headers
+
+
+@pytest.mark.parametrize("key_accounts", [
+    {"a": {"key": FAKE_KEY}},
+    {"console": {"key": ""}},
+    {"console": {"key": FAKE_KEY + "\n"}},
+    {"console": {"key": 5}},
+    {"console": FAKE_KEY},
+    {"console": {"key": FAKE_KEY, "preferred": "yes"}},
+    {"bad alias!": {"key": FAKE_KEY}},
+])
+def test_a_malformed_key_account_is_refused(monkeypatch, tmp_path, key_accounts):
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"a": 1}, "api_key_accounts": key_accounts}))
+    with pytest.raises(ValueError) as error:
+        inject.read_accounts(path)
+    assert FAKE_KEY not in str(error.value)

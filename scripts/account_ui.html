@@ -305,7 +305,7 @@ function renderHeader() {
 }
 
 function renderRouting() {
-  const b = state.balance, names = state.accounts.map((a) => a.alias);
+  const b = state.balance, names = subscriptions().map((a) => a.alias);
   const hint = {session: "each machine starts on its own main account",
     prefer: "every session starts on one account", "round-robin": "new sessions take turns",
     "least-sessions": "new sessions go to the least busy account"}[b.strategy];
@@ -341,12 +341,27 @@ function meter(name, w) {
 // One flat list, the global chain "*": Claude accounts (the `order`) interleaved with every backend in the
 // router's catalog, where `accounts:N` stands for the next N enabled accounts.
 const isRun = (t) => t === "accounts" || /^accounts:\d+$/.test(t);
+// Console API keys sit outside the draggable order: a preferred one leads every pool, the rest follow it.
+const subscriptions = () => state.accounts.filter((a) => a.kind !== "api_key");
+function keyCard(a) {
+  return `<div class="card ${a.disabled ? "off" : ""} ${a.preferred && !a.disabled ? "pref" : ""}">
+      <div class="card-head">
+        <span class="name">${esc(a.alias)}</span><span class="spacer"></span>
+        ${a.preferred ? `<span class="badge accent" title="Every session tries this key first, then the order below">tried first</span>` : `<span class="badge" title="Tried after every Claude account">after the accounts</span>`}
+        <span class="badge" title="Console API key: billed per token; falls back when its credit or spend limit runs out">api key</span>
+      </div>
+      <div class="small muted">no usage windows: a Console key is limited by credit and its workspace spend limit</div>
+      <div class="card-foot">
+        <span class="small muted">${a.disabled ? "off: never tried" : "in the pool"}</span><span class="spacer"></span>
+        <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>
+      </div></div>`;
+}
 function globalChain() {
   const chains = state.fallback.chains || {};
   return chains["*"] ?? chains.claude ?? defaultChains().claude;
 }
 function fallbackItems() {
-  const accounts = state.accounts, items = [], chain = globalChain() ?? ["accounts"];
+  const accounts = subscriptions(), items = [], chain = globalChain() ?? ["accounts"];
   let next = 0;
   const take = (n) => {
     for (let taken = 0; next < accounts.length && taken < n; next++) {
@@ -388,7 +403,7 @@ function renderAccounts() {
   const b = state.balance, threshold = state.fallback.threshold ?? null, items = fallbackItems();
   const live = items.filter((x) => !x.off).length;
   let rank = 0;
-  $("accounts").innerHTML = items.map((x, i) => {
+  $("accounts").innerHTML = state.accounts.filter((a) => a.kind === "api_key").map(keyCard).join("") + items.map((x, i) => {
     const a = x.a, off = x.off || a?.disabled, n = x.off ? null : ++rank;
     if (!a) {
       const provider = providerOf(x.target, "*"), named = Object.hasOwn(PROVIDER, x.target) && !state.providers.catalog?.[x.target]?.models.includes(x.target);
@@ -430,9 +445,9 @@ function renderAccounts() {
   // Pointer drag works for mouse and touch alike. A mouse drags from anywhere on the card except its controls;
   // touch drags only from the handle, so the page still scrolls. Drops save like the arrows and re-render from
   // the server's reply, never optimistically.
-  const cards = [...$("accounts").querySelectorAll(".card")];
+  const cards = [...$("accounts").querySelectorAll(".card[data-i]")];
   let drag = null;
-  const targetAt = (e) => { const c = document.elementFromPoint(e.clientX, e.clientY)?.closest("#accounts .card"); return c && !items[+c.dataset.i].off ? c : null; };
+  const targetAt = (e) => { const c = document.elementFromPoint(e.clientX, e.clientY)?.closest("#accounts .card[data-i]"); return c && !items[+c.dataset.i].off ? c : null; };
   cards.forEach((card) => {
     const i = +card.dataset.i;
     if (items[i].off) return;

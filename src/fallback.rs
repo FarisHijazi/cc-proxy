@@ -13,6 +13,9 @@
 //! across the accounts, with the same triggers and no cooldowns. A conversation whose
 //! turn completed on a fallback keeps trying that target first until its requested
 //! model changes, so a recovered earlier target never switches it back mid-task.
+//! A pool member may be a Console API key instead of a login: it is sent as `x-api-key`,
+//! and a reply saying its credit or spend limit ran out moves on and drops the key, for
+//! every model, until the 1st of next month (UTC). Cooldowns live in memory only.
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::Logger;
@@ -39,12 +42,46 @@ const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 const ROUTE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTES: usize = 10_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PoolAccount {
     pub alias: String,
+    #[serde(default)]
     pub authorization: String,
+    /// A Console API key (`"kind": "api_key"`), sent as `x-api-key` in place of a login.
+    #[serde(default)]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub primary: bool,
+}
+
+impl std::fmt::Debug for PoolAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolAccount")
+            .field("alias", &self.alias)
+            .field("api_key", &self.api_key.is_some())
+            .field("primary", &self.primary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolAccount {
+    /// Put this member's credential on an attempt; false when it is not a valid header value.
+    fn sign(&self, headers: &mut HeaderMap) -> bool {
+        let (name, value) = match &self.api_key {
+            Some(key) => ("x-api-key", key.as_str()),
+            None => ("authorization", self.authorization.as_str()),
+        };
+        let Ok(mut value) = HeaderValue::from_str(value) else {
+            return false;
+        };
+        value.set_sensitive(true);
+        if self.api_key.is_some() {
+            // Measured: a key accepts Claude Code's request as is, OAuth beta flags included.
+            headers.remove("authorization");
+        }
+        headers.insert(name, value);
+        true
+    }
 }
 
 /// When a failed attempt moves on to the next target.
@@ -343,6 +380,8 @@ pub fn handles(provider: &str, model: &str, policy: &Policy, providers: &[String
 /// Cooldown expiry per (account or provider, model), as unix seconds.
 #[derive(Default)]
 pub(crate) struct Cooldowns(Mutex<HashMap<(String, String), u64>>);
+/// The cooldown "model" of a credential that is unusable for every model.
+const EVERY_MODEL: &str = "*";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Served {
@@ -601,16 +640,25 @@ fn now() -> u64 {
 
 impl Cooldowns {
     fn cooling(&self, owner: &str, model: &str) -> bool {
-        let key = (owner.to_string(), model.to_string());
         let mut cooldowns = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match cooldowns.get(&key) {
-            Some(until) if *until > now() => true,
-            Some(_) => {
-                cooldowns.remove(&key);
-                false
+        [model, EVERY_MODEL].into_iter().any(|model| {
+            let key = (owner.to_string(), model.to_string());
+            match cooldowns.get(&key) {
+                Some(until) if *until > now() => true,
+                Some(_) => {
+                    cooldowns.remove(&key);
+                    false
+                }
+                None => false,
             }
-            None => false,
-        }
+        })
+    }
+
+    fn exhaust(&self, owner: &str, until: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((owner.to_string(), EVERY_MODEL.to_string()), until);
     }
 
     fn record_rejection(&self, owner: &str, model: &str, headers: &HeaderMap) {
@@ -637,6 +685,43 @@ fn cooldown_until(headers: &HeaderMap) -> u64 {
         return reset;
     }
     now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs())
+}
+
+/// A Console key's credit or spend limit ran out. Matched conservatively on the documented forms:
+/// a 402 `billing_error`, or a 400 "credit balance is too low" / "reached your specified (workspace)
+/// API usage limits".
+fn out_of_credit(status: StatusCode, body: &[u8]) -> bool {
+    let Ok(reply) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = &reply["error"];
+    let message = error["message"].as_str().unwrap_or_default().to_lowercase();
+    match status {
+        StatusCode::PAYMENT_REQUIRED => error["type"] == "billing_error",
+        StatusCode::BAD_REQUEST => {
+            error["type"] == "invalid_request_error"
+                && (message.contains("credit balance is too low")
+                    || message.contains("reached your specified")
+                        && message.contains("api usage limits"))
+        }
+        _ => false,
+    }
+}
+
+/// Unix seconds of the 1st of the month after `now`, 00:00 UTC, when Console credit and spend limits reset.
+fn next_month(now: u64) -> u64 {
+    use time::{Date, Month, OffsetDateTime};
+    let fallback = now + 31 * 24 * 60 * 60;
+    let Ok(today) = OffsetDateTime::from_unix_timestamp(now as i64).map(|t| t.date()) else {
+        return fallback;
+    };
+    let (year, month) = match today.month() {
+        Month::December => (today.year() + 1, Month::January),
+        month => (today.year(), month.next()),
+    };
+    Date::from_calendar_date(year, month, 1)
+        .map(|day| day.midnight().assume_utc().unix_timestamp() as u64)
+        .unwrap_or(fallback)
 }
 
 fn is_thread_continue(body: &MessagesRequest) -> bool {
@@ -763,7 +848,12 @@ pub async fn dispatch(
                 (target.name().to_string(), model.clone(), target, substitute)
             }
         };
-        if !count_tokens && registry.cooldowns.cooling(&owner, &model) {
+        let cooling = if count_tokens {
+            registry.cooldowns.cooling(&owner, EVERY_MODEL)
+        } else {
+            registry.cooldowns.cooling(&owner, &model)
+        };
+        if cooling {
             skipped_cooling = true;
             continue;
         }
@@ -779,17 +869,16 @@ pub async fn dispatch(
         }
         let mut attempt = ctx.clone();
         attempt.provider = target.name().to_string();
-        if let Step::Account(index, model) = &step {
-            let Ok(authorization) = HeaderValue::from_str(&pool[*index].authorization) else {
+        if let Step::Account(index, model) = &step
+            && let Some(passthrough) = attempt.passthrough.as_mut()
+        {
+            if !pool[*index].sign(&mut passthrough.headers) {
                 continue;
-            };
-            if let Some(passthrough) = attempt.passthrough.as_mut() {
-                passthrough.headers.insert("authorization", authorization);
-                if *model != requested {
-                    match with_model(&passthrough.raw_body, model, cross) {
-                        Some(raw) => passthrough.raw_body = raw,
-                        None => continue,
-                    }
+            }
+            if *model != requested {
+                match with_model(&passthrough.raw_body, model, cross) {
+                    Some(raw) => passthrough.raw_body = raw,
+                    None => continue,
                 }
             }
         }
@@ -809,7 +898,34 @@ pub async fn dispatch(
         })
         .await;
         let status = response.status();
-        let quota = status == StatusCode::TOO_MANY_REQUESTS && policy.on.rate_limit;
+        let keyed = matches!(step, Step::Account(index, _) if pool[index].api_key.is_some());
+        let (response, spent) = if keyed
+            && matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::PAYMENT_REQUIRED
+            ) {
+            let (parts, body) = response.into_parts();
+            let body = axum::body::to_bytes(body, 1 << 20)
+                .await
+                .unwrap_or_default();
+            let spent = out_of_credit(status, &body);
+            (Response::from_parts(parts, Body::from(body)), spent)
+        } else {
+            (response, false)
+        };
+        if spent && policy.on.rate_limit {
+            let until = next_month(now());
+            registry.cooldowns.exhaust(&owner, until);
+            log.info(
+                "api key out of credit",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(ctx.req_id)),
+                    ("account".to_string(), json!(owner)),
+                    ("until".to_string(), json!(until)),
+                ])),
+            );
+        }
+        let quota = (status == StatusCode::TOO_MANY_REQUESTS || spent) && policy.on.rate_limit;
         let credential_rejected = matches!(step, Step::Account(_, _))
             && status == StatusCode::UNAUTHORIZED
             && policy.on.auth;
@@ -841,15 +957,23 @@ pub async fn dispatch(
             };
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
-        if !count_tokens && !server_error && !unavailable {
+        if !count_tokens && !server_error && !unavailable && !spent {
             registry
                 .cooldowns
                 .record_rejection(&owner, &model, response.headers());
         }
-        // Lack of model access must not hide a usable account's quota/auth failure.
-        if rejection.as_ref().is_none_or(|prior| {
-            prior.status() == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND
-        }) {
+        // Lack of model access or credit must not hide a usable account's quota/auth failure:
+        // Claude Code retries a 429 but stops at a 400.
+        let weak = |status: StatusCode| {
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST | StatusCode::PAYMENT_REQUIRED
+            )
+        };
+        if rejection
+            .as_ref()
+            .is_none_or(|prior| weak(prior.status()) && !weak(status))
+        {
             rejection = Some(response);
         }
     }
@@ -1399,6 +1523,7 @@ mod tests {
         let routes = Routes::default();
         let pool = Pool {
             accounts: vec![PoolAccount {
+                api_key: None,
                 alias: "owner".into(),
                 authorization: "Bearer token".into(),
                 primary: true,
@@ -1426,6 +1551,60 @@ mod tests {
                 .pinned,
             Some(Served::Substitute("new".into()))
         );
+    }
+
+    #[test]
+    fn credit_runs_out_until_the_first_of_next_month_utc() {
+        // 2026-11-23 21:30 UTC -> 2026-12-01; 2026-12-31 23:59:59 UTC -> 2027-01-01.
+        assert_eq!(next_month(1_795_469_400), 1_796_083_200);
+        assert_eq!(next_month(1_798_761_599), 1_798_761_600);
+        let cooldowns = Cooldowns::default();
+        cooldowns.exhaust("key", next_month(now()));
+        assert!(
+            cooldowns.cooling("key", "claude-opus-5-5") && cooldowns.cooling("key", EVERY_MODEL)
+        );
+        assert!(!cooldowns.cooling("other", "claude-opus-5-5"));
+    }
+
+    #[test]
+    fn only_the_documented_credit_errors_count_as_out_of_credit() {
+        let error = |kind: &str, message: &str| {
+            json!({"type": "error", "error": {"type": kind, "message": message}}).to_string()
+        };
+        let credit = error(
+            "invalid_request_error",
+            "Your credit balance is too low to access the Anthropic API.",
+        );
+        let org = error(
+            "invalid_request_error",
+            "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.",
+        );
+        let bad = error(
+            "invalid_request_error",
+            "messages: text content blocks must be non-empty",
+        );
+        assert!(out_of_credit(StatusCode::BAD_REQUEST, credit.as_bytes()));
+        assert!(out_of_credit(StatusCode::BAD_REQUEST, org.as_bytes()));
+        assert!(!out_of_credit(StatusCode::BAD_REQUEST, bad.as_bytes()));
+        assert!(!out_of_credit(
+            StatusCode::TOO_MANY_REQUESTS,
+            credit.as_bytes()
+        ));
+        assert!(!out_of_credit(StatusCode::BAD_REQUEST, b"not json"));
+    }
+
+    #[test]
+    fn a_pool_member_never_prints_its_credential() {
+        let member: PoolAccount = serde_json::from_value(
+            json!({"alias": "console", "kind": "api_key", "api_key": "sk-ant-fake-secret", "primary": true}),
+        )
+        .unwrap();
+        assert!(!format!("{member:?}").contains("sk-ant-fake-secret"));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer login"));
+        assert!(member.sign(&mut headers));
+        assert!(headers.get("authorization").is_none());
+        assert!(headers["x-api-key"].is_sensitive());
     }
 
     #[test]

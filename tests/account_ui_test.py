@@ -285,3 +285,20 @@ def test_catalogue_identity_is_independent_of_display_labels():
     board.opener, board.cache = Opener(), {}
     assert board.providers()["models"]["kimi"] == ["k3.1-pro"]
     assert board.providers()["catalog"] == catalog
+
+
+def test_a_console_key_account_is_shown_and_toggled_but_its_key_never_leaves_the_file(tmp_path):
+    board, accounts = dashboard(tmp_path)
+    cfg = json.loads(accounts.read_text())
+    cfg["api_key_accounts"] = {"console": {"key": "sk-ant-api03-fake-test-key", "preferred": True}}
+    accounts.write_text(json.dumps(cfg))
+    saved = board.update({"disabled": ["console"], "order": ["b", "a"]})
+    assert saved["disabled"] == ["console"]
+    assert saved["api_key_accounts"]["console"]["key"] == "sk-ant-api03-fake-test-key", "kept on every write"
+    card = board.key_account("console", saved)
+    assert card == {"alias": "console", "kind": "api_key", "preferred": True, "disabled": True,
+                    "usage": {}, "usage_at": None, "token_only": False, "error": None,
+                    "slot": None, "email": None, "plan": "api key"}
+    assert "sk-ant" not in json.dumps(card)
+    with pytest.raises(ValueError):
+        board.update({"balance": {"strategy": "prefer", "prefer": "console"}})

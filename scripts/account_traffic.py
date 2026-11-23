@@ -44,7 +44,9 @@ CLIENT_HEADERS = {
     "x-claude-client-cwd": "launch_cwd",
 }
 SERVED_BY_HEADER = "x-claude-codex-served-by"
-SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+# The account pool carries every login and Console key; only the router may read it.
+SECRET_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key",
+                  "x-claude-codex-account-pool"}
 SECRET_KEYS = {
     "access_token", "refresh_token", "id_token", "oauth_token", "token",
     "api_key", "client_secret", "password", "code_verifier",

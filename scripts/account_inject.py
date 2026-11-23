@@ -69,6 +69,9 @@ SESSION_HEADER = "x-claude-code-session-id"
 SESSION_MODEL_HEADER = "x-claude-codex-session-model"
 MODEL_PATHS = {"/v1/messages", "/v1/messages/count_tokens"}
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
+# A Console API key: the router sends it as x-api-key, so it must be one printable token.
+CONSOLE_KEY = re.compile(r"[\x21-\x7e]{1,512}")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # Prompt caches last at most an hour, so an idle session may be reassigned.
 STICKY_IDLE_S = 3600
@@ -269,6 +272,24 @@ class PostgresAffinity:
             raise AffinityUnavailable("shared account affinity unavailable") from None
 
 
+def key_accounts(section, accounts):
+    """The accounts file's "api_key_accounts": {alias: {"key": "<Console key>", "preferred": bool}}.
+    Errors never quote a key."""
+    if not isinstance(section, dict):
+        raise ValueError("api_key_accounts maps aliases to {key, preferred}")
+    keys, preferred = {}, []
+    for alias, member in section.items():
+        if not ALIAS.fullmatch(alias) or alias in accounts:
+            raise ValueError(f"api_key_accounts alias {alias!r} is invalid or also a subscription account")
+        if not isinstance(member, dict) or not isinstance(member.get("key"), str) \
+                or not CONSOLE_KEY.fullmatch(member["key"]) or not isinstance(member.get("preferred", False), bool):
+            raise ValueError(f"api_key_accounts {alias!r} needs a single-token key and a boolean preferred")
+        keys[alias] = member["key"]
+        if member.get("preferred"):
+            preferred.append(alias)
+    return keys, preferred
+
+
 def codex_cli_auth_file():
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
 
@@ -309,6 +330,8 @@ class AccountInject:
         self.fallback = {}
         self.session_models = {}
         self.api_keys, self.main = {}, None
+        # alias -> Console API key, and the aliases tried before any subscription ("api_key_accounts").
+        self.keys, self.preferred = {}, []
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
@@ -401,6 +424,7 @@ class AccountInject:
             raise ValueError("session_models maps session ids to model ids")
         self.session_models = dict(session_models)
         self.api_keys = {k["sha256"]: k["name"] for k in data.get("api_keys", [])}
+        self.keys, self.preferred = key_accounts(data.get("api_key_accounts", {}), accounts)
         self.main = data.get("main")
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
@@ -521,13 +545,20 @@ class AccountInject:
 
     def pool(self, alias, session=None, pinned=False):
         """Every usable login, the session's starting account first, then file order.
-        A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
+        A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance.
+        A preferred Console key goes before them all (except when pinned), other keys after."""
         alias = self.start(alias, session, pinned)
         names = [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]
         # Accounts at the usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
         names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
-        pool, fetching = [], None
+        keys = [k for k in self.keys if k not in self.disabled]
+        lead = [] if pinned else [k for k in keys if k in self.preferred]
+        pool = [{"alias": k, "kind": "api_key", "api_key": self.keys[k], "primary": False} for k in lead]
+        tail = [{"alias": k, "kind": "api_key", "api_key": self.keys[k], "primary": False} for k in keys if k not in lead]
+        if lead:
+            pool[0]["primary"], alias = True, None  # the key starts the thread, so it owns it
+        fetching = None
         for name in names:
             if self.unusable.get(name, 0) > time.time():
                 continue
@@ -539,7 +570,7 @@ class AccountInject:
                 self.unusable[name] = time.time() + UNUSABLE_RETRY_S
         if not pool and fetching is not None:
             raise fetching
-        return pool
+        return pool + tail
 
     def hot(self, alias):
         """Whether an unexpired 5h or 7d window of the account is at the fallback threshold."""
@@ -808,8 +839,10 @@ class AccountInject:
                 flow.metadata["account_private"] = private
                 pinned = "pin" in placeholder.split("+")[1:]
                 pool = self.pool(alias, flow.request.headers.get(SESSION_HEADER), pinned)
-                if pool:
-                    flow.request.headers["authorization"] = pool[0]["authorization"]
+                # A Console key never rides on the request itself: the router sends it per attempt.
+                login = next((m["authorization"] for m in pool if "authorization" in m), None)
+                if login:
+                    flow.request.headers["authorization"] = login
                 else:
                     flow.request.headers.pop("authorization", None)
                 flow.request.headers[POOL_HEADER] = json.dumps(pool)
