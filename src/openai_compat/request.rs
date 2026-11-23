@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     anthropic::schema::{Message, MessagesRequest},
-    registry::normalize_incoming_model,
+    registry::route_model,
 };
 
 use super::{OpenAiError, OpenAiResponseMetadata, OpenAiSurface};
@@ -61,7 +61,7 @@ pub fn extract_model(body: &Value) -> Result<(String, String), OpenAiError> {
         .filter(|model| !model.is_empty())
         .ok_or_else(|| OpenAiError::invalid("Missing or invalid 'model'", Some("model")))?
         .to_string();
-    Ok((requested.clone(), normalize_incoming_model(&requested)))
+    Ok((requested.clone(), route_model(&requested)))
 }
 
 pub fn parse_request(

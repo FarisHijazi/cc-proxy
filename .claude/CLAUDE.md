@@ -9,7 +9,11 @@ chosen per request by the model name. Claude Code already speaks the Anthropic
 Messages API, so the proxy speaks it too and forwards or translates each request:
 
 - `claude-*` models go to Anthropic as a transparent passthrough that reuses
-  Claude Code's own subscription login. No API key, no translation.
+  Claude Code's own subscription login. No API key, no translation. The
+  exception is `registry::REROUTED_MODELS` (`claude-opus-4-8` runs as
+  `kimi-k3.1-pro`, owner's rule): `route_model` rewrites the id at entry, so
+  routing, fallback tier and chain, and `x-claude-codex-served-by` all see the
+  kimi model.
 - `gpt-5.6-*` (and the other codex ids) go to the Codex backend using the
   ChatGPT subscription that the Codex CLI already logged in.
 - `kimi-*`, `grok-*`, and `cursor*` ids go to their own translators.

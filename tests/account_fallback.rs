@@ -1582,3 +1582,54 @@ async fn a_model_change_without_a_fallback_chain_still_forgets_the_route() {
         "Bearer flaky-1"
     );
 }
+
+async fn served_by(router: Router, model: &str, accounts: &str) -> (StatusCode, String, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header(POOL, accounts)
+        .body(Body::from(hi(model).to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let header = response
+        .headers()
+        .get("x-claude-codex-served-by")
+        .map(|value| value.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    (status, header, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn opus_4_8_is_served_by_kimi_k3_1_pro_and_falls_back_along_kimis_chain() {
+    let upstream = anthropic_upstream().await;
+    let kimi = stub("kimi", "kimi-k3.1-pro", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![kimi.clone()]);
+    let accounts = pool(&[("a1", "live-a1")]);
+
+    let (status, header, body) = served_by(router.clone(), "claude-opus-4-8[1m]", &accounts).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(header, "kimi/kimi-k3.1-pro");
+    assert_eq!(*kimi.seen.lock().unwrap(), ["kimi-k3.1-pro"]);
+    assert!(
+        upstream.seen.lock().unwrap().is_empty(),
+        "Anthropic never sees it"
+    );
+
+    let (status, header, body) = served_by(router.clone(), "claude-opus-5-5", &accounts).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(header, "a1/claude-opus-5-5");
+    assert_eq!(body["model"], "claude-opus-5-5");
+
+    *kimi.status.lock().unwrap() = StatusCode::TOO_MANY_REQUESTS;
+    let (status, header, body) = served_by(router, "claude-opus-4-8", &accounts).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        header, "a1/claude-fable-5-1",
+        "kimi's chain, in kimi-k3.1-pro's tier"
+    );
+}
