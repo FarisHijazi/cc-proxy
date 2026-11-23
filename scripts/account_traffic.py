@@ -7,14 +7,21 @@ decoded and stored zlib-compressed. A model request resends the whole conversati
 every turn, so its `system`, `tools` and each message are stored once in `blobs` and
 the request body keeps `{"$blob": hash}` in their place. Read them with
 `scripts/claude-traffic`, which puts the pieces back.
+
+mitmproxy runs every hook on ONE event loop shared by every connection of every
+account, so the hooks only copy plain data into a bounded queue. One writer thread
+owns the database and does all decoding, redaction, deduplication, pruning and
+inserts. When it falls behind, rows are dropped: telemetry never delays traffic.
 """
 
 import hashlib
 import json
+import queue
 import re
 import runpy
 import sqlite3
 import subprocess
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -143,11 +150,12 @@ def clean_header(name, value):
     return value
 
 
-def clean_headers(headers):
-    return json.dumps([(k, clean_header(k, v)) for k, v in headers.items(multi=True)])
+def clean_headers(items):
+    return json.dumps([(k, clean_header(k, v)) for k, v in items])
 
 
 PRUNE_EVERY_S = 3600
+QUEUE_MAX = 5000
 
 
 class TrafficDB:
@@ -156,9 +164,33 @@ class TrafficDB:
         self.days_of = days_of  # its "traffic_days": keep this many days, unset keeps all
         self.path = self.db = None
         self.pruned = 0.0
+        self.dropped = 0
+        self.jobs = queue.Queue(QUEUE_MAX)
+        threading.Thread(target=self.writer, name="traffic-db", daemon=True).start()
 
-    def connection(self):
-        path = self.path_of()
+    def enqueue(self, path, job, *args):
+        try:
+            self.jobs.put_nowait((path, job, args))
+        except queue.Full:
+            self.dropped += 1
+
+    def flush(self):
+        """Wait until every queued row is written (tests, shutdown)."""
+        self.jobs.join()
+
+    def writer(self):
+        while True:
+            path, job, args = self.jobs.get()
+            try:
+                if self.connection(path) is not None:
+                    job(*args)
+            except Exception as error:  # noqa: BLE001 - a bad row must not stop the recorder
+                print(f"traffic-db: {type(error).__name__}: {error}", flush=True)
+            finally:
+                self.jobs.task_done()
+
+    def connection(self, path=None):
+        path = self.path_of() if path is None else path
         if path != self.path:
             if self.db is not None:
                 self.db.close()
@@ -193,11 +225,13 @@ class TrafficDB:
         self.db.execute("DELETE FROM blobs WHERE last_seen < ?", (cutoff,))
 
     def requestheaders(self, flow):
-        if self.connection() is None:
+        path = self.path_of()
+        if not path:
             return
         headers = flow.request.headers
         supplied = headers.get("authorization", "")
         meta = {
+            "path": path,
             "started": time.time(),
             "client_ip": flow.client_conn.peername[0] if flow.client_conn.peername else None,
             "session_id": headers.get("x-claude-code-session-id"),
@@ -205,12 +239,11 @@ class TrafficDB:
             "account": supplied.removeprefix("Bearer ") if "proxy-account-" in supplied
             else ("other-credential" if supplied else None),
             "url": flow.request.pretty_url,
-            "request_headers": clean_headers(headers),
+            "request_headers": list(headers.items(multi=True)),
         }
         for header, column in CLIENT_HEADERS.items():
             if header in headers:
                 meta[column] = unquote(headers.pop(header))
-        meta.setdefault("client_host", tailnet_name(meta["client_ip"]))
         flow.metadata["traffic"] = meta
 
     def responseheaders(self, flow):
@@ -249,13 +282,35 @@ class TrafficDB:
         return zlib.compress(json.dumps(redact(request), ensure_ascii=False).encode())
 
     def record(self, flow):
+        """On the event loop: copy what the row needs, nothing else."""
         meta = flow.metadata.pop("traffic", None)
-        db = self.connection()
-        if meta is None or db is None:
+        if meta is None:
             return
-        self.prune()
         request, response = flow.request, flow.response
-        body = request.get_content(strict=False) or b""
+        meta.update(
+            id=flow.id, finished=time.time(), method=request.method, api_key=flow.metadata.get("api_key"),
+            request_raw=request.raw_content or b"",
+            request_encoding=request.headers.get("content-encoding", ""),
+            error=flow.error.msg if flow.error else None,
+        )
+        if response is not None:
+            meta.update(
+                status=response.status_code,
+                response_raw=b"".join(meta.pop("chunks")) if "chunks" in meta else response.raw_content,
+                response_headers=list(response.headers.items(multi=True)),
+            )
+        meta.pop("chunks", None)
+        self.enqueue(meta["path"], self.write_flow, meta)
+
+    def write_flow(self, meta):
+        """On the writer thread: decode, redact, deduplicate and insert one flow."""
+        self.prune()
+        body = meta["request_raw"]
+        if meta["request_encoding"]:
+            try:
+                body = encoding.decode(body, meta["request_encoding"])
+            except ValueError:
+                pass
         model = cwd = None
         request_body = clean_body(body)
         try:
@@ -265,34 +320,33 @@ class TrafficDB:
                 request_body = self.deduplicated(parsed)
         except (ValueError, AttributeError):
             pass
-        tokens = None
-        meta["api_key"] = flow.metadata.get("api_key")
-        if response is not None:
-            raw = b"".join(meta["chunks"]) if "chunks" in meta else response.raw_content
-            response_body = clean_body(raw, response.headers.get("content-encoding", ""))
+        tokens = response_body = response_headers = served_by = None
+        if "response_headers" in meta:
+            items = meta["response_headers"]
+            lower = {k.lower(): v for k, v in items}
+            response_body = clean_body(meta["response_raw"], lower.get("content-encoding", ""))
+            response_headers, served_by = clean_headers(items), lower.get(SERVED_BY_HEADER)
             tokens = reply_tokens(response_body) if model else None
-        db.execute(
+        self.db.execute(
             f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 24)})",
             (
-                flow.id, meta["started"], time.time(),
-                meta["client_ip"], meta.get("client_host"), meta.get("client_user"), meta.get("launch_cwd"), cwd,
-                meta["session_id"], meta["account"],
-                response.headers.get(SERVED_BY_HEADER) if response is not None else None, model,
-                request.method, meta["url"], response.status_code if response is not None else None,
-                flow.error.msg if flow.error else None,
-                meta["request_headers"], request_body,
-                clean_headers(response.headers) if response is not None else None,
-                response_body if response is not None else None, meta.get("api_key"),
+                meta["id"], meta["started"], meta["finished"],
+                meta["client_ip"], meta.get("client_host") or tailnet_name(meta["client_ip"]),
+                meta.get("client_user"), meta.get("launch_cwd"), cwd,
+                meta["session_id"], meta["account"], served_by, model,
+                meta["method"], meta["url"], meta.get("status"), meta["error"],
+                clean_headers(meta["request_headers"]), request_body, response_headers,
+                response_body, meta["api_key"],
                 *((tokens["input"], tokens["cache_read"], tokens["output"]) if tokens else (None, None, None)),
             ),
         )
 
     def websocket_message(self, flow):
-        db = self.connection()
-        if db is None:
+        path = self.path_of()
+        if not path:
             return
         message = flow.websocket.messages[-1]
-        db.execute(
-            "INSERT INTO websocket_messages VALUES (?,?,?,?)",
-            (flow.id, message.timestamp, message.from_client, clean_body(message.content)),
-        )
+        self.enqueue(path, self.write_message, flow.id, message.timestamp, message.from_client, message.content)
+
+    def write_message(self, flow_id, at, from_client, content):
+        self.db.execute("INSERT INTO websocket_messages VALUES (?,?,?,?)", (flow_id, at, from_client, clean_body(content)))
