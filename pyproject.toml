@@ -15,6 +15,7 @@ dependencies = [
 sessions = ["httpx==0.28.1"]
 sessions-mcp = ["httpx==0.28.1", "httpx2==2.16.0", "mcp==2.3.0"]
 acp = ["httpx==0.28.1", "httpx2==2.16.0", "mcp==2.3.0", "agent-client-protocol==1.0.0"]
+affinity = ["psycopg[binary]>=3.2,<4"]
 
 [project.scripts]
 cc-proxy = "cc_proxy.cli:main"

@@ -284,6 +284,17 @@ its own locks. Nothing else on the proxy host renews it. cswap's `_fetch_active_
 whose lineage the stale slot backup cannot vouch for, and Claude Code refreshes only within 5 minutes of expiry, so
 renewing 30 minutes early is impossible. Outages: `docs/devlog/claude_20261109-renew-rejected-login.md` and
 `docs/devlog/claude_20261110-renew-expiring-live-login.md` (plain paths).
+With `CCP_GRANTS_DSN` set (opt-in, for primary + standby proxies), PostgreSQL owns every Claude grant instead
+of cswap: a committed lease on generation G before any refresh POST, an encrypted local journal of G+1, and
+adoption of the host's live login into the table (`adopt_live_login`, run off the event loop on reloads).
+`CCP_AFFINITY_DSN` (separate opt-in) shares session-to-account affinity across proxies; see
+`docs/postgres-affinity.md` (plain path). In every mode a login fetch runs on `FETCHER`, never on the event
+loop: a still-valid token keeps serving while it refreshes, only a request with no valid token waits
+`FETCH_WAIT_S`, and a login still being fetched (`StillFetching`) is skipped for that one pool, never marked
+unusable. `CCP_GRANTS_CODEX_ACCOUNT` + `CCP_CODEX_AUTH_FILE` put the
+Codex login in the same table (row `codex:<name>`): `account_inject` refreshes it and writes an access-only file,
+and `--serve` starts the router with `CCP_CODEX_EXTERNAL_REFRESH=1`, which never refreshes. See
+`docs/postgres-grants.md` (plain path).
 Live computer-use and real two-account Chrome checks, the `computer-use` flag gate
 (appears only from a config dir's second launch) and the fact that 2.1.302 keeps
 computer-use approvals terminal-only are in

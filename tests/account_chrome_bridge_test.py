@@ -79,6 +79,7 @@ class Harness:
         self.flow = flow_for()
         self.client_rows = []
         self.session = None
+        self.main_silent = False
 
         async def connect(request, **options):
             self.opened.append((request.url, options))
@@ -91,7 +92,7 @@ class Harness:
         def inject(flow, client, raw):
             frame = json.loads(raw)
             self.sent.append((client, frame))
-            if not client and frame["type"] == "list_extensions":
+            if not client and frame["type"] == "list_extensions" and not self.main_silent:
                 self.session.incoming(
                     "main", {"type": "extensions_list", "extensions": self.source}
                 )
@@ -617,5 +618,43 @@ def test_tornado_transport_runs_native_permission_roundtrip_on_a_real_websocket(
                 peer.close()
             server.stop()
             await server.close_all_connections()
+
+    asyncio.run(run())
+
+
+def test_a_slow_main_roster_comes_back_on_the_next_discovery(monkeypatch):
+    monkeypatch.setitem(
+        bridge["BridgeSession"].discover.__globals__, "DISCOVERY_TIMEOUT", 0.02
+    )
+
+    async def run():
+        harness = Harness()
+        try:
+            harness.main_silent = True
+            assert [row["name"] for row in await harness.discover()] == ["work: B"]
+            assert not harness.flow.killed if hasattr(harness.flow, "killed") else True
+            harness.main_silent = False
+            names = {row["name"] for row in await harness.discover()}
+            assert names == {"main: A", "work: B"}, "the main account's browsers return"
+        finally:
+            await harness.close()
+
+    asyncio.run(run())
+
+
+def test_a_refused_account_is_remembered_and_costs_later_discoveries_nothing(monkeypatch):
+    async def run():
+        harness = Harness(fail=True)
+        try:
+            await harness.discover()
+            opened = len(harness.opened)
+            for _ in range(3):
+                assert [row["name"] for row in await harness.discover()] == ["main: A"]
+            assert len(harness.opened) == opened, "no reconnect while the refusal is fresh"
+            harness.session.channels["work"].refused_at -= bridge["CONNECT_RETRY_S"]
+            harness.fail = False
+            assert len(await harness.discover()) == 2, "retried after the window"
+        finally:
+            await harness.close()
 
     asyncio.run(run())

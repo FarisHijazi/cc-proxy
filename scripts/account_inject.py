@@ -4,8 +4,10 @@ Clients carry `Bearer proxy-account-<alias>`; this proxy holds the logins. A
 real token passes through untouched, so a client's own login still works.
 cswap owns every grant: the live default login is renewed by running Claude Code
 itself (`renew_live_login`), any other slot through cswap's `consume_backup_grant`.
+With `CCP_GRANTS_DSN` set, PostgreSQL owns every grant instead (account_grants.py).
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -16,6 +18,8 @@ import runpy
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FetchTimeout
 from pathlib import Path
 from uuid import UUID
 
@@ -37,6 +41,15 @@ PROXY_ENV = {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROX
 SETUP_TOKEN_REREAD_MS = 60 * 1000
 # A rejected login is renewed at most this often, however many requests it fails.
 RENEW_EVERY_S = 60
+# mitmproxy serves every connection from one event loop, and reading an expired slot runs a
+# network refresh. A token that is still valid keeps serving while its refresh runs in the
+# background; only a request with no valid token waits, this long, and a failed fetch is not
+# retried for FETCH_RETRY_S.
+FETCH_WAIT_S = 0.25
+FETCH_RETRY_S = 60
+FETCHER = ThreadPoolExecutor(max_workers=4, thread_name_prefix="slot-token")
+# Accounts file reloads in shared-login mode adopt the live login (database writes, fsyncs).
+RELOADER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="accounts-reload")
 # Ordered logins for the router's quota fallback (src/fallback.rs). Loopback only:
 # the router strips it before anything is relayed upstream.
 POOL_HEADER = "x-claude-codex-account-pool"
@@ -59,6 +72,16 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # Prompt caches last at most an hour, so an idle session may be reassigned.
 STICKY_IDLE_S = 3600
+AFFINITY_MAX_PENDING = 16
+_grants = runpy.run_path(str(Path(__file__).with_name("account_grants.py")))
+GrantsUnavailable, PostgresGrants, read_key, write_private_json = (
+    _grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key", "write_private_json")
+)
+CodexKeeper, CODEX_NAME = _grants["CodexKeeper"], _grants["CODEX_NAME"]
+
+
+class StillFetching(GrantsUnavailable):
+    """The login is being fetched in the background: retry soon, the account is not broken."""
 
 
 def slot_token(slot):
@@ -117,6 +140,62 @@ def renew(slot, stale):
         switcher.consume_backup_grant(slot, email, raw)
 
 
+def live_login():
+    """(slot, email) of this host's live default Claude login, read from ~/.claude.json, never its token."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    identity = switcher._get_current_account()
+    return switcher.current_account_number(), identity[0] if identity else None
+
+
+def setup_token_slot(slot):
+    """A `claude setup-token` login has no refresh grant, so every host may hold a copy of it."""
+    from claude_swap import oauth
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    email = switcher._get_sequence_data()["accounts"][slot]["email"]
+    raw, _ = switcher._read_account_credentials_ex(slot, email)
+    token = oauth.extract_oauth_data(raw) or {}
+    return bool(token.get("accessToken")) and "expiresAt" not in token and not token.get("refreshToken")
+
+
+def copyable(slot):
+    try:
+        return setup_token_slot(slot)
+    except Exception:  # noqa: BLE001 - an unreadable slot is treated as a rotating grant
+        return False
+
+
+def adopt_live_login(grants, alias, home=None):
+    """Take a shared alias's live login on this host away from Claude Code, which refreshes it outside any lease.
+
+    A Claude Code process that held the login before the cutover writes it back when it refreshes. The newer
+    of that copy and the stored generation is kept; the copy then leaves Claude Code's files (a private
+    backup stays under ~/.local/state/ccp-adopted), keeping the MCP logins beside it.
+    """
+    home = home or Path.home()
+    credentials = home / ".claude" / ".credentials.json"
+    doc = json.loads(credentials.read_text()) if credentials.exists() else {}
+    live = doc.get("claudeAiOauth")
+    if live:
+        generation = None
+        if live.get("refreshToken"):
+            generation = grants.seed(alias, json.dumps({"claudeAiOauth": live}), replace=True, newer_only=True)
+        aside = home / ".local" / "state" / "ccp-adopted"
+        aside.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_private_json(aside / f"{alias}-{time.strftime('%Y%m%dT%H%M%S')}.json", {"claudeAiOauth": live})
+        del doc["claudeAiOauth"]
+        write_private_json(credentials, doc)
+        logging.warning(f"{alias}: took the live Claude login off this host"
+                        + (f", stored as generation {generation}" if generation else ", the shared one was newer"))
+    config = home / ".claude.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    if data.pop("oauthAccount", None) is not None:
+        write_private_json(config, data)
+
+
 def renew_in_background(slot, stale):
     try:
         renew(slot, stale)
@@ -151,6 +230,66 @@ def parse(placeholder):
     return alias, (owners or [None])[0], "private" in suffixes
 
 
+class AffinityUnavailable(Exception):
+    """Shared selection failed; never fall back to process-local assignment."""
+
+
+class PostgresAffinity:
+    def __init__(self, dsn, namespace):
+        self.dsn, self.namespace = dsn, namespace
+
+    def choose(self, inject, alias, session, pinned):
+        try:
+            import psycopg
+            from psycopg.types.json import Jsonb
+
+            with psycopg.connect(
+                self.dsn, connect_timeout=3,
+                options="-c statement_timeout=3000 -c lock_timeout=3000",
+            ) as conn:
+                conn.execute("SET LOCAL synchronous_commit = on")
+                conn.execute(
+                    "INSERT INTO ccp_affinity (namespace) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (self.namespace,),
+                )
+                state, = conn.execute(
+                    "SELECT state FROM ccp_affinity WHERE namespace = %s FOR UPDATE",
+                    (self.namespace,),
+                ).fetchone()
+                now, = conn.execute("SELECT extract(epoch FROM clock_timestamp())::float8").fetchone()
+                inject.sticky = {s: e for s, e in state["sessions"].items() if e[1] > now - STICKY_IDLE_S}
+                inject.turn = state["turn"]
+                chosen = inject._start(alias, session, pinned, now)
+                conn.execute(
+                    "UPDATE ccp_affinity SET state = %s WHERE namespace = %s",
+                    (Jsonb({"sessions": inject.sticky, "turn": inject.turn}), self.namespace),
+                )
+            return chosen
+        except Exception:  # noqa: BLE001 - fail closed, including malformed shared state; never expose a DSN
+            raise AffinityUnavailable("shared account affinity unavailable") from None
+
+
+def codex_cli_auth_file():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+
+
+def codex_keeper(grants, name, auth_file):
+    """The shared Codex login (opt-in): its row is `codex:<name>`, written for the router to `auth_file`."""
+    if grants is None or not CODEX_NAME.fullmatch(name) or not auth_file:
+        raise exceptions.OptionsError(
+            "A shared Codex login requires the CCP_GRANTS_* settings, a valid CCP_GRANTS_CODEX_ACCOUNT"
+            " and CCP_CODEX_AUTH_FILE"
+        )
+    path = Path(auth_file).expanduser().absolute()
+    if path.resolve() == codex_cli_auth_file().expanduser().resolve():
+        raise exceptions.OptionsError(
+            "CCP_CODEX_AUTH_FILE must not be the Codex CLI's own auth.json, which the CLI refreshes itself"
+        )
+    codex = PostgresGrants(grants.dsn, grants.namespace, grants.key, grants.journal_dir,
+                           refresh=_grants["codex_refresh"], parse=_grants["codex_login"])
+    return CodexKeeper(codex, name, path)
+
+
 class AccountInject:
     def __init__(self):
         self.accounts = {}
@@ -158,6 +297,8 @@ class AccountInject:
         self.cache = {}
         self.renewed = {}
         self.unusable = {}
+        self.fetching = {}
+        self.epoch = {}
         self.strategy, self.prefer = "session", None
         self.sticky, self.turn = {}, -1
         self.chrome = None
@@ -171,6 +312,35 @@ class AccountInject:
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
+        dsn = os.environ.get("CCP_AFFINITY_DSN")
+        namespace = os.environ.get("CCP_AFFINITY_NAMESPACE")
+        self.affinity = None
+        self.affinity_worker = None
+        if dsn is not None or namespace is not None:
+            if not dsn or not namespace or not SESSION_ID.fullmatch(namespace):
+                raise exceptions.OptionsError("Shared affinity requires a DSN and valid namespace")
+            self.affinity = PostgresAffinity(dsn, namespace)
+            self.affinity_slots = threading.BoundedSemaphore(AFFINITY_MAX_PENDING)
+            self.affinity_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account-affinity")
+            self.requestheaders = self.shared_requestheaders
+        self.grants, self.stale, self.copyable = None, {}, set()
+        grants = [os.environ.get(n) for n in ("CCP_GRANTS_DSN", "CCP_GRANTS_NAMESPACE", "CCP_GRANTS_KEY_FILE")]
+        if any(v is not None for v in grants):
+            dsn, namespace, key_file = grants
+            if not dsn or not namespace or not key_file or not SESSION_ID.fullmatch(namespace):
+                raise exceptions.OptionsError(
+                    "Shared logins require CCP_GRANTS_DSN, a valid CCP_GRANTS_NAMESPACE and CCP_GRANTS_KEY_FILE"
+                )
+            try:
+                key = read_key(key_file)
+            except (OSError, ValueError):
+                raise exceptions.OptionsError("CCP_GRANTS_KEY_FILE must be a private file of 32 base64 bytes") from None
+            self.grants = PostgresGrants(dsn, namespace, key, Path(key_file).parent / "grants-journal")
+        self.codex = None
+        codex = os.environ.get("CCP_GRANTS_CODEX_ACCOUNT")
+        if codex is not None:
+            self.codex = codex_keeper(self.grants, codex, os.environ.get("CCP_CODEX_AUTH_FILE"))
+            threading.Thread(target=self.codex.run, daemon=True, name="codex-grant").start()
 
     def load(self, loader):
         loader.add_option(
@@ -189,12 +359,30 @@ class AccountInject:
             self.read_accounts(Path(ctx.options.proxy_accounts_file))
         except (OSError, ValueError, KeyError, AttributeError):
             raise exceptions.OptionsError("Invalid proxy accounts file") from None
+        if self.grants is not None:
+            try:
+                self.grants.reconcile_all()
+            except Exception as error:  # noqa: BLE001 - each account reconciles again on its next read
+                logging.warning(f"reconciling shared logins failed: {type(error).__name__}")
 
     def read_accounts(self, path):
         self.accounts_file = path
         self.accounts_mtime = path.stat().st_mtime
         data = json.loads(path.read_text())
-        self.accounts = {a: str(s) for a, s in data["accounts"].items()}
+        accounts = {a: str(s) for a, s in data["accounts"].items()}
+        if self.grants is not None:
+            # Setup-tokens never rotate: they stay in cswap; only rotating grants are shared.
+            self.copyable = {alias for alias, account_slot in accounts.items() if copyable(account_slot)}
+            slot, email = live_login()
+            for alias, account_slot in accounts.items():
+                if alias in self.copyable:
+                    continue
+                if account_slot == slot or email and alias.lower() == email.lower():
+                    try:
+                        adopt_live_login(self.grants, alias)
+                    except Exception as error:  # noqa: BLE001 - serving beats refusing; the next reload adopts again
+                        logging.error(f"{alias} is still this host's live Claude login: {type(error).__name__}")
+        self.accounts = accounts
         # Old alias -> current alias, so sessions launched before a rename keep working.
         self.renamed = dict(data.get("renamed", {}))
         # Where account_traffic.py records every flow; unset records nothing.
@@ -229,33 +417,92 @@ class AccountInject:
         # Added accounts join the fallback pool without restarting the proxy.
         path = getattr(self, "accounts_file", None)
         try:
-            if path is not None and path.stat().st_mtime != self.accounts_mtime:
+            mtime = path is not None and path.stat().st_mtime
+            if path is None or mtime == self.accounts_mtime:
+                return
+            if self.grants is None:
                 self.read_accounts(path)
+            else:
+                self.accounts_mtime = mtime
+                RELOADER.submit(self.reload_in_background, path)
         except (OSError, ValueError, KeyError, AttributeError):
             pass
 
+    def reload_in_background(self, path):
+        try:
+            self.read_accounts(path)
+        except (OSError, ValueError, KeyError, AttributeError) as error:
+            self.accounts_mtime = None  # retried on the next request, as an inline reload was
+            logging.warning(f"reloading the accounts file failed: {type(error).__name__}")
+
     def token(self, alias):
         cached = self.cache.get(alias)
-        if cached and cached[1] - MARGIN_MS > time.time() * 1000:
+        now = time.time() * 1000
+        if cached and cached[1] - MARGIN_MS > now:
             return cached[0]
+        if cached and cached[1] > now:
+            try:
+                self.fetch(alias, wait=False)
+            except ValueError:
+                pass  # the cached token is still valid; the background fetch replaces it
+            self.renew(alias, None)
+            return cached[0]
+        epoch, fetched = self.epoch.get(alias, 0), None
         try:
-            self.cache[alias] = slot_token(self.accounts[alias])
+            fetched = self.fetch(alias)
+            if self.epoch.get(alias, 0) == epoch:
+                self.cache[alias] = fetched  # never a token rejected while this request waited
         finally:
-            if self.cache.get(alias, (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
+            if (fetched or (None, 0))[1] - MARGIN_MS <= time.time() * 1000:
                 self.renew(alias, None)  # nothing on this host renews the live login before it dies
-        return self.cache[alias][0]
+        return fetched[0]
+
+    def fetch(self, alias, wait=True):
+        future = self.fetching.get(alias)
+        error = ValueError if self.grants is None else GrantsUnavailable
+        if future is not None and not future.done():
+            raise StillFetching(f"login for {alias} is still being fetched")
+        if future is not None and future.exception() is not None and time.time() < future.failed_at + FETCH_RETRY_S:
+            raise error(f"login for {alias} is unavailable")
+        if self.grants is None or alias in self.copyable:
+            future = self.fetching[alias] = FETCHER.submit(slot_token, self.accounts[alias])
+        else:
+            future = self.fetching[alias] = FETCHER.submit(self.grants.token, alias, self.stale.pop(alias, None))
+        future.failed_at = float("inf")
+        epoch = self.epoch.get(alias, 0)
+
+        def settle(done):
+            if done.exception() is not None:
+                done.failed_at = time.time()
+            elif self.epoch.get(alias, 0) == epoch:
+                self.cache[alias] = done.result()  # never a token rejected after this fetch started
+
+        future.add_done_callback(settle)
+        if not wait:
+            raise StillFetching(f"login for {alias} is still being fetched")
+        try:
+            return future.result(timeout=FETCH_WAIT_S)
+        except FetchTimeout:
+            raise StillFetching(f"login for {alias} is still being fetched") from None
 
     def name(self, alias):
         return self.renamed.get(alias, alias)
 
-    def start(self, alias, session):
-        """The account a session tries first. Sessions never round-robin per request:
-        a session keeps its account, because prompt caches are per account."""
+    def start(self, alias, session, pinned=False):
+        """The ONLY first-account selector, optionally serialized across proxy workers."""
+        if self.affinity is not None:
+            return self.affinity.choose(self, alias, session, pinned)
+        return self._start(alias, session, pinned)
+
+    def _start(self, alias, session, pinned=False, now=None):
+        """Sessions keep their account because prompt caches are per account."""
+        if pinned:
+            return alias
         if self.strategy == "prefer":
             return alias if self.prefer in self.disabled else self.prefer
         if self.strategy == "session" or not session:
             return alias
-        now = time.time()
+        now = time.time() if now is None else now
         self.sticky = {s: e for s, e in self.sticky.items() if e[1] > now - STICKY_IDLE_S}
         entry = self.sticky.get(session)
         if entry is None or entry[0] not in self.accounts:
@@ -275,19 +522,23 @@ class AccountInject:
     def pool(self, alias, session=None, pinned=False):
         """Every usable login, the session's starting account first, then file order.
         A pinned placeholder (`+pin`) starts on its own alias, ignoring the balance."""
-        alias = alias if pinned else self.start(alias, session)
+        alias = self.start(alias, session, pinned)
         names = [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]
         # Accounts at the usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
         names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
-        pool = []
+        pool, fetching = [], None
         for name in names:
             if self.unusable.get(name, 0) > time.time():
                 continue
             try:
                 pool.append({"alias": name, "authorization": "Bearer " + self.token(name), "primary": name == alias})
+            except StillFetching as error:
+                fetching = error  # not broken: it joins the pool once its fetch lands
             except Exception:  # noqa: BLE001 - one broken slot must not block the rest
                 self.unusable[name] = time.time() + UNUSABLE_RETRY_S
+        if not pool and fetching is not None:
+            raise fetching
         return pool
 
     def hot(self, alias):
@@ -349,9 +600,17 @@ class AccountInject:
         if not cached or cached[0] != sent:
             return  # already replaced since this request went out
         del self.cache[alias]
+        self.epoch[alias] = self.epoch.get(alias, 0) + 1
         self.renew(alias, sent)
 
     def renew(self, alias, stale):
+        if self.grants is not None:
+            if alias in self.copyable:
+                return  # a setup-token has nothing to renew
+            # The next fetch refreshes under the shared lease; expiry needs no hint.
+            if stale and time.time() - self.renewed.get(alias, 0) >= RENEW_EVERY_S:
+                self.renewed[alias], self.stale[alias] = time.time(), stale
+            return
         now = time.time()
         if now - self.renewed.get(alias, 0) < RENEW_EVERY_S:
             return
@@ -443,6 +702,8 @@ class AccountInject:
             self.chrome.end(flow)
 
     def done(self):
+        if self.affinity_worker is not None:
+            self.affinity_worker.shutdown(wait=False, cancel_futures=True)
         if self.chrome is not None:
             self.chrome.close()
 
@@ -468,7 +729,43 @@ class AccountInject:
         flow.metadata["api_key"] = name
         return True
 
+    @staticmethod
+    def affinity_failure(flow, message="shared account affinity unavailable"):
+        for name in ("authorization", "x-api-key", POOL_HEADER, POLICY_HEADER, SESSION_MODEL_HEADER):
+            flow.request.headers.pop(name, None)
+        flow.response = http.Response.make(
+            503,
+            json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}),
+            {"content-type": "application/json"},
+        )
+
+    async def shared_requestheaders(self, flow):
+        headers = flow.request.headers
+        supplied = headers.get("authorization", "")
+        key = headers.get("x-api-key", "") or supplied.removeprefix("Bearer ")
+        if not (
+            flow.request.method == "POST" and flow.request.path.split("?")[0] in MODEL_PATHS
+            and (supplied.startswith(PREFIX) or key.startswith(API_KEY_PREFIX))
+        ):
+            self.requestheaders_local(flow)
+            return
+        if not self.affinity_slots.acquire(blocking=False):
+            self.affinity_failure(flow)
+            return
+        try:
+            future = self.affinity_worker.submit(self.requestheaders_local, flow)
+        except RuntimeError:  # shutdown; no local selection after the worker is gone
+            self.affinity_slots.release()
+            self.affinity_failure(flow)
+            return
+        # Release only when the worker finishes, even if the waiting client disconnects.
+        future.add_done_callback(lambda _: self.affinity_slots.release())
+        await asyncio.wrap_future(future)
+
     def requestheaders(self, flow):
+        self.requestheaders_local(flow)
+
+    def requestheaders_local(self, flow):
         # Only this addon may name the pool; a client-supplied one never survives.
         flow.request.headers.pop(POOL_HEADER, None)
         flow.request.headers.pop(POLICY_HEADER, None)
@@ -531,6 +828,10 @@ class AccountInject:
                 del flow.request.headers["authorization"]
                 return
             flow.request.headers["authorization"] = "Bearer " + token
+        except AffinityUnavailable:
+            self.affinity_failure(flow)
+        except GrantsUnavailable as error:
+            self.affinity_failure(flow, str(error))
         except Exception as error:
             # Never forward a placeholder upstream.
             flow.response = http.Response.make(
