@@ -302,7 +302,7 @@ impl Registry {
         raw_model: &str,
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
-        let normalized = normalize_incoming_model(raw_model);
+        let normalized = route_model(raw_model);
         // Claude-shaped models always resolve to the configured alias target (the
         // Anthropic passthrough by default). Session affinity is deliberately NOT
         // consulted here: a codex request earlier in the same session must never drag
@@ -369,6 +369,18 @@ impl Registry {
         }
         message
     }
+}
+
+/// Claude ids served by another backend's model instead of Anthropic (owner's rule).
+const REROUTED_MODELS: &[(&str, &str)] = &[("claude-opus-4-8", "kimi-k3.1-pro")];
+
+/// The model a request runs as: [`normalize_incoming_model`], then [`REROUTED_MODELS`].
+pub fn route_model(model: &str) -> String {
+    let normalized = normalize_incoming_model(model);
+    REROUTED_MODELS
+        .iter()
+        .find(|(from, _)| normalized.eq_ignore_ascii_case(from))
+        .map_or(normalized, |(_, to)| (*to).to_string())
 }
 
 pub fn normalize_incoming_model(model: &str) -> String {
@@ -579,11 +591,34 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_8_routes_to_configured_provider() {
-        let registry = Registry::new(AliasProvider::Codex);
-        let p = registry.provider_for_model("claude-opus-4-8", None);
-        assert!(p.is_some());
-        assert_eq!(p.expect("provider").name(), "codex");
+    fn opus_4_8_runs_as_kimi_k3_1_pro_whatever_the_alias_target() {
+        for model in ["claude-opus-4-8", "claude-opus-4-8[1m]", "CLAUDE-OPUS-4-8"] {
+            assert_eq!(route_model(model), "kimi-k3.1-pro", "{model}");
+        }
+        for alias in [
+            AliasProvider::Anthropic,
+            AliasProvider::Codex,
+            AliasProvider::Kimi,
+        ] {
+            let registry = Registry::new(alias);
+            for model in ["claude-opus-4-8", "claude-opus-4-8[1m]"] {
+                let p = registry.provider_for_model(model, Some(&AliasProvider::Anthropic));
+                assert_eq!(p.expect("provider").name(), "kimi", "{model}");
+            }
+        }
+    }
+
+    #[test]
+    fn other_claude_ids_keep_their_own_model() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-7",
+            "opus",
+        ] {
+            assert_eq!(route_model(model), model);
+        }
+        assert_eq!(route_model("claude-opus-5-5[1m]"), "claude-opus-5-5");
     }
 
     #[test]
@@ -606,7 +641,8 @@ mod tests {
         let registry = Registry::new(AliasProvider::Anthropic);
         for model in [
             "opus",
-            "claude-opus-4-8",
+            "claude-opus-5-5",
+            "claude-opus-4-7",
             "sonnet",
             "haiku",
             "claude-3-5-haiku-20241022",
@@ -640,7 +676,7 @@ mod tests {
     fn session_affinity_cannot_hijack_claude_slot() {
         // Even if a prior codex request set Codex affinity, claude aliases stay on anthropic.
         let registry = Registry::new(AliasProvider::Anthropic);
-        let p = registry.provider_for_model("claude-opus-4-8", Some(&AliasProvider::Codex));
+        let p = registry.provider_for_model("claude-opus-5-5", Some(&AliasProvider::Codex));
         assert_eq!(p.expect("provider").name(), "anthropic");
     }
 

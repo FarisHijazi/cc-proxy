@@ -1724,7 +1724,7 @@ async fn dispatch_request(
         }
     };
 
-    let mut normalized_model = normalize_incoming_model(model);
+    let mut normalized_model = crate::registry::route_model(model);
     state
         .registry
         .prepare_model_catalog(&normalized_model)
