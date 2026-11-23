@@ -33,20 +33,32 @@ changes made on top of it.
 - `src/providers/codex/*` translates the Anthropic Messages API to the OpenAI
   Responses API and back.
 - `src/providers/translate_shared.rs` holds types and helpers shared by the
-  translators, including the reasoning-tag helpers.
+  translators, including synthetic reasoning provenance and input validation.
 
 ## Invariants to preserve
 
-- The Anthropic passthrough must stay byte-exact for normal traffic. The only
-  rewrite it performs is converting a signature-less `thinking` block into a
-  tagged `text` block, and it reserializes only when such a block is present.
-  Anything that reserializes every request would evict Anthropic's prompt cache.
-- Reasoning stays portable across a model switch. A `thinking` block written by
-  one backend cannot be replayed to the other in native form (Anthropic rejects
-  a signature-less `thinking` block; the Responses API has no `thinking`
-  container). Both translators convert it to text wrapped in the shared
-  `REASONING_OPEN` and `REASONING_CLOSE` tags via `wrap_reasoning`. Keep this
-  deterministic so the rewritten prefix is byte-stable turn to turn.
+- The Anthropic passthrough stays byte-exact for native traffic. It drops unsigned
+  `thinking` and proxy-signed `thinking` (Codex, Kimi, Gemini/local, Cursor CLI),
+  removing an assistant turn left empty. Genuine Anthropic signed and redacted
+  thinking stays untouched. Only a changed body is reserialized.
+- Private reasoning is never converted to visible assistant text. Cross-provider
+  history keeps answers and supported tool calls/results, not another provider's
+  thinking. Codex replays its own encrypted continuation; Kimi and local replay
+  only their proxy-marked reasoning in `reasoning_content`. Gemini/local share
+  the historical `ccp:gemini:v1:` marker. Cursor paths need no reasoning replay.
+  `translate_shared::ProxyReasoning` owns the unchanged persisted marker formats.
+- Already-executed hosted web/X searches retain their complete public call/result
+  records and text citations as deterministic text through `public_history_text`.
+  They must not become client-executed function calls. Anthropic-native web search
+  stays untouched; foreign X-search blocks are downgraded to public text there too.
+- Unsupported documents, audio, video, unknown content, and unsupported images
+  must fail explicitly at translation, before calling upstream. Gemini/local
+  move tool-result images into the following user image parts; Cursor API takes
+  base64 selected images, while Cursor CLI takes text only. Grok retains its
+  explicitly configured image policy. Do not infer model-specific vision or tool
+  support from a provider's request format. `tests/history_translation.rs` covers
+  source histories across destination translators; it is not a live capability
+  test of vendor models.
 - Codex credentials come only from the Codex CLI's `~/.codex/auth.json`. The
   proxy has no Codex login of its own. Token refresh writes back to that file so
   the Codex CLI keeps working (OpenAI rotates the refresh token on use).

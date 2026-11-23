@@ -11,15 +11,7 @@
 use serde_json::{Value, json};
 
 use crate::anthropic::sse::encode_sse_event;
-
-/// Anthropic rejects a `thinking` block replayed without a signature. The
-/// upstream has none to give, so one is derived from the message id and block
-/// index — stable across a replay of the same turn.
-fn make_thinking_signature(message_id: &str, index: usize) -> String {
-    use base64::Engine;
-    let input = format!("ccp:gemini:v1:{message_id}:{index}");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes())
-}
+use crate::providers::translate_shared::ProxyReasoning;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenBlock {
@@ -200,7 +192,7 @@ impl StreamTranslator {
         match self.open {
             OpenBlock::None => {}
             OpenBlock::Thinking(index) => {
-                let signature = make_thinking_signature(&self.message_id, index);
+                let signature = ProxyReasoning::Gemini.sign(&self.message_id, index);
                 let data = json!({
                     "type": "content_block_delta",
                     "index": index,

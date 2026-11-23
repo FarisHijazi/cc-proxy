@@ -15,7 +15,10 @@ use claude_codex::{
     server::app,
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
@@ -25,6 +28,8 @@ const POLICY: &str = "x-claude-codex-fallback";
 struct Upstream {
     base: String,
     seen: Arc<Mutex<Vec<(String, bool)>>>,
+    flaky: Arc<AtomicBool>,
+    gate: Arc<tokio::sync::Notify>,
     task: JoinHandle<()>,
 }
 impl Drop for Upstream {
@@ -37,16 +42,64 @@ impl Drop for Upstream {
 /// `Bearer basic` has no `claude-mythos-*` models.
 async fn anthropic_upstream() -> Upstream {
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let flaky = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(tokio::sync::Notify::new());
     let log = seen.clone();
+    let failing = flaky.clone();
+    let opened = gate.clone();
     let router = Router::new().fallback(move |req: Request<Body>| {
         let log = log.clone();
+        let failing = failing.clone();
+        let opened = opened.clone();
         async move {
             let auth = req.headers()["authorization"].to_str().unwrap().to_string();
             log.lock()
                 .unwrap()
                 .push((auth.clone(), req.headers().contains_key(POOL) || req.headers().contains_key(POLICY)));
             let body = axum::body::to_bytes(req.into_body(), 1_000_000).await.unwrap();
-            let model = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["model"].as_str().map(str::to_string));
+            let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let model = request["model"].as_str().map(str::to_string);
+            if auth.starts_with("Bearer flaky") && failing.load(Ordering::SeqCst) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"type":"error","error":{"type":"api_error","message":"flaky"}}))).into_response();
+            }
+            if auth.starts_with("Bearer refuse") {
+                return axum::Json(json!({"type": "message", "servedBy": auth, "model": model, "stop_reason": "refusal"})).into_response();
+            }
+            if auth.starts_with("Bearer tool-error") {
+                return axum::Json(json!({"type": "message", "servedBy": auth, "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "t", "name": "report", "input": {"type": "error"}}]})).into_response();
+            }
+            if let Some(name) = auth.strip_prefix("Bearer sse-") {
+                return ([("content-type", "text/event-stream")], sse_reply(name)).into_response();
+            }
+            if auth.starts_with("Bearer slow") {
+                let parts = futures_util::stream::unfold(0, move |step| {
+                    let opened = opened.clone();
+                    async move {
+                        match step {
+                            0 => Some((Ok::<_, std::io::Error>(SSE_START.to_string()), 1)),
+                            1 => {
+                                opened.notified().await;
+                                Some((Ok(SSE_END.to_string()), 2))
+                            }
+                            _ => None,
+                        }
+                    }
+                });
+                return ([("content-type", "text/event-stream")], Body::from_stream(parts)).into_response();
+            }
+            if auth.starts_with("Bearer abort") {
+                let cut = futures_util::stream::unfold(0, |step| async move {
+                    match step {
+                        0 => Some((Ok("{\"partial\":"), 1)),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            Some((Err(std::io::Error::other("cut")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                return Body::from_stream(cut).into_response();
+            }
             if auth.starts_with("Bearer invalid") {
                 return (StatusCode::UNAUTHORIZED, axum::Json(json!({"type":"error","error":{"type":"authentication_error","message":"expired"}}))).into_response();
             }
@@ -64,20 +117,55 @@ async fn anthropic_upstream() -> Upstream {
                 )
                     .into_response();
             }
-            axum::Json(json!({"servedBy": auth, "model": model})).into_response()
+            axum::Json(json!({"type": "message", "stop_reason": "end_turn", "servedBy": auth, "model": model, "thinking": request["thinking"], "effort": request["output_config"]["effort"]})).into_response()
         }
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    Upstream { base, seen, task }
+    Upstream {
+        base,
+        seen,
+        flaky,
+        gate,
+        task,
+    }
+}
+
+const SSE_START: &str =
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n";
+const SSE_END: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+fn sse_reply(name: &str) -> String {
+    let delta = |reason: &str| {
+        format!(
+            "event: message_delta\ndata: {{\"type\" : \"message_delta\", \"delta\" : {{\"stop_reason\" : \"{reason}\"}}}}\n\n"
+        )
+    };
+    let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    match name {
+        "done" => format!("{SSE_START}{SSE_END}"),
+        "spaced-refusal" => format!("{SSE_START}{}{stop}", delta("refusal")),
+        "spaced-done" => format!("{SSE_START}{}{stop}", delta("end_turn")),
+        "truncated" => format!("{SSE_START}{}", delta("end_turn")),
+        "unterminated" => format!(
+            "{SSE_START}{}{stop}event: ping\ndata: {{",
+            delta("end_turn")
+        ),
+        "error" => format!(
+            "{SSE_START}{}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\"}}}}\n\n{stop}",
+            delta("end_turn")
+        ),
+        other => panic!("no SSE reply {other}"),
+    }
 }
 
 struct Stub {
     name: &'static str,
     model: &'static str,
-    status: StatusCode,
+    status: Mutex<StatusCode>,
     seen: Arc<Mutex<Vec<String>>>,
+    thinking: Mutex<Vec<(Value, Value)>>,
 }
 #[async_trait]
 impl Provider for Stub {
@@ -93,9 +181,17 @@ impl Provider for Stub {
     async fn handle_messages(&self, body: MessagesRequest, _ctx: RequestContext) -> Response {
         let model = body.model.unwrap_or_default();
         self.seen.lock().unwrap().push(model.clone());
+        self.thinking.lock().unwrap().push((
+            body.extra.get("thinking").cloned().unwrap_or(Value::Null),
+            body.extra
+                .get("output_config")
+                .and_then(|config| config.get("effort"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ));
         (
-            self.status,
-            axum::Json(json!({"servedBy": self.name, "model": model})),
+            *self.status.lock().unwrap(),
+            axum::Json(json!({"type": "message", "stop_reason": "end_turn", "servedBy": self.name, "model": model})),
         )
             .into_response()
     }
@@ -108,8 +204,9 @@ fn stub(name: &'static str, model: &'static str, status: StatusCode) -> Arc<Stub
     Arc::new(Stub {
         name,
         model,
-        status,
+        status: Mutex::new(status),
         seen: Arc::default(),
+        thinking: Mutex::default(),
     })
 }
 
@@ -882,4 +979,606 @@ async fn custom_tier_discovers_a_cold_codex_destination_before_routing() {
     );
     assert_eq!(body["model"], "gpt-6.10-sol");
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+const SERVER_ERRORS: &str = r#"{"on":{"server_error":true}}"#;
+
+async fn turn(
+    router: Router,
+    path: &str,
+    who: &[&str],
+    payload: Value,
+    pool: String,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer own-session-token")
+        .header(POOL, pool)
+        .header(POLICY, SERVER_ERRORS);
+    for (header, value) in ["x-claude-code-session-id", "x-claude-code-agent-id"]
+        .into_iter()
+        .zip(who)
+    {
+        request = request.header(header, *value);
+    }
+    let response = router
+        .oneshot(request.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 100_000).await;
+    let body = body
+        .ok()
+        .and_then(|body| serde_json::from_slice(&body).ok())
+        .unwrap_or(Value::Null);
+    (status, body)
+}
+
+fn hi(model: &str) -> Value {
+    json!({"model": model, "max_tokens": 1, "messages": [{"role":"user","content":"hi"}]})
+}
+
+async fn served(router: &Router, who: &[&str], model: &str, accounts: &str) -> Value {
+    let (status, body) = turn(
+        router.clone(),
+        "/v1/messages",
+        who,
+        hi(model),
+        accounts.into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["servedBy"].clone()
+}
+
+#[tokio::test]
+async fn a_conversation_stays_on_its_fallback_after_the_first_target_recovers() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s1"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s1"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    assert_eq!(
+        served(&router, &["s2"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1",
+        "another session keeps its own route"
+    );
+    assert_eq!(
+        served(&router, &["s1", "agent"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1",
+        "a subagent keeps its own route"
+    );
+    let other_owner = pool(&[("third", "flaky-3"), ("second", "live-2")]);
+    assert_eq!(
+        served(&router, &["s1"], "claude-opus-5-5", &other_owner).await,
+        "Bearer live-2",
+        "the conversation's route does not depend on the primary alias"
+    );
+    assert_eq!(
+        served(&router, &["s1"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+}
+
+async fn continuity_over_tcp(backup: &str, streamed: bool) {
+    let upstream = anthropic_upstream().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let router = gateway(&upstream.base, vec![]);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let accounts = pool(&[("first", "flaky-1"), ("second", backup)]);
+    for failing in [true, false] {
+        upstream.flaky.store(failing, Ordering::SeqCst);
+        let mut payload = hi("claude-opus-5-5");
+        payload["stream"] = json!(streamed);
+        let response = client
+            .post(&url)
+            .header("authorization", "Bearer own-session-token")
+            .header("x-claude-code-session-id", "tcp-session")
+            .header(POOL, &accounts)
+            .header(POLICY, SERVER_ERRORS)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let length = response.headers()["content-length"]
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let bytes = response.bytes().await.unwrap();
+        assert_eq!(bytes.len(), length);
+        if streamed {
+            assert_eq!(bytes.as_ref(), sse_reply("done").as_bytes());
+        } else {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["servedBy"], format!("Bearer {backup}"));
+        }
+    }
+    assert_eq!(
+        seen_auths(&upstream),
+        [
+            "Bearer flaky-1".to_string(),
+            format!("Bearer {backup}"),
+            format!("Bearer {backup}")
+        ]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn non_streaming_continuity_survives_content_length_over_tcp() {
+    continuity_over_tcp("live-2", false).await;
+}
+
+#[tokio::test]
+async fn streaming_continuity_survives_content_length_over_tcp() {
+    continuity_over_tcp("sse-done", true).await;
+}
+
+#[tokio::test]
+async fn continuity_survives_an_absent_primary_returning_but_not_an_absent_target() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let absent =
+        json!([{"alias":"second", "authorization":"Bearer live-2", "primary":false}]).to_string();
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &absent).await,
+        "Bearer live-2"
+    );
+    let restored = pool(&[("first", "live-1"), ("second", "live-2")]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &restored).await,
+        "Bearer live-2"
+    );
+    assert_eq!(
+        served(&router, &["s", "agent"], "claude-opus-5-5", &restored).await,
+        "Bearer live-1"
+    );
+    let removed = pool(&[("first", "live-1")]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &removed).await,
+        "Bearer live-1"
+    );
+    assert_eq!(
+        seen_auths(&upstream),
+        [
+            "Bearer live-2",
+            "Bearer live-2",
+            "Bearer live-1",
+            "Bearer live-1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn changing_the_requested_model_forgets_the_route_even_after_changing_back() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-sonnet-5-5", &accounts).await,
+        "Bearer flaky-1"
+    );
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1"
+    );
+}
+
+#[tokio::test]
+async fn the_route_follows_the_alias_and_never_revives_a_removed_target() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    let accounts = pool(&[
+        ("first", "flaky-1"),
+        ("second", "live-2"),
+        ("third", "live-3"),
+    ]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    let reordered = pool(&[
+        ("first", "flaky-1"),
+        ("third", "live-3"),
+        ("second", "live-2"),
+    ]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &reordered).await,
+        "Bearer live-2"
+    );
+    let removed = pool(&[("first", "flaky-1"), ("third", "live-3")]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &removed).await,
+        "Bearer flaky-1"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_remembered_target_falls_back_in_the_configured_order() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    let accounts = pool(&[
+        ("first", "flaky-1"),
+        ("second", "live-2"),
+        ("third", "live-3"),
+    ]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    upstream.seen.lock().unwrap().clear();
+    let spent = pool(&[
+        ("first", "flaky-1"),
+        ("second", "dead-2"),
+        ("third", "live-3"),
+    ]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &spent).await,
+        "Bearer flaky-1"
+    );
+    assert_eq!(seen_auths(&upstream), ["Bearer dead-2", "Bearer flaky-1"]);
+}
+
+#[tokio::test]
+async fn counts_never_set_a_route() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    let count = json!({"model": "claude-opus-5-5", "messages": [{"role":"user","content":"hi"}]});
+    let (status, body) = turn(
+        router.clone(),
+        "/v1/messages/count_tokens",
+        &["s"],
+        count,
+        accounts.clone(),
+    )
+    .await;
+    assert_eq!(
+        (status, &body["servedBy"]),
+        (StatusCode::OK, &json!("Bearer live-2"))
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1"
+    );
+}
+
+#[tokio::test]
+async fn refusals_and_broken_bodies_never_set_a_route() {
+    for (backup, broken) in [("refuse-2", false), ("abort-2", true)] {
+        let upstream = anthropic_upstream().await;
+        let router = gateway(&upstream.base, vec![]);
+        let accounts = pool(&[("first", "flaky-1"), ("second", backup)]);
+        upstream.flaky.store(true, Ordering::SeqCst);
+        let (status, body) = turn(
+            router.clone(),
+            "/v1/messages",
+            &["s"],
+            hi("claude-opus-5-5"),
+            accounts.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.is_null(), broken, "{body}");
+        upstream.flaky.store(false, Ordering::SeqCst);
+        assert_eq!(
+            served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+            "Bearer flaky-1"
+        );
+        assert_eq!(seen_auths(&upstream).len(), 3, "the backup was not retried");
+    }
+}
+
+#[tokio::test]
+async fn a_thread_delta_never_follows_the_route_to_another_account() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    let mut delta = hi("claude-opus-5-5");
+    delta["thread"] = json!({"type": "continue", "previous_message_id": "msg_toy"});
+    let (status, body) = turn(router, "/v1/messages", &["s"], delta, accounts).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"]["details"]["error_code"],
+        "thread_unsupported_request"
+    );
+    assert_eq!(
+        seen_auths(&upstream).len(),
+        2,
+        "nothing reached any account"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_provider_claude_destination_gets_thinking_it_accepts() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6-astra", StatusCode::TOO_MANY_REQUESTS);
+    let router = gateway(&upstream.base, vec![codex]);
+    let accounts = pool(&[("only", "live-1")]);
+    let cases = [
+        (
+            json!({"type": "enabled", "budget_tokens": 4000}),
+            json!("high"),
+            json!("high"),
+        ),
+        (
+            json!({"type": "enabled", "budget_tokens": 4000}),
+            Value::Null,
+            Value::Null,
+        ),
+        (json!({"type": "disabled"}), Value::Null, json!("low")),
+        (json!({"type": "disabled"}), json!("max"), json!("max")),
+    ];
+    for (thinking, effort, expected) in cases {
+        let mut payload = hi("gpt-6-astra");
+        payload["thinking"] = thinking;
+        if !effort.is_null() {
+            payload["output_config"] = json!({"effort": effort});
+        }
+        let (status, body) = turn(
+            router.clone(),
+            "/v1/messages",
+            &[],
+            payload,
+            accounts.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["model"], "claude-fable-5-1");
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["effort"], expected);
+    }
+    let mut direct = hi("claude-fable-5-1");
+    direct["thinking"] = json!({"type": "enabled", "budget_tokens": 4000});
+    let (_, body) = turn(router, "/v1/messages", &[], direct.clone(), accounts).await;
+    assert_eq!(
+        body["thinking"], direct["thinking"],
+        "a direct request is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_kimi_k3_substitute_never_receives_disabled_thinking() {
+    let upstream = anthropic_upstream().await;
+    let kimi = stub("kimi", "kimi-k3", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![kimi.clone()]);
+    let chains = r#"{"chains":{"claude":["accounts","kimi"]}}"#;
+    for thinking in [
+        json!({"type": "disabled"}),
+        json!({"type": "enabled", "budget_tokens": 2000}),
+    ] {
+        let mut payload = hi("claude-sonnet-5-5");
+        payload["thinking"] = thinking;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(POOL, pool(&[("spent", "dead-1")]))
+            .header(POLICY, chains)
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        *kimi.thinking.lock().unwrap(),
+        [
+            (json!({"type": "adaptive"}), json!("low")),
+            (
+                json!({"type": "enabled", "budget_tokens": 2000}),
+                Value::Null
+            ),
+        ]
+    );
+}
+
+fn last_auth(upstream: &Upstream) -> String {
+    seen_auths(upstream).pop().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn only_a_completed_turn_sets_a_route() {
+    for (backup, completes) in [
+        ("sse-done", true),
+        ("sse-spaced-done", true),
+        ("tool-error", true),
+        ("sse-spaced-refusal", false),
+        ("sse-truncated", false),
+        ("sse-unterminated", false),
+        ("sse-error", false),
+    ] {
+        let upstream = anthropic_upstream().await;
+        let router = gateway(&upstream.base, vec![]);
+        let accounts = pool(&[("first", "flaky-1"), ("second", backup)]);
+        upstream.flaky.store(true, Ordering::SeqCst);
+        let (status, _) = turn(
+            router.clone(),
+            "/v1/messages",
+            &["s"],
+            hi("claude-opus-5-5"),
+            accounts.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{backup}");
+        upstream.flaky.store(false, Ordering::SeqCst);
+        turn(
+            router,
+            "/v1/messages",
+            &["s"],
+            hi("claude-opus-5-5"),
+            accounts,
+        )
+        .await;
+        let expected = if completes {
+            format!("Bearer {backup}")
+        } else {
+            "Bearer flaky-1".into()
+        };
+        assert_eq!(last_auth(&upstream), expected, "{backup}");
+    }
+}
+
+async fn open(router: &Router, model: &str, accounts: &str) -> Response {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header(POOL, accounts)
+        .header(POLICY, SERVER_ERRORS)
+        .header("x-claude-code-session-id", "s")
+        .body(Body::from(hi(model).to_string()))
+        .unwrap();
+    router.clone().oneshot(request).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_older_turn_finishing_late_never_overwrites_a_newer_one() {
+    for newer_model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+        let upstream = anthropic_upstream().await;
+        let router = gateway(&upstream.base, vec![]);
+        let accounts = pool(&[("first", "flaky-1"), ("second", "slow-2")]);
+        upstream.flaky.store(true, Ordering::SeqCst);
+        let older = open(&router, "claude-opus-5-5", &accounts).await;
+        assert_eq!(older.status(), StatusCode::OK);
+        assert_eq!(last_auth(&upstream), "Bearer slow-2");
+        upstream.flaky.store(false, Ordering::SeqCst);
+        assert_eq!(
+            served(&router, &["s"], newer_model, &accounts).await,
+            "Bearer flaky-1"
+        );
+        upstream.gate.notify_one();
+        let finished = axum::body::to_bytes(older.into_body(), 100_000)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&finished).contains("message_stop"));
+        upstream.gate.notify_one();
+        assert_eq!(
+            served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+            "Bearer flaky-1",
+            "after {newer_model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn helper_calls_never_move_or_reset_the_route() {
+    let upstream = anthropic_upstream().await;
+    let router = gateway(&upstream.base, vec![]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    let system = |text: &str| json!([{"type": "text", "text": text}]);
+    let mut title = hi("claude-haiku-5-5");
+    title["system"] = system(
+        "You are naming a coding session so the user can pick it out of a long list of sessions. The title is a name.",
+    );
+    let mut review = hi("claude-sonnet-5-5");
+    review["system"] =
+        system("You are a security monitor for autonomous AI coding agents. Decide.");
+    let mut compaction = hi("claude-sonnet-5-5");
+    compaction["system"] =
+        system("You are a helpful AI assistant tasked with summarizing conversations.");
+    for helper in [title, review, compaction] {
+        let (status, body) = turn(
+            router.clone(),
+            "/v1/messages",
+            &["s"],
+            helper,
+            accounts.clone(),
+        )
+        .await;
+        assert_eq!(
+            (status, &body["servedBy"]),
+            (StatusCode::OK, &json!("Bearer flaky-1"))
+        );
+    }
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    assert_eq!(
+        served(&router, &["s"], "claude-haiku-5-5", &accounts).await,
+        "Bearer flaky-1",
+        "an ordinary model change still resets"
+    );
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1"
+    );
+}
+
+#[tokio::test]
+async fn a_model_change_without_a_fallback_chain_still_forgets_the_route() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let accounts = pool(&[("first", "flaky-1"), ("second", "live-2")]);
+    upstream.flaky.store(true, Ordering::SeqCst);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer live-2"
+    );
+    upstream.flaky.store(false, Ordering::SeqCst);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header(POOL, accounts.clone())
+        .header(
+            POLICY,
+            r#"{"chains":{"codex":["codex"]},"on":{"server_error":true}}"#,
+        )
+        .header("x-claude-code-session-id", "s")
+        .body(Body::from(hi("gpt-6.1-sol").to_string()))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(*codex.seen.lock().unwrap(), ["gpt-6.1-sol"]);
+    assert_eq!(
+        served(&router, &["s"], "claude-opus-5-5", &accounts).await,
+        "Bearer flaky-1"
+    );
 }

@@ -4,7 +4,7 @@ use super::reducer::{
     AnthropicUsage, KimiUsage, ReducerEvent, StopReason, map_usage_to_anthropic,
     reduce_upstream_bytes,
 };
-use super::signature::make_thinking_signature;
+use crate::providers::translate_shared::ProxyReasoning;
 
 pub fn accumulate_response(
     input: &[u8],
@@ -112,7 +112,7 @@ pub fn accumulate_response(
                     content.push(serde_json::json!({
                         "type": "thinking",
                         "thinking": text,
-                        "signature": make_thinking_signature(message_id, block.index),
+                        "signature": ProxyReasoning::Kimi.sign(message_id, block.index),
                     }));
                 }
             }

@@ -206,7 +206,7 @@ fn prompt_renders_system_tools_and_messages() {
     }))
     .unwrap();
 
-    let rendered = render_cursor_prompt(&req);
+    let rendered = render_cursor_prompt(&req).unwrap();
     assert!(rendered.contains("<system>"));
     assert!(rendered.contains("<user>"));
     assert!(rendered.contains("<tools>"));

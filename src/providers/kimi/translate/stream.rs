@@ -1,6 +1,6 @@
 use super::reducer::{KimiReducer, ReducerEvent, map_usage_to_anthropic, reduce_upstream_bytes};
-use super::signature::make_thinking_signature;
 use crate::anthropic::sse::encode_sse_event;
+use crate::providers::translate_shared::ProxyReasoning;
 
 pub struct StreamEncoder {
     message_id: String,
@@ -66,7 +66,7 @@ impl StreamEncoder {
                         "index": index,
                         "delta": {
                             "type": "signature_delta",
-                            "signature": make_thinking_signature(&self.message_id, *index)
+                            "signature": ProxyReasoning::Kimi.sign(&self.message_id, *index)
                         }
                     });
                     emit(Some("content_block_delta"), &data.to_string());

@@ -4,8 +4,9 @@ use serde_json::Value;
 use super::model_allowlist::{KIMI_DEFAULT_MODEL, assert_allowed_model, is_k3, resolve_model};
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_block_to_url, image_source_to_url, normalize_content,
-    parallel_tool_calls, read_effort,
+    ContentBlock, ImageInput, ProxyReasoning, ensure_image, flatten_system_text,
+    image_block_to_url, image_source_to_url, normalize_content, parallel_tool_calls, read_effort,
+    tool_reference_text,
 };
 
 // ---------------------------------------------------------------------------
@@ -346,7 +347,18 @@ fn validate_request(req: &MessagesRequest) -> Result<(), anyhow::Error> {
         for block in blocks {
             let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
             let supported = match message.role.as_str() {
-                "assistant" => matches!(kind, "text" | "thinking" | "tool_use"),
+                "assistant" => {
+                    matches!(
+                        kind,
+                        "text"
+                            | "thinking"
+                            | "redacted_thinking"
+                            | "tool_use"
+                            | "server_tool_use"
+                            | "web_search_tool_result"
+                            | "x_search_tool_result"
+                    )
+                }
                 "user" => matches!(kind, "text" | "image" | "tool_result"),
                 "system" | "developer" => kind == "text",
                 _ => false,
@@ -356,6 +368,15 @@ fn validate_request(req: &MessagesRequest) -> Result<(), anyhow::Error> {
                 "Kimi does not support {kind} content in {} messages",
                 message.role
             );
+            if kind == "server_tool_use" {
+                anyhow::ensure!(
+                    crate::providers::translate_shared::public_history_text(block).is_some(),
+                    "Kimi does not support server_tool_use history for this tool"
+                );
+            }
+            if kind == "image" {
+                ensure_image(ImageInput::Any, block, "Kimi", "")?;
+            }
             if kind == "tool_result" {
                 if let Some(parts) = block.get("content").and_then(Value::as_array) {
                     for part in parts {
@@ -364,6 +385,9 @@ fn validate_request(req: &MessagesRequest) -> Result<(), anyhow::Error> {
                             matches!(kind, "text" | "image" | "tool_reference"),
                             "Kimi does not support tool result content {kind}"
                         );
+                        if kind == "image" {
+                            ensure_image(ImageInput::Any, part, "Kimi", " in tool results")?;
+                        }
                         if kind == "tool_reference" {
                             let name = part["tool_name"]
                                 .as_str()
@@ -784,9 +808,7 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
                     Some("tool_reference") => {
                         let name = b["tool_name"].as_str().unwrap_or("");
                         parts.push(KimiToolResultPart::Text {
-                            text: format!(
-                                "Tool available: {name}. Use its registered function schema."
-                            ),
+                            text: tool_reference_text(name),
                         });
                     }
                     Some(_) => unreachable!("tool result validated before translation"),
@@ -830,17 +852,8 @@ fn push_assistant_message(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
                 thinking,
                 signature,
             } => {
-                if !thinking.is_empty() {
-                    if signature
-                        .as_deref()
-                        .and_then(crate::providers::translate_shared::foreign_reasoning_provider)
-                        == Some("kimi")
-                    {
-                        thinking_parts.push(thinking.clone());
-                    } else {
-                        text_parts
-                            .push(crate::providers::translate_shared::wrap_reasoning(thinking));
-                    }
+                if !thinking.is_empty() && ProxyReasoning::Kimi.wrote(signature.as_deref()) {
+                    thinking_parts.push(thinking.clone());
                 }
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -1012,12 +1025,7 @@ mod tests {
                 tool_calls,
             } => {
                 assert_eq!(role, "assistant");
-                assert_eq!(
-                    content.as_deref(),
-                    Some(
-                        "<previous_reasoning>\nlet me think...\n</previous_reasoning>here's the answer"
-                    )
-                );
+                assert_eq!(content.as_deref(), Some("here's the answer"));
                 assert!(reasoning_content.is_none());
                 assert!(tool_calls.is_some());
                 let tcs = tool_calls.as_ref().unwrap();
@@ -1029,34 +1037,17 @@ mod tests {
     }
 
     #[test]
-    fn translate_empty_assistant_content_emits_empty_string() {
-        // When there are no text blocks and no tool calls but there is thinking
+    fn thinking_only_foreign_assistant_turn_is_dropped() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "kimi-for-coding",
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "thinking..."}
-                ]
-            }]
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "thinking..."},
+                {"type": "redacted_thinking", "data": "opaque"}
+            ]}]
         }))
         .unwrap();
         let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
-        assert_eq!(translated.messages.len(), 1);
-        match &translated.messages[0] {
-            KimiMessage::Assistant {
-                content,
-                reasoning_content,
-                ..
-            } => {
-                assert_eq!(
-                    content.as_deref(),
-                    Some("<previous_reasoning>\nthinking...\n</previous_reasoning>")
-                );
-                assert!(reasoning_content.is_none());
-            }
-            _ => panic!("expected Assistant message"),
-        }
+        assert!(translated.messages.is_empty());
     }
 
     #[test]
@@ -1067,7 +1058,7 @@ mod tests {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "describe this"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "xyz"}}
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}}
                 ]
             }]
         }))
@@ -1099,7 +1090,7 @@ mod tests {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "describe this"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "xyz"}}
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}}
                 ]
             }]
         }))

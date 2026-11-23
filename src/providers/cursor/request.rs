@@ -1,4 +1,14 @@
 use crate::anthropic::schema::MessagesRequest;
+use crate::providers::translate_shared::{
+    ImageInput, InputSupport, public_history_text, tool_reference_text,
+};
+
+/// Cursor receives base64 images as selected images; it cannot fetch a URL.
+const INPUT_SUPPORT: InputSupport = InputSupport {
+    backend: "cursor",
+    images: ImageInput::Base64,
+    tool_result_images: ImageInput::Base64,
+};
 
 /// A selected image extracted from the request content blocks.
 #[derive(Debug, Clone)]
@@ -15,7 +25,11 @@ pub struct CursorSelectedImage {
 /// - System message (with billing-header filtering)
 /// - Conversation messages with content blocks
 /// - Tools block
-pub fn render_cursor_prompt(req: &MessagesRequest) -> String {
+///
+/// Prior reasoning is not rendered: Cursor does not need it to continue, and as
+/// prompt text the model can echo it into its public answer.
+pub fn render_cursor_prompt(req: &MessagesRequest) -> anyhow::Result<String> {
+    INPUT_SUPPORT.ensure(req)?;
     let mut sections: Vec<String> = Vec::new();
 
     if let Some(system) = render_system(req) {
@@ -55,7 +69,7 @@ pub fn render_cursor_prompt(req: &MessagesRequest) -> String {
         }
     }
 
-    sections.join("\n\n")
+    Ok(sections.join("\n\n"))
 }
 
 /// Extract selected images from the request, mimicking `cursorSelectedImages`.
@@ -120,16 +134,15 @@ fn render_message_content(message: &crate::anthropic::schema::Message) -> Option
 }
 
 fn render_block(block: &serde_json::Value) -> Option<String> {
+    if let Some(text) = public_history_text(block) {
+        return Some(text);
+    }
     let block_type = block.get("type").and_then(|t| t.as_str())?;
     match block_type {
         "text" => block
             .get("text")
             .and_then(|t| t.as_str())
             .map(|s| s.to_string()),
-        "thinking" => {
-            let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-            Some(format!("<thinking>\n{text}\n</thinking>"))
-        }
         "image" => {
             let source = block.get("source")?;
             match source.get("type").and_then(|t| t.as_str()) {
@@ -176,37 +189,7 @@ fn render_block(block: &serde_json::Value) -> Option<String> {
                 "<tool_result tool_use_id=\"{tool_use_id}\"{error_attr}>\n{content}\n</tool_result>"
             ))
         }
-        "server_tool_use" => {
-            let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let input = block
-                .get("input")
-                .and_then(|i| serde_json::to_string(i).ok())
-                .unwrap_or_else(|| "{}".to_string());
-            Some(format!(
-                "<server_tool_use id=\"{id}\" name=\"{name}\">\n{input}\n</server_tool_use>"
-            ))
-        }
-        "web_search_tool_result" => {
-            let tool_use_id = block
-                .get("tool_use_id")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
-            let content = block
-                .get("content")
-                .and_then(|c| serde_json::to_string(c).ok())
-                .unwrap_or_else(|| "{}".to_string());
-            Some(format!(
-                "<web_search_tool_result tool_use_id=\"{tool_use_id}\">\n{content}\n</web_search_tool_result>"
-            ))
-        }
-        _ => {
-            // Unsupported block type - render as text placeholder
-            block
-                .get("text")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-        }
+        _ => None,
     }
 }
 
@@ -227,11 +210,11 @@ fn render_tool_result_content(block: &serde_json::Value) -> String {
 fn render_tool_result_block(block: &serde_json::Value) -> Option<String> {
     let block_type = block.get("type").and_then(|t| t.as_str())?;
     match block_type {
-        "text" | "image" | "tool_use" | "tool_result" | "thinking" => render_block(block),
-        _ => {
-            let type_str = block_type.to_string();
-            Some(format!("[unsupported tool result block: {type_str}]"))
-        }
+        "tool_reference" => block
+            .get("tool_name")
+            .and_then(|name| name.as_str())
+            .map(tool_reference_text),
+        _ => render_block(block),
     }
 }
 
@@ -314,7 +297,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.contains("<system>"));
         assert!(rendered.contains("be direct"));
         assert!(rendered.contains("</system>"));
@@ -331,7 +314,7 @@ mod tests {
             "tools": [{"name": "Read", "description": "read files", "input_schema": {"type": "object"}}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains("Read"));
     }
@@ -347,7 +330,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.contains("keep this"));
         assert!(!rendered.contains("x-anthropic-billing-header"));
     }
@@ -388,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_url_image_placeholder() {
+    fn refuses_url_images_it_cannot_attach() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{
@@ -399,12 +382,12 @@ mod tests {
             }]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
-        assert!(rendered.contains("[image: https://example.com/img.png]"));
+        let error = render_cursor_prompt(&req).unwrap_err().to_string();
+        assert_eq!(error, "cursor does not support url image content");
     }
 
     #[test]
-    fn renders_thinking_blocks() {
+    fn prior_thinking_is_not_rendered() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "assistant", "content": [
@@ -413,10 +396,8 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
-        assert!(rendered.contains("<thinking>"));
-        assert!(rendered.contains("let me think..."));
-        assert!(rendered.contains("done"));
+        let rendered = render_cursor_prompt(&req).unwrap();
+        assert_eq!(rendered, "<assistant>\ndone\n</assistant>");
     }
 
     #[test]
@@ -428,7 +409,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.contains("<tool_use id=\"tu1\" name=\"Read\">"));
     }
 
@@ -443,13 +424,13 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.contains("<tool_result tool_use_id=\"tu1\">"));
         assert!(rendered.contains("file contents"));
     }
 
     #[test]
-    fn handles_unsupported_block_types() {
+    fn refuses_unknown_block_types() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "user", "content": [
@@ -457,9 +438,11 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
-        // Unsupported blocks fall back to text rendering if they have a text field
-        assert!(rendered.contains("some fallback text"));
+        let error = render_cursor_prompt(&req).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "cursor does not support unknown_block content in user messages"
+        );
     }
 
     #[test]
@@ -469,7 +452,7 @@ mod tests {
             "messages": [{"role": "user", "content": ""}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
+        let rendered = render_cursor_prompt(&req).unwrap();
         assert!(rendered.is_empty() || !rendered.is_empty());
     }
 
@@ -495,12 +478,13 @@ mod tests {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "assistant", "content": [
-                {"type": "server_tool_use", "id": "st1", "name": "WebSearch", "input": {"query": "rust"}}
+                {"type": "server_tool_use", "id": "st1", "name": "web_search", "input": {"query": "rust"}}
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
-        assert!(rendered.contains("<server_tool_use id=\"st1\" name=\"WebSearch\">"));
+        let rendered = render_cursor_prompt(&req).unwrap();
+        assert!(rendered.contains("\"id\":\"st1\""));
+        assert!(rendered.contains("\"name\":\"web_search\""));
     }
 
     #[test]
@@ -512,7 +496,8 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let rendered = render_cursor_prompt(&req);
-        assert!(rendered.contains("<web_search_tool_result tool_use_id=\"ws1\">"));
+        let rendered = render_cursor_prompt(&req).unwrap();
+        assert!(rendered.contains("\"tool_use_id\":\"ws1\""));
+        assert!(rendered.contains("\"type\":\"web_search_tool_result\""));
     }
 }
