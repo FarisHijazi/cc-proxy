@@ -134,6 +134,26 @@ def test_discovery_lists_a_remote_control_session_once_under_its_tmux_pane():
     asyncio.run(check())
 
 
+def test_discovery_names_the_unattended_worker_a_session_is_a_run_of():
+    async def check():
+        bridge = "cse_" + "b" * 32
+        hq = mock_hq(listing=[
+            row(id="run", transport="tmux", provider="claude", tmux_session="hq-reply-radar-1",
+                host="Work / Work", bridge_session_id=bridge),
+            row(id="rc", transport="native", provider="claude", tmux_session=bridge, host="Remote Control"),
+            row(id="mine", transport="tmux", provider="claude", tmux_session="build", host="Work / Work"),
+        ])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        response = await agent.list_sessions("/local/fleet")
+        assert {entry.session_id: entry.field_meta["t3.codes/externalSessionIdentity"].get("worker")
+                for entry in response.sessions} == {"run": "hq-reply-radar-1", "rc": "hq-reply-radar-1",
+                                                    "mine": None}
+        assert hq.actions == []
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(("changes", "expected"), [
     ({"transport": "tmux", "tmux_session": "build", "title": "build"}, "build"),
     ({"transport": "tmux", "tmux_session": "build", "title": None}, "build"),
