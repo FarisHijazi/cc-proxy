@@ -343,6 +343,17 @@ function meter(name, w) {
 const isRun = (t) => t === "accounts" || /^accounts:\d+$/.test(t);
 // Console API keys sit outside the draggable order: a preferred one leads every pool, the rest follow it.
 const subscriptions = () => state.accounts.filter((a) => a.kind !== "api_key");
+// Spend is only what this proxy sent through the key since the 1st (UTC); null means unknown, never zero.
+function keySpend(a) {
+  if (a.spend_usd == null) return `<div class="small muted">spend unknown: no traffic database to read it from</div>`;
+  const spent = `$${a.spend_usd.toFixed(2)}`;
+  if (a.budget_usd == null) return `<div class="small muted">${spent} this month through the proxy · no budget set</div>`;
+  const pct = Math.min(100, a.spend_usd / a.budget_usd * 100), level = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
+  return `<div class="meter"><span class="muted">month</span>
+    <div class="track" title="Stops using the key before this budget; resets on the 1st, UTC"><div class="fill ${level}" style="width:${pct}%"></div></div>
+    <span>${Math.round(pct)}%</span></div>
+    <div class="small muted">${spent} of $${a.budget_usd.toFixed(2)} this month through the proxy; other users of the key are not counted</div>`;
+}
 function keyCard(a) {
   return `<div class="card ${a.disabled ? "off" : ""} ${a.preferred && !a.disabled ? "pref" : ""}">
       <div class="card-head">
@@ -350,7 +361,7 @@ function keyCard(a) {
         ${a.preferred ? `<span class="badge accent" title="Every session tries this key first, then the order below">tried first</span>` : `<span class="badge" title="Tried after every Claude account">after the accounts</span>`}
         <span class="badge" title="Console API key: billed per token; falls back when its credit or spend limit runs out">api key</span>
       </div>
-      <div class="small muted">no usage windows: a Console key is limited by credit and its workspace spend limit</div>
+      ${keySpend(a)}
       <div class="card-foot">
         <span class="small muted">${a.disabled ? "off: never tried" : "in the pool"}</span><span class="spacer"></span>
         <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>

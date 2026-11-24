@@ -65,12 +65,18 @@ def reply_tokens(body):
         found = data.get("usage") or (data.get("message") or {}).get("usage")
         if isinstance(found, dict):
             usage.update({k: v for k, v in found.items() if isinstance(v, int) and not isinstance(v, bool)})
+            split = found.get("cache_creation")
+            if isinstance(split, dict) and isinstance(split.get("ephemeral_1h_input_tokens"), int):
+                usage["cache_write_1h"] = split["ephemeral_1h_input_tokens"]
     if not usage:
         return None
     return {
+        # Cache writes are counted in "input" too; "cache_write" and its 1-hour part price them.
         "input": usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
         "cache_read": usage.get("cache_read_input_tokens", 0),
         "output": usage.get("output_tokens", 0),
+        "cache_write": usage.get("cache_creation_input_tokens", 0),
+        "cache_write_1h": usage.get("cache_write_1h", 0),
     }
 
 
@@ -110,8 +116,8 @@ def provider_usage(db, now=None, hours=WINDOW_HOURS, limit=ROW_LIMIT, catalog=No
         tokens = reply_tokens(body)
         if tokens:
             result[name]["tokens_reported"] += 1
-            for key, value in tokens.items():
-                result[name]["tokens"][key] += value
+            for key in result[name]["tokens"]:
+                result[name]["tokens"][key] += tokens[key]
     return {
         "source": "traffic database",
         "hours": hours,

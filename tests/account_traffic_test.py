@@ -326,3 +326,12 @@ def test_a_console_api_key_header_or_the_pool_carrying_it_is_never_stored():
     assert module.clean_header("X-Api-Key", "sk-ant-api03-fake-test-key") == "[redacted]"
     stored = module.clean_headers([("x-api-key", "sk-ant-api03-fake-test-key"), ("x-claude-codex-account-pool", pool)])
     assert "sk-ant-api03-fake" not in stored
+
+
+def test_cache_writes_and_their_one_hour_part_are_stored_for_pricing(tmp_path):
+    tokens = module.reply_tokens(zlib.compress(json.dumps({"usage": {
+        "input_tokens": 10, "cache_creation_input_tokens": 700, "cache_read_input_tokens": 5,
+        "cache_creation": {"ephemeral_5m_input_tokens": 300, "ephemeral_1h_input_tokens": 400},
+        "output_tokens": 3}}).encode()))
+    assert tokens == {"input": 710, "cache_read": 5, "output": 3, "cache_write": 700, "cache_write_1h": 400}
+    assert {"cache_write_tokens", "cache_write_1h_tokens"} <= set(module.TOKEN_COLUMNS)

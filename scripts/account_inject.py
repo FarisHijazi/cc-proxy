@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import runpy
+import sqlite3
 import subprocess
 import threading
 import time
@@ -81,6 +82,11 @@ GrantsUnavailable, PostgresGrants, read_key, write_private_json = (
     _grants[n] for n in ("GrantsUnavailable", "PostgresGrants", "read_key", "write_private_json")
 )
 CodexKeeper, CODEX_NAME = _grants["CodexKeeper"], _grants["CODEX_NAME"]
+month_spend = runpy.run_path(str(Path(__file__).with_name("account_key_spend.py")))["month_spend"]
+# A budgeted key's month-to-date spend is re-read this often, off the event loop; older than
+# SPEND_STALE_S (or never read) leaves the key out of the pool, because unknown spend is not zero.
+SPEND_EVERY_S = 10
+SPEND_STALE_S = 60
 
 
 class StillFetching(GrantsUnavailable):
@@ -273,11 +279,11 @@ class PostgresAffinity:
 
 
 def key_accounts(section, accounts):
-    """The accounts file's "api_key_accounts": {alias: {"key": "<Console key>", "preferred": bool}}.
+    """The accounts file's "api_key_accounts": {alias: {"key", "preferred", "monthly_budget_usd"}}.
     Errors never quote a key."""
     if not isinstance(section, dict):
         raise ValueError("api_key_accounts maps aliases to {key, preferred}")
-    keys, preferred = {}, []
+    keys, preferred, budgets = {}, [], {}
     for alias, member in section.items():
         if not ALIAS.fullmatch(alias) or alias in accounts:
             raise ValueError(f"api_key_accounts alias {alias!r} is invalid or also a subscription account")
@@ -287,7 +293,12 @@ def key_accounts(section, accounts):
         keys[alias] = member["key"]
         if member.get("preferred"):
             preferred.append(alias)
-    return keys, preferred
+        budget = member.get("monthly_budget_usd")
+        if budget is not None:
+            if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+                raise ValueError(f"api_key_accounts {alias!r} monthly_budget_usd must be a positive number")
+            budgets[alias] = float(budget)
+    return keys, preferred, budgets
 
 
 def codex_cli_auth_file():
@@ -332,6 +343,8 @@ class AccountInject:
         self.api_keys, self.main = {}, None
         # alias -> Console API key, and the aliases tried before any subscription ("api_key_accounts").
         self.keys, self.preferred = {}, []
+        # alias -> monthly USD cap, and alias -> (USD spent this month, when it was read).
+        self.budgets, self.spend, self.spend_thread = {}, {}, None
         # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
         self.usage = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
@@ -382,6 +395,9 @@ class AccountInject:
             self.read_accounts(Path(ctx.options.proxy_accounts_file))
         except (OSError, ValueError, KeyError, AttributeError):
             raise exceptions.OptionsError("Invalid proxy accounts file") from None
+        if self.budgets and self.spend_thread is None:
+            self.spend_thread = threading.Thread(target=self.track_spend, daemon=True, name="key-spend")
+            self.spend_thread.start()
         if self.grants is not None:
             try:
                 self.grants.reconcile_all()
@@ -424,7 +440,9 @@ class AccountInject:
             raise ValueError("session_models maps session ids to model ids")
         self.session_models = dict(session_models)
         self.api_keys = {k["sha256"]: k["name"] for k in data.get("api_keys", [])}
-        self.keys, self.preferred = key_accounts(data.get("api_key_accounts", {}), accounts)
+        self.keys, self.preferred, self.budgets = key_accounts(data.get("api_key_accounts", {}), accounts)
+        if self.budgets and not data.get("traffic_db"):
+            raise ValueError("a key's monthly_budget_usd needs traffic_db, where its spend is read from")
         self.main = data.get("main")
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
@@ -436,6 +454,32 @@ class AccountInject:
         self.chrome_profiles_file = Path(
             data.get("chrome_profiles_file", self.chrome_profiles_file)
         ).expanduser()
+
+    def track_spend(self):
+        """Keep each budgeted key's month-to-date spend fresh, reading the traffic database read-only."""
+        while True:
+            try:
+                path = Path(self.traffic_db).expanduser()
+                db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+                try:
+                    for alias in list(self.budgets):
+                        self.spend[alias] = (month_spend(db, alias), time.time())
+                finally:
+                    db.close()
+            except Exception as error:  # noqa: BLE001 - the spend goes stale and the key leaves the pool
+                logging.warning(f"reading key spend failed: {type(error).__name__}")
+            time.sleep(SPEND_EVERY_S)
+
+    def key_member(self, alias):
+        """The pool entry of a key, or None while its budget is used up or its spend is unknown."""
+        member = {"alias": alias, "kind": "api_key", "api_key": self.keys[alias], "primary": False}
+        if alias not in self.budgets:
+            return member
+        spent, read_at = self.spend.get(alias, (None, 0))
+        if spent is None or time.time() - read_at > SPEND_STALE_S or spent >= self.budgets[alias]:
+            return None
+        member["budget_usd"] = round(self.budgets[alias] - spent, 6)
+        return member
 
     def reload_accounts(self):
         # Added accounts join the fallback pool without restarting the proxy.
@@ -552,10 +596,10 @@ class AccountInject:
         # Accounts at the usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
         names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
-        keys = [k for k in self.keys if k not in self.disabled]
-        lead = [] if pinned else [k for k in keys if k in self.preferred]
-        pool = [{"alias": k, "kind": "api_key", "api_key": self.keys[k], "primary": False} for k in lead]
-        tail = [{"alias": k, "kind": "api_key", "api_key": self.keys[k], "primary": False} for k in keys if k not in lead]
+        members = [m for k in self.keys if k not in self.disabled and (m := self.key_member(k))]
+        lead = [] if pinned else [m["alias"] for m in members if m["alias"] in self.preferred]
+        pool = [m for m in members if m["alias"] in lead]
+        tail = [m for m in members if m["alias"] not in lead]
         if lead:
             pool[0]["primary"], alias = True, None  # the key starts the thread, so it owns it
         fetching = None

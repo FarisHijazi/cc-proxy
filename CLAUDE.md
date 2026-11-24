@@ -79,7 +79,7 @@ signed-in Google account. Before adding a backend, check it can work without a
 per-token-billed key — if it cannot, it does not belong here. The owner explicitly authorized
 Moonshot Open Platform API-key use for Kimi on 2026-11-19; this is a Kimi-only exception.
 On 2026-11-23 the owner also authorized one Anthropic Console API key as a pool member tried before
-the subscriptions; its workspace spend limit is the hard stop (see the quota fallback paragraph).
+the subscriptions; the proxy's own monthly budget stops it before Anthropic does (quota fallback paragraph).
 
 ## Architecture
 
@@ -275,15 +275,21 @@ emails (pattern shared by the three launcher scripts); the proxy file's `renamed
 that running sessions still send. A client's `main` sets the login claude.ai sees (artifacts,
 Remote Control, `/usage`); `balance.prefer` only picks inference. Read
 `docs/devlog/claude_20261024-quota-fallback.md` on demand (plain path).
-Console API keys: the `--serve` accounts file's `api_key_accounts` (`{alias: {"key", "preferred"}}`, never in the
-repo or a client) adds pool members of kind `api_key`. A `preferred` key leads every unpinned pool and owns the
-thread (`primary`); `balance` still orders the subscriptions after it; other keys go after them. `account_inject`
-never puts a key on the request itself, only in the pool; `PoolAccount::sign` sends it as `x-api-key` without
-`Authorization` (Claude Code's OAuth betas and body fields were measured to work with a key). A key's 402
-`billing_error`, or a 400 saying its credit is too low or its (workspace) API usage limit is reached, falls back
-under `on.rate_limit` and cools that key for every model until the 1st of next month, 00:00 UTC. Cooldowns are
-in memory, so after a restart an exhausted key is tried once more. See
-`docs/devlog/claude_20261123-console-api-key-pool.md` (plain path).
+Console API keys: the `--serve` accounts file's `api_key_accounts` (`{alias: {"key", "preferred",
+"monthly_budget_usd"}}`, never in the repo or a client) adds pool members of kind `api_key`. A `preferred` key leads
+every unpinned pool and owns the thread (`primary`); `balance` still orders the subscriptions after it; other keys
+go after them. `account_inject` never puts a key on the request itself, only in the pool; `PoolAccount::sign` sends
+it as `x-api-key` without `Authorization`, with `accept-encoding: identity` (Claude Code's OAuth betas and body
+fields were measured to work with a key). **Budget:** `scripts/account_key_spend.py` prices each answered reply
+(traffic DB `*_tokens` columns, incl. `cache_write_tokens`/`cache_write_1h_tokens`) with `scripts/anthropic_prices.json`,
+the only price table (the router `include_str!`s it). `account_inject` re-reads the month's spend every 10 s off the
+event loop and leaves the key out while it is unknown, older than a minute or at the budget; otherwise the pool
+member carries `budget_usd` left, and `key_budget::estimate_usd` (whole prompt at the 1-hour cache-write price plus
+up to 8,192 output tokens) skips any request that might not fit. Spend is only what the proxy sent: other users of
+the key are invisible (Anthropic's cost report needs an Admin key). A key's `billing_error`, a 400 saying its credit
+is too low or its API usage limit is reached, or an unreadable 400/402, falls back under `on.rate_limit`; the first
+two also cool that key for every model until the 1st of next month, 00:00 UTC (in memory only). Incident and
+measurements: `docs/devlog/claude_20261123-console-api-key-pool.md` (plain path).
 
 Saved accounts are claude-swap slots: cswap owns every refresh grant, and the launcher
 spends an expired non-live slot's grant only through cswap's `consume_backup_grant`.
@@ -335,7 +341,7 @@ runs on ONE event loop shared by every connection of every account. `account_tra
 plain data into a bounded queue; its writer thread owns SQLite and drops rows when behind. Writing inline
 stalled Remote Control for every machine once the DB reached 18 GB
 (`docs/devlog/claude_20261112-traffic-writer-off-event-loop.md`, plain path).
-Each model-call row also stores `input_tokens`/`cache_read_tokens`/`output_tokens` from the reply (parser:
+Each model-call row also stores `input_tokens` (cache writes included)/`cache_read_tokens`/`output_tokens`/`cache_write_tokens`/`cache_write_1h_tokens` from the reply (parser:
 `account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
 fills older rows. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's
 `served_models()` adds the same non-Claude ids to the `/model` picker at launch. The router's Claude ids come from Anthropic's own `/v1/models`. A `/v1/models` call that

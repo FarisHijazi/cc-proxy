@@ -30,7 +30,7 @@ from urllib.parse import unquote
 from mitmproxy.net import encoding
 
 reply_tokens = runpy.run_path(str(Path(__file__).with_name("account_providers.py")))["reply_tokens"]
-TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "output_tokens")
+TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "output_tokens", "cache_write_tokens", "cache_write_1h_tokens")
 FLOW_COLUMNS = (
     "id, started, finished, client_ip, client_host, client_user, launch_cwd, cwd, session_id, account, "
     "served_by, model, method, url, status, error, request_headers, request_body, response_headers, "
@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS flows (
     session_id TEXT, account TEXT, served_by TEXT, model TEXT,
     method TEXT, url TEXT, status INTEGER, error TEXT,
     request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB, api_key TEXT,
-    input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER
+    input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
+    cache_write_tokens INTEGER, cache_write_1h_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS flows_started ON flows(started);
 CREATE INDEX IF NOT EXISTS flows_session ON flows(session_id);
@@ -330,7 +331,7 @@ class TrafficDB:
             response_headers, served_by = clean_headers(items), lower.get(SERVED_BY_HEADER)
             tokens = reply_tokens(response_body) if model else None
         self.db.execute(
-            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 24)})",
+            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 26)})",
             (
                 meta["id"], meta["started"], meta["finished"],
                 meta["client_ip"], meta.get("client_host") or tailnet_name(meta["client_ip"]),
@@ -339,7 +340,8 @@ class TrafficDB:
                 meta["method"], meta["url"], meta.get("status"), meta["error"],
                 clean_headers(meta["request_headers"]), request_body, response_headers,
                 response_body, meta["api_key"],
-                *((tokens["input"], tokens["cache_read"], tokens["output"]) if tokens else (None, None, None)),
+                *((tokens["input"], tokens["cache_read"], tokens["output"], tokens["cache_write"], tokens["cache_write_1h"])
+                  if tokens else (None,) * 5),
             ),
         )
 
