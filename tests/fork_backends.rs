@@ -65,7 +65,8 @@ async fn gemini_models_are_advertised_when_available() {
     // so the server serves those ids as plain flash. They still route, because
     // any `gemini-*` id goes to gemini (`Registry::provider_for_model`).
     assert!(
-        !ids.iter().any(|id| id.contains("thinking")),
+        !ids.iter()
+            .any(|id| id.starts_with("gemini-") && id.contains("thinking")),
         "offered a model the backend substitutes: {ids:?}"
     );
 }
@@ -222,4 +223,36 @@ fn models_banner_lists_new_backends_after_the_upstream_order() {
     assert!(position("cursor-cli:") < position("gemini:"));
     // The anthropic passthrough is deliberately not a banner line.
     assert!(!stdout.contains("anthropic:"), "{stdout}");
+}
+
+/// agy serves `claude-*` ids of its own; only the prefix may send them to agy,
+/// and the bare Claude ids must stay on the Anthropic passthrough.
+#[test]
+fn agy_ids_route_to_agy_and_never_steal_claude_ids() {
+    let registry = registry();
+    for model in [
+        "agy",
+        "agy:claude-sonnet-4-6",
+        "agy:gemini-3.8-flash-high",
+        "agy-agent:gpt-oss-120b-medium",
+    ] {
+        assert_eq!(
+            registry
+                .provider_for_model(model, None)
+                .unwrap_or_else(|| panic!("{model} should route"))
+                .name(),
+            "agy",
+            "{model}"
+        );
+    }
+    for (model, provider) in [
+        ("claude-sonnet-4-6", "anthropic"),
+        ("gemini-3-flash", "gemini"),
+    ] {
+        assert_eq!(
+            registry.provider_for_model(model, None).unwrap().name(),
+            provider,
+            "{model}"
+        );
+    }
 }

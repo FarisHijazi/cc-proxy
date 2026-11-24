@@ -42,14 +42,14 @@ changes made on top of it.
 ## Invariants to preserve
 
 - The Anthropic passthrough stays byte-exact for native traffic. It drops unsigned
-  `thinking` and proxy-signed `thinking` (Codex, Kimi, Gemini/local, Cursor CLI),
+  `thinking` and proxy-signed `thinking` (Codex, Kimi, Gemini/local, Cursor CLI, agy),
   removing an assistant turn left empty. Genuine Anthropic signed and redacted
   thinking stays untouched. Only a changed body is reserialized.
 - Private reasoning is never converted to visible assistant text. Cross-provider
   history keeps answers and supported tool calls/results, not another provider's
   thinking. Codex replays its own encrypted continuation; Kimi and local replay
   only their proxy-marked reasoning in `reasoning_content`. Gemini/local share
-  the historical `ccp:gemini:v1:` marker. Cursor paths need no reasoning replay.
+  the historical `ccp:gemini:v1:` marker. Cursor and agy paths need no reasoning replay.
   `translate_shared::ProxyReasoning` owns the unchanged persisted marker formats.
 - Already-executed hosted web/X searches retain their complete public call/result
   records and text citations as deterministic text through `public_history_text`.
@@ -58,7 +58,7 @@ changes made on top of it.
 - Unsupported documents, audio, video, unknown content, and unsupported images
   must fail explicitly at translation, before calling upstream. Gemini/local
   move tool-result images into the following user image parts; Cursor API takes
-  base64 selected images, while Cursor CLI takes text only. Grok retains its
+  base64 selected images, while Cursor CLI and agy take text only. Grok retains its
   explicitly configured image policy. Do not infer model-specific vision or tool
   support from a provider's request format. `tests/history_translation.rs` covers
   source histories across destination translators; it is not a live capability

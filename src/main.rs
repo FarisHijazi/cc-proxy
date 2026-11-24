@@ -77,6 +77,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Check the Antigravity agy CLI backend
+    Agy {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +183,7 @@ fn main() -> Result<()> {
         Commands::Grok { command } => run_provider_cli("grok", command),
         Commands::Gemini { command } => run_provider_cli("gemini", command),
         Commands::CursorCli { command } => run_provider_cli("cursor-cli", command),
+        Commands::Agy { command } => run_provider_cli("agy", command),
     }
 }
 

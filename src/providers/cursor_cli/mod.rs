@@ -159,14 +159,16 @@ impl Provider for CursorCliProvider {
             return stream_agent_response(
                 agent,
                 options.timeout,
-                message_id,
-                model_label,
+                EventTranslator::new(message_id, model_label),
+                "cursor-agent",
                 ctx.monitor.clone(),
                 ctx.req_id.clone(),
             );
         }
 
-        let sse = match collect_agent_sse(agent, options.timeout, &message_id, &model_label).await {
+        let translator = EventTranslator::new(message_id.clone(), model_label.clone());
+        let sse = match collect_agent_sse(agent, options.timeout, translator, "cursor-agent").await
+        {
             Ok(sse) => sse,
             Err(error) => return json_error(StatusCode::BAD_GATEWAY, "api_error", error),
         };
@@ -241,7 +243,8 @@ impl Provider for CursorCliProvider {
             )
         })?;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let sse = collect_agent_sse(agent, options.timeout, &message_id, requested)
+        let translator = EventTranslator::new(message_id, requested);
+        let sse = collect_agent_sse(agent, options.timeout, translator, "cursor-agent")
             .await
             .map_err(|error| {
                 ProviderError::new(StatusCode::BAD_GATEWAY, ProviderErrorKind::Api, error)
@@ -263,14 +266,33 @@ impl Provider for CursorCliProvider {
     }
 }
 
+/// A headless CLI's stdout -> Anthropic SSE, shared by every backend that
+/// spawns an agent CLI.
+pub(crate) trait AgentTranslator: Send + 'static {
+    fn push_bytes(&mut self, chunk: &[u8]) -> Vec<u8>;
+    fn fail(&mut self, message: &str, out: &mut Vec<u8>);
+    fn is_finished(&self) -> bool;
+}
+
+impl AgentTranslator for EventTranslator {
+    fn push_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
+        EventTranslator::push_bytes(self, chunk)
+    }
+    fn fail(&mut self, message: &str, out: &mut Vec<u8>) {
+        EventTranslator::fail(self, message, out)
+    }
+    fn is_finished(&self) -> bool {
+        EventTranslator::is_finished(self)
+    }
+}
+
 /// Run to completion and return the full Anthropic SSE.
-async fn collect_agent_sse(
+pub(crate) async fn collect_agent_sse<T: AgentTranslator>(
     mut agent: process::RunningAgent,
     timeout: Duration,
-    message_id: &str,
-    model: &str,
+    mut translator: T,
+    label: &str,
 ) -> Result<Vec<u8>, String> {
-    let mut translator = EventTranslator::new(message_id, model);
     let mut out = Vec::new();
     let mut buffer = vec![0u8; 8192];
 
@@ -279,7 +301,7 @@ async fn collect_agent_sse(
             match agent.stdout.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(read) => out.extend(translator.push_bytes(&buffer[..read])),
-                Err(error) => return Err(format!("cursor-agent stdout read failed: {error}")),
+                Err(error) => return Err(format!("{label} stdout read failed: {error}")),
             }
         }
         Ok(())
@@ -291,7 +313,7 @@ async fn collect_agent_sse(
         Err(_) => {
             agent.kill().await;
             translator.fail(
-                &format!("cursor-agent timed out after {}s", timeout.as_secs()),
+                &format!("{label} timed out after {}s", timeout.as_secs()),
                 &mut out,
             );
             return Ok(out);
@@ -302,9 +324,9 @@ async fn collect_agent_sse(
         // No `result` event: the process died or printed nothing useful.
         let stderr = agent.stderr_tail().await;
         let detail = if stderr.is_empty() {
-            "cursor-agent exited without producing a result".to_string()
+            format!("{label} exited without producing a result")
         } else {
-            format!("cursor-agent failed: {stderr}")
+            format!("{label} failed: {stderr}")
         };
         translator.fail(&detail, &mut out);
     } else {
@@ -315,17 +337,17 @@ async fn collect_agent_sse(
 
 /// Stream the agent's output as it arrives, so a long run is visible while it
 /// is still going.
-fn stream_agent_response(
+pub(crate) fn stream_agent_response<T: AgentTranslator>(
     agent: process::RunningAgent,
     timeout: Duration,
-    message_id: String,
-    model: String,
+    translator: T,
+    label: &'static str,
     monitor: Option<MonitorHandle>,
     req_id: String,
 ) -> Response {
-    struct State {
+    struct State<T> {
         agent: Option<process::RunningAgent>,
-        translator: EventTranslator,
+        translator: T,
         buffer: Vec<u8>,
         monitor: Option<MonitorHandle>,
         req_id: String,
@@ -336,7 +358,7 @@ fn stream_agent_response(
 
     let state = State {
         agent: Some(agent),
-        translator: EventTranslator::new(message_id, model),
+        translator,
         buffer: vec![0u8; 8192],
         monitor,
         req_id,
@@ -366,9 +388,9 @@ fn stream_agent_response(
                         let mut agent = state.agent.take().expect("agent present");
                         let stderr = agent.stderr_tail().await;
                         let detail = if stderr.is_empty() {
-                            "cursor-agent exited without producing a result".to_string()
+                            format!("{label} exited without producing a result")
                         } else {
-                            format!("cursor-agent failed: {stderr}")
+                            format!("{label} failed: {stderr}")
                         };
                         state.translator.fail(&detail, &mut out);
                     } else if let Some(agent) = state.agent.take() {
@@ -412,7 +434,7 @@ fn stream_agent_response(
                     }
                     let mut out = Vec::new();
                     state.translator.fail(
-                        &format!("cursor-agent timed out after {}s", timeout.as_secs()),
+                        &format!("{label} timed out after {}s", timeout.as_secs()),
                         &mut out,
                     );
                     return Some((Ok::<Bytes, Infallible>(Bytes::from(out)), state));

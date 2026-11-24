@@ -30,7 +30,16 @@ const INPUT_SUPPORT: InputSupport = InputSupport {
 };
 
 pub fn render_prompt(req: &MessagesRequest) -> anyhow::Result<String> {
-    INPUT_SUPPORT.ensure(req)?;
+    render_prompt_for(req, INPUT_SUPPORT.backend)
+}
+
+/// The same text-only rendering for another agent CLI, named in its errors.
+pub fn render_prompt_for(req: &MessagesRequest, backend: &'static str) -> anyhow::Result<String> {
+    InputSupport {
+        backend,
+        ..INPUT_SUPPORT
+    }
+    .ensure(req)?;
     let mut sections: Vec<String> = Vec::new();
 
     if let Some(system) = flatten_system_text(req.extra.get("system")) {

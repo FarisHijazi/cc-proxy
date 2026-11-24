@@ -79,6 +79,10 @@ impl Registry {
             crate::providers::cursor_cli::models::supported_models(),
         );
         models.insert(
+            "agy".into(),
+            crate::providers::agy::models::supported_models(),
+        );
+        models.insert(
             "grok".into(),
             GROK_MODELS
                 .iter()
@@ -97,6 +101,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "cursor-cli" => Arc::new(crate::providers::cursor_cli::CursorCliProvider::new()),
+                "agy" => Arc::new(crate::providers::agy::AgyProvider::new()),
                 "gemini" => Arc::new(crate::providers::gemini::GeminiProvider::new()),
                 "local" => Arc::new(crate::providers::gemini::GeminiProvider::local()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
@@ -214,6 +219,9 @@ impl Registry {
             if provider == "cursor-cli" {
                 models.extend(crate::providers::cursor_cli::models::discovered_model_ids());
             }
+            if provider == "agy" {
+                models.extend(crate::providers::agy::models::discovered_model_ids());
+            }
             for model in models {
                 out.push((model, provider.clone()));
             }
@@ -247,6 +255,7 @@ impl Registry {
             ("kimi", "Kimi"),
             ("cursor", "Cursor API"),
             ("cursor-cli", "cursor-agent CLI"),
+            ("agy", "Antigravity agy CLI"),
             ("gemini", "Gemini"),
             ("grok", "Grok"),
             ("local", "Local"),
@@ -317,6 +326,9 @@ impl Registry {
         // can never be swallowed by a `cursor*` prefix match.
         if crate::providers::cursor_cli::models::is_cursor_cli_model(&normalized) {
             return self.handlers.get("cursor-cli").cloned();
+        }
+        if crate::providers::agy::models::is_agy_model(&normalized) {
+            return self.handlers.get("agy").cloned();
         }
         if is_cursor_model(&normalized) {
             return self.handlers.get("cursor").cloned();

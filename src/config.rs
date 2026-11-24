@@ -47,6 +47,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     #[serde(rename = "cursorCli")]
     pub cursor_cli: Option<CursorCliConfig>,
+    pub agy: Option<AgyConfig>,
     pub gemini: Option<GeminiConfig>,
     pub local: Option<LocalConfig>,
     pub grok: Option<GrokConfig>,
@@ -209,6 +210,17 @@ struct CursorCliConfig {
     pub workspace: Option<String>,
     #[serde(rename = "defaultModel")]
     pub default_model: Option<String>,
+}
+
+/// The Antigravity `agy` CLI backend. Same shape as `cursorCli`.
+#[derive(Deserialize, Clone)]
+struct AgyConfig {
+    pub binary: Option<String>,
+    #[serde(rename = "allowWrite")]
+    pub allow_write: Option<bool>,
+    #[serde(rename = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+    pub workspace: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1102,6 +1114,51 @@ pub fn cursor_cli_timeout_secs() -> u64 {
         return secs;
     }
     900
+}
+
+// ---------------------------------------------------------------------------
+// agy (Antigravity CLI) config
+// ---------------------------------------------------------------------------
+
+fn agy_file_config() -> Option<AgyConfig> {
+    read_file_config(&paths::config_dir())?.agy
+}
+
+pub fn agy_binary() -> String {
+    std::env::var("CCP_AGY_BINARY")
+        .ok()
+        .and_then(non_blank)
+        .or_else(|| agy_file_config()?.binary.and_then(non_blank))
+        .unwrap_or_else(|| "agy".to_string())
+}
+
+/// `agy-agent:` runs agy in `auto` mode, which edits the workspace; opt-in.
+pub fn agy_allow_write() -> bool {
+    if let Ok(raw) = std::env::var("CCP_AGY_ALLOW_WRITE") {
+        return matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    agy_file_config()
+        .and_then(|agy| agy.allow_write)
+        .unwrap_or(false)
+}
+
+pub fn agy_timeout_secs() -> u64 {
+    std::env::var("CCP_AGY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .or_else(|| agy_file_config()?.timeout_secs)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(900)
+}
+
+pub fn agy_workspace() -> Option<String> {
+    std::env::var("CCP_AGY_WORKSPACE")
+        .ok()
+        .and_then(non_blank)
+        .or_else(|| agy_file_config()?.workspace.and_then(non_blank))
 }
 
 /// List every backend, including ones nothing is signed into.

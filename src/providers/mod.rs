@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod anthropic;
 pub mod codex;
 pub mod cursor;

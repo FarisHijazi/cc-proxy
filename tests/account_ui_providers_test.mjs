@@ -21,7 +21,7 @@ const USAGE = {
   providers: {
     codex: { ...empty, requests: 407, errors: 9, last_at: NOW - 300, last_model: "gpt-6.1-sol", last_status: 200,
              tokens: { input: 2_494_465, cache_read: 90_654_848, output: 174_326 }, tokens_reported: 398 },
-    "cursor-cli": empty, cursor: empty, gemini: empty, kimi: empty, grok: empty,
+    "cursor-cli": empty, agy: empty, cursor: empty, gemini: empty, kimi: empty, grok: empty,
   },
 };
 
@@ -29,8 +29,8 @@ async function open(browser, { reachable = true, usage = USAGE, stall = false, q
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   const page = await ctx.newPage();
   const models = reachable ? { anthropic: ["claude-opus-5"], codex: ["gpt-6.1-sol"], gemini: ["gemini-3-pro"],
-                               cursor: [], "cursor-cli": [], kimi: [], grok: [] } : {};
-  const labels = { anthropic: "Claude", codex: "Codex", gemini: "Gemini", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI", kimi: "Kimi", grok: "Grok" };
+                               cursor: [], "cursor-cli": [], agy: [], kimi: [], grok: [] } : {};
+  const labels = { anthropic: "Claude", codex: "Codex", gemini: "Gemini", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI", agy: "Antigravity agy CLI", kimi: "Kimi", grok: "Grok" };
   const catalog = Object.fromEntries(Object.keys(models).map((p) => [p, { label: labels[p], family: p === "anthropic" ? "claude" : p, models: models[p] }]));
   if (catalog["cursor-cli"]) catalog["cursor-cli"].models = ["cursor-cli"];
   const state = {
@@ -66,7 +66,7 @@ try {
     assert.equal(await page.locator("#provider-cards").count(), 0, "no separate provider section");
     assert.doesNotMatch(await page.locator("main").innerText(), /Other backends/);
     const listed = await page.locator("#accounts .card").evaluateAll((els) => els.map((e) => e.dataset.target || e.querySelector(".name").textContent));
-    assert.deepEqual(listed, ["a@example.com", "codex", "cursor", "gemini", "cursor-cli", "kimi", "grok"],
+    assert.deepEqual(listed, ["a@example.com", "codex", "cursor", "gemini", "cursor-cli", "agy", "kimi", "grok"],
       "one flat list: the saved order, then every other catalog provider, switched off");
     const boxes = await page.locator("#accounts .card").evaluateAll(els => els.map(el => {
       const r = el.getBoundingClientRect();
@@ -74,7 +74,7 @@ try {
     }));
     assert(boxes.every(b => Math.abs(b.x - boxes[0].x) < 1 && Math.abs(b.width - boxes[0].width) < 1), "cards are one vertical column");
     assert(boxes.slice(1).every((b, i) => b.y >= boxes[i].bottom), "cards stack without overlap");
-    assert.equal(await page.locator("#accounts .card .switch").count(), 7, "every account and provider has an on/off switch");
+    assert.equal(await page.locator("#accounts .card .switch").count(), 8, "every account and provider has an on/off switch");
 
     const codex = await card(page, "codex").innerText();
     assert.match(codex, /signed in · 1 model/);
@@ -118,7 +118,9 @@ try {
       { label: "API", used: 35.42, limit: 100, unit: "%", resets_at: null },
       { label: "On-demand", used: 2.5, limit: null, unit: "USD", resets_at: null }] },
       codex: { source: "ChatGPT usage API (Codex CLI login)", at: NOW, note: "prolite plan; one budget shared by Codex CLI and the router",
-        windows: [{ label: "Weekly", used: 6, limit: 100, unit: "%", resets_at: new Date((NOW + 6 * 86400) * 1000).toISOString() }] } };
+        windows: [{ label: "Weekly", used: 6, limit: 100, unit: "%", resets_at: new Date((NOW + 6 * 86400) * 1000).toISOString() }] },
+      agy: { source: "Antigravity Cloud Code quota (agy login)", at: NOW, note: "one quota per agy login",
+        windows: [{ label: "Claude and GPT models · 5-hour", used: 8.4, limit: 100, unit: "%", resets_at: new Date((NOW + 4 * 3600) * 1000).toISOString() }] } };
     const { page, close } = await open(browser, { quota });
     await card(page, "cursor-cli").waitFor();
     const cli = await card(page, "cursor-cli").innerText();
@@ -129,6 +131,9 @@ try {
     assert.match(codex, /Weekly\s+6%/); assert.match(codex, /Quota from ChatGPT usage API \(Codex CLI login\)/);
     assert.doesNotMatch(codex, /Quota: unknown|of 100 %/);
     assert.match(await card(page, "cursor").innerText(), /Quota: unknown.*own Cursor login/s, "the API backend may use another Cursor login");
+    const agy = await card(page, "agy").innerText();
+    assert.match(agy, /Claude and GPT models · 5-hour\s+8%/); assert.match(agy, /Quota from Antigravity Cloud Code quota \(agy login\)/);
+    assert.doesNotMatch(agy, /Quota: unknown|of 100 %/);
     await close();
     console.log("ok vendor quota");
   }
