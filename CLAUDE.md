@@ -143,6 +143,11 @@ any of the three.
    `public_model_ids()` for listing and `all_public_model_ids()` for routing. Moonshot Open Platform uses
    `CCP_KIMI_BASE_URL=https://api.moonshot.ai/v1` and prefixed upstream IDs. A kimi.ai Coding account uses
    `CCP_KIMI_OAUTH_HOST=https://auth.kimi.ai` and `CCP_KIMI_BASE_URL=https://api.kimi.ai/coding/v1`.
+   Kimi has two credentials, tried in order by `providers/kimi/client.rs` `lanes()`: the Kimi login
+   (`kimi/auth.json`, OAuth, at `CCP_KIMI_BASE_URL`), then the Moonshot Open Platform API key
+   (`kimi/api_key`, plain text, mode 600, at `CCP_KIMI_API_KEY_BASE_URL`, default `https://api.moonshot.ai/v1`).
+   A 401/402/403/429 on one hands over to the next; a spent quota or balance is never retried; the last
+   lane's 429 reaches the fallback chain. Never write an API key into `auth.json`: it replaces the login.
    Kimi streams incrementally. Unsupported model IDs and content fail explicitly.
    `tests/kimi_parity.rs` covers streaming, cancellation, errors, and fallback before output.
 7. **`cursor-cli` follows the caller, and `--workspace` is not a sandbox.**

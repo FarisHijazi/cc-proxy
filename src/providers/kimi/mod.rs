@@ -18,7 +18,9 @@ use crate::provider::{
 };
 use crate::providers::kimi::auth::token_store::file_store;
 use crate::providers::kimi::translate::model_allowlist::public_model_ids;
-use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, resolve_model};
+use crate::providers::kimi::translate::model_allowlist::{
+    allowed_on, assert_allowed_model, resolve_model, resolve_model_for_endpoint,
+};
 use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
 
 fn now_ms() -> u64 {
@@ -44,8 +46,11 @@ impl KimiProvider {
 
 #[async_trait]
 impl Provider for KimiProvider {
-    /// Kimi signs in through this proxy, so its own auth file is the whole test.
+    /// Kimi signs in through this proxy: its login file or its API key file is the whole test.
     fn availability(&self) -> crate::provider::Availability {
+        if client::api_key().is_some() {
+            return crate::provider::Availability::Ready;
+        }
         crate::provider::Availability::from_file(
             &crate::paths::provider_auth_file("kimi"),
             "run `claude-codex kimi login`",
@@ -160,8 +165,7 @@ impl Provider for KimiProvider {
             .model
             .clone()
             .unwrap_or_else(|| "kimi-for-coding".to_string());
-        let resolved = resolve_model(&requested);
-        assert_allowed_model(&resolved).map_err(|error| {
+        assert_allowed_model(&resolve_model(&requested)).map_err(|error| {
             ProviderError::new(
                 StatusCode::BAD_REQUEST,
                 ProviderErrorKind::InvalidRequest,
@@ -171,10 +175,7 @@ impl Provider for KimiProvider {
                 ),
             )
         })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
-        let translated = translate_request(
+        let mut translated = translate_request(
             &body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
@@ -187,19 +188,9 @@ impl Provider for KimiProvider {
                 error.to_string(),
             )
         })?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_json(
-                "020-upstream-request",
-                &serde_json::to_value(&translated).unwrap_or_default(),
-            );
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = client::KimiHttpClient::new()
-            .post_kimi(&translated)
-            .await
-            .map_err(kimi_provider_error)?;
+        let (upstream, resolved) = self
+            .post_first_lane(&mut translated, &requested, &ctx)
+            .await?;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let translator = translate::stream::LiveTranslator::new(&message_id, &requested);
         use futures_util::StreamExt;
@@ -262,6 +253,49 @@ impl Provider for KimiProvider {
             body: GenerationBody::LiveSse(axum::body::Body::from_stream(stream)),
             resolved_model: resolved,
         })
+    }
+}
+
+impl KimiProvider {
+    /// Login first, then the API key. A lane out of quota or credit, or rejecting its
+    /// credential, hands over to the next; the last lane's error goes to the fallback chain.
+    async fn post_first_lane(
+        &self,
+        translated: &mut translate::request::KimiChatRequest,
+        requested: &str,
+        ctx: &RequestContext,
+    ) -> Result<(client::KimiResponse, String), ProviderError> {
+        let http = client::KimiHttpClient::new();
+        let mut last = None;
+        for lane in client::lanes() {
+            let model = resolve_model_for_endpoint(requested, lane.endpoint);
+            if !allowed_on(&model, lane.endpoint) {
+                continue;
+            }
+            translated.model = model.clone();
+            if let Some(traffic) = ctx.traffic.as_ref() {
+                traffic.write_json(
+                    "020-upstream-request",
+                    &serde_json::to_value(&*translated).unwrap_or_default(),
+                );
+            }
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.model_resolved(&ctx.req_id, &model);
+                monitor.upstream_started(&ctx.req_id);
+            }
+            match http.post_kimi(translated, &lane).await {
+                Ok(upstream) => return Ok((upstream, model)),
+                Err(error) if error.lane_exhausted() => last = Some(error),
+                Err(error) => return Err(kimi_provider_error(error)),
+            }
+        }
+        Err(last.map(kimi_provider_error).unwrap_or_else(|| {
+            ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                format!("Model \"{requested}\" is not served by any configured Kimi credential"),
+            )
+        }))
     }
 }
 

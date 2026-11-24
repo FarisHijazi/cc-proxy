@@ -271,6 +271,7 @@ impl Registry {
                 let base = crate::config::kimi_base_url();
                 entry["balance_base_url"] = serde_json::json!(if base.trim_end_matches('/')
                     == "https://api.moonshot.ai/v1"
+                    || crate::providers::kimi::client::api_key().is_some()
                 {
                     Some("https://api.moonshot.ai/v1")
                 } else {
