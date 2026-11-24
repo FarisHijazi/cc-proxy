@@ -134,7 +134,18 @@ async fn pdf_tool_results_fall_back_intact_before_codex_for_json_and_streaming()
         let response = exhausted_router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
-    assert_eq!(exhausted.seen.lock().unwrap().len(), 1);
+    // A rejected document request never cools the account for anyone else.
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 2);
+    let (status, _) = send(
+        exhausted_router,
+        "claude-opus-5-5",
+        Some(pool(&[("dead", "dead")])),
+        false,
+    )
+    .await;
+    // The account is still tried (then Codex answers): no cooldown skipped it.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 3);
     task.abort();
 }
 

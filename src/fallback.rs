@@ -1012,7 +1012,14 @@ pub async fn dispatch(
             };
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
-        if !count_tokens && !server_error && !unavailable && refused == Refusal::Other {
+        // A native-document request is rarer and differently shaped than ordinary traffic, so
+        // its rejection must not cool an account that is still serving everything else.
+        if !count_tokens
+            && !native_document
+            && !server_error
+            && !unavailable
+            && refused == Refusal::Other
+        {
             registry
                 .cooldowns
                 .record_rejection(&owner, &model, response.headers());
