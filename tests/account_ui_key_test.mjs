@@ -13,7 +13,7 @@ const { chromium } = createRequire(join(root, "x.js"))("playwright");
 const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../scripts/account_ui.html"), "utf8");
 
 const KEY = { alias: "console-key", kind: "api_key", preferred: true, slot: null, email: null, plan: "api key",
-  usage: {}, usage_at: null, token_only: false, error: null, disabled: false };
+  usage: {}, usage_at: null, token_only: false, error: null, disabled: false, spend_usd: 150.5, budget_usd: 180 };
 const ACCOUNTS = [
   { alias: "a@example.com", email: "a@example.com", slot: 1, usage: {} },
   { alias: "b@example.com", email: "b@example.com", slot: 2, usage: {} },
@@ -53,6 +53,7 @@ try {
   const first = page.locator("#accounts .card").first();
   assert.match(await first.innerText(), /console-key[\s\S]*tried first[\s\S]*api key/);
   assert.equal(await first.locator(".handle").count(), 0, "the key card is not draggable");
+  assert.match(await first.innerText(), /84%[\s\S]*\$150\.50 of \$180\.00 this month/, "spend against the budget");
   assert.equal(await page.locator('#accounts .card[data-i] .name').allTextContents().then((n) => n.includes("console-key")), false);
 
   await page.locator("#accounts .card[data-i]").nth(1).locator("[data-up]").click();

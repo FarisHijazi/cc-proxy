@@ -298,7 +298,7 @@ def test_a_console_key_account_is_shown_and_toggled_but_its_key_never_leaves_the
     card = board.key_account("console", saved)
     assert card == {"alias": "console", "kind": "api_key", "preferred": True, "disabled": True,
                     "usage": {}, "usage_at": None, "token_only": False, "error": None,
-                    "slot": None, "email": None, "plan": "api key"}
+                    "slot": None, "email": None, "plan": "api key", "spend_usd": None, "budget_usd": None}
     assert "sk-ant" not in json.dumps(card)
     with pytest.raises(ValueError):
         board.update({"balance": {"strategy": "prefer", "prefer": "console"}})

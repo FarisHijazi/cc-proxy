@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod fallback;
 pub mod inbound_auth;
+pub mod key_budget;
 pub mod logging;
 pub mod monitor;
 pub mod openai_compat;

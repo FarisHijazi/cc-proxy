@@ -50,6 +50,10 @@ pub struct PoolAccount {
     /// A Console API key (`"kind": "api_key"`), sent as `x-api-key` in place of a login.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// USD left of a key's monthly budget (`account_inject` reads the spend); a request whose
+    /// estimate does not fit never reaches the key.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
     #[serde(default)]
     pub primary: bool,
 }
@@ -78,6 +82,9 @@ impl PoolAccount {
         if self.api_key.is_some() {
             // Measured: a key accepts Claude Code's request as is, OAuth beta flags included.
             headers.remove("authorization");
+            // Its refusals must stay readable: the router never decompresses, and Anthropic
+            // sent the credit error brotli-compressed (2026-11-23), so it reached the client.
+            headers.insert("accept-encoding", HeaderValue::from_static("identity"));
         }
         headers.insert(name, value);
         true
@@ -687,24 +694,34 @@ fn cooldown_until(headers: &HeaderMap) -> u64 {
     now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs())
 }
 
-/// A Console key's credit or spend limit ran out. Matched conservatively on the documented forms:
-/// a 402 `billing_error`, or a 400 "credit balance is too low" / "reached your specified (workspace)
-/// API usage limits".
-fn out_of_credit(status: StatusCode, body: &[u8]) -> bool {
+/// How a Console key refused a request.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// Its credit or spend limit ran out: any `billing_error`, or a 400 "credit balance is too low"
+    /// (recorded live) / "reached your specified (workspace) API usage limits".
+    OutOfCredit,
+    /// Not readable JSON (still encoded, say): may be the credit error, so another account answers.
+    Unreadable,
+    /// A real bad request, returned to the client.
+    Other,
+}
+
+fn refusal(status: StatusCode, body: &[u8]) -> Refusal {
     let Ok(reply) = serde_json::from_slice::<Value>(body) else {
-        return false;
+        return Refusal::Unreadable;
     };
     let error = &reply["error"];
     let message = error["message"].as_str().unwrap_or_default().to_lowercase();
-    match status {
-        StatusCode::PAYMENT_REQUIRED => error["type"] == "billing_error",
-        StatusCode::BAD_REQUEST => {
-            error["type"] == "invalid_request_error"
-                && (message.contains("credit balance is too low")
-                    || message.contains("reached your specified")
-                        && message.contains("api usage limits"))
-        }
-        _ => false,
+    let spent = error["type"] == "billing_error"
+        || status == StatusCode::BAD_REQUEST
+            && error["type"] == "invalid_request_error"
+            && (message.contains("credit balance is too low")
+                || message.contains("reached your specified")
+                    && message.contains("api usage limits"));
+    if spent {
+        Refusal::OutOfCredit
+    } else {
+        Refusal::Other
     }
 }
 
@@ -853,7 +870,12 @@ pub async fn dispatch(
         } else {
             registry.cooldowns.cooling(&owner, &model)
         };
-        if cooling {
+        // A key's budget is checked before it is spent: a request that may not fit goes elsewhere.
+        let over_budget = !count_tokens
+            && matches!(&step, Step::Account(index, model) if pool[*index].budget_usd.is_some_and(|left| {
+                !crate::key_budget::estimate_usd(model, &attempt_body).is_some_and(|cost| cost <= left)
+            }));
+        if cooling || over_budget {
             skipped_cooling = true;
             continue;
         }
@@ -899,7 +921,7 @@ pub async fn dispatch(
         .await;
         let status = response.status();
         let keyed = matches!(step, Step::Account(index, _) if pool[index].api_key.is_some());
-        let (response, spent) = if keyed
+        let (response, refused) = if keyed
             && matches!(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::PAYMENT_REQUIRED
@@ -908,11 +930,12 @@ pub async fn dispatch(
             let body = axum::body::to_bytes(body, 1 << 20)
                 .await
                 .unwrap_or_default();
-            let spent = out_of_credit(status, &body);
-            (Response::from_parts(parts, Body::from(body)), spent)
+            let refused = refusal(status, &body);
+            (Response::from_parts(parts, Body::from(body)), refused)
         } else {
-            (response, false)
+            (response, Refusal::Other)
         };
+        let spent = refused == Refusal::OutOfCredit;
         if spent && policy.on.rate_limit {
             let until = next_month(now());
             registry.cooldowns.exhaust(&owner, until);
@@ -925,7 +948,9 @@ pub async fn dispatch(
                 ])),
             );
         }
-        let quota = (status == StatusCode::TOO_MANY_REQUESTS || spent) && policy.on.rate_limit;
+        let quota =
+            (status == StatusCode::TOO_MANY_REQUESTS || spent || refused == Refusal::Unreadable)
+                && policy.on.rate_limit;
         let credential_rejected = matches!(step, Step::Account(_, _))
             && status == StatusCode::UNAUTHORIZED
             && policy.on.auth;
@@ -957,7 +982,7 @@ pub async fn dispatch(
             };
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
-        if !count_tokens && !server_error && !unavailable && !spent {
+        if !count_tokens && !server_error && !unavailable && refused == Refusal::Other {
             registry
                 .cooldowns
                 .record_rejection(&owner, &model, response.headers());
@@ -1524,6 +1549,7 @@ mod tests {
         let pool = Pool {
             accounts: vec![PoolAccount {
                 api_key: None,
+                budget_usd: None,
                 alias: "owner".into(),
                 authorization: "Bearer token".into(),
                 primary: true,
@@ -1567,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_documented_credit_errors_count_as_out_of_credit() {
+    fn only_credit_errors_count_as_out_of_credit_and_unreadable_ones_are_flagged() {
         let error = |kind: &str, message: &str| {
             json!({"type": "error", "error": {"type": kind, "message": message}}).to_string()
         };
@@ -1579,18 +1605,35 @@ mod tests {
             "invalid_request_error",
             "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.",
         );
+        let billing = error("billing_error", "Credit balance is too low");
         let bad = error(
             "invalid_request_error",
             "messages: text content blocks must be non-empty",
         );
-        assert!(out_of_credit(StatusCode::BAD_REQUEST, credit.as_bytes()));
-        assert!(out_of_credit(StatusCode::BAD_REQUEST, org.as_bytes()));
-        assert!(!out_of_credit(StatusCode::BAD_REQUEST, bad.as_bytes()));
-        assert!(!out_of_credit(
-            StatusCode::TOO_MANY_REQUESTS,
-            credit.as_bytes()
-        ));
-        assert!(!out_of_credit(StatusCode::BAD_REQUEST, b"not json"));
+        assert_eq!(
+            refusal(StatusCode::BAD_REQUEST, credit.as_bytes()),
+            Refusal::OutOfCredit
+        );
+        assert_eq!(
+            refusal(StatusCode::BAD_REQUEST, org.as_bytes()),
+            Refusal::OutOfCredit
+        );
+        assert_eq!(
+            refusal(StatusCode::BAD_REQUEST, billing.as_bytes()),
+            Refusal::OutOfCredit
+        );
+        assert_eq!(
+            refusal(StatusCode::PAYMENT_REQUIRED, billing.as_bytes()),
+            Refusal::OutOfCredit
+        );
+        assert_eq!(
+            refusal(StatusCode::BAD_REQUEST, bad.as_bytes()),
+            Refusal::Other
+        );
+        assert_eq!(
+            refusal(StatusCode::BAD_REQUEST, &[0x1b, 0x8f, 0x01]),
+            Refusal::Unreadable
+        );
     }
 
     #[test]

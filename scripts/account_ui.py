@@ -189,6 +189,9 @@ def usage_size(entry):
     return sum(entry["tokens"].values()), entry["requests"]
 
 
+month_spend = runpy.run_path(str(Path(__file__).with_name("account_key_spend.py")))["month_spend"]
+
+
 def private_write(path, data):
     """Replace `path` with a file that is private from its first byte: it may hold a Console API key."""
     tmp = path.with_name(path.name + ".ui-tmp")
@@ -286,14 +289,18 @@ class Dashboard:
             "disabled": alias in cfg.get("disabled", []),
         }
 
-    @staticmethod
-    def key_account(alias, cfg):
-        """A Console API key in the pool: shown and switchable like an account, its key never leaves the file."""
+    def key_account(self, alias, cfg):
+        """A Console API key in the pool: shown and switchable like an account, its key never leaves the file.
+        `spend_usd` is what the proxy spent through it this month; None (unknown) without a traffic database."""
+        member = cfg["api_key_accounts"][alias]
+        db = self.database(cfg)
         return {
             "alias": alias, "kind": "api_key", "slot": None, "email": None, "plan": "api key",
-            "preferred": cfg["api_key_accounts"][alias].get("preferred") is True,
+            "preferred": member.get("preferred") is True,
             "usage": {}, "usage_at": None, "token_only": False, "error": None,
             "disabled": alias in cfg.get("disabled", []),
+            "spend_usd": round(month_spend(db, alias), 4) if db else None,
+            "budget_usd": member.get("monthly_budget_usd"),
         }
 
     def recorded_provider_usage(self, cfg):

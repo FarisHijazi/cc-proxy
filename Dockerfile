@@ -3,6 +3,7 @@ FROM rust:1-bookworm AS router
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
+COPY scripts/anthropic_prices.json scripts/anthropic_prices.json
 RUN cargo build --release --locked
 
 FROM python:3.12-slim-bookworm

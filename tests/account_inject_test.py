@@ -954,3 +954,38 @@ def test_a_malformed_key_account_is_refused(monkeypatch, tmp_path, key_accounts)
     with pytest.raises(ValueError) as error:
         inject.read_accounts(path)
     assert FAKE_KEY not in str(error.value)
+
+
+def budgeted(monkeypatch, tmp_path, spend):
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True, "monthly_budget_usd": 180},
+                      traffic_db=str(tmp_path / "traffic.sqlite3"))
+    if spend is not None:
+        inject.spend["console"] = spend
+    return inject
+
+
+def test_a_budgeted_key_tells_the_router_what_is_left_of_its_monthly_budget(monkeypatch, tmp_path):
+    inject = budgeted(monkeypatch, tmp_path, (179.25, time.time()))
+    _, pool = pool_of(inject)
+    assert pool[0]["alias"] == "console" and pool[0]["budget_usd"] == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("spend", [None, (10.0, time.time() - module.SPEND_STALE_S - 1), (180.0, time.time()), (190.0, time.time())],
+                         ids=["never-read", "stale", "at-cap", "over-cap"])
+def test_a_key_whose_spend_is_unknown_or_at_its_budget_is_left_out(monkeypatch, tmp_path, spend):
+    inject = budgeted(monkeypatch, tmp_path, spend)
+    _, pool = pool_of(inject)
+    assert [e["alias"] for e in pool] == ["a", "b"]
+    assert pool[0]["primary"] is True, "the session's subscription owns the thread instead"
+
+
+@pytest.mark.parametrize("member", [{"monthly_budget_usd": 0}, {"monthly_budget_usd": -5}, {"monthly_budget_usd": "180"},
+                                    {"monthly_budget_usd": True}])
+def test_a_malformed_budget_is_refused(monkeypatch, tmp_path, member):
+    with pytest.raises(ValueError):
+        with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, **member}, traffic_db=str(tmp_path / "t.sqlite3"))
+
+
+def test_a_budget_without_a_traffic_database_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ValueError):
+        with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "monthly_budget_usd": 180})

@@ -30,12 +30,12 @@ STREAMED = sse(
 
 
 def test_sse_usage_takes_the_final_delta_over_message_start():
-    assert providers["reply_tokens"](STREAMED) == {"input": 40, "cache_read": 60, "output": 7}
+    assert providers["reply_tokens"](STREAMED) == {"input": 40, "cache_read": 60, "output": 7, "cache_write": 0, "cache_write_1h": 0}
 
 
 def test_plain_json_reply_and_reply_without_usage():
     body = zlib.compress(json.dumps({"usage": {"input_tokens": 3, "output_tokens": 2}}).encode())
-    assert providers["reply_tokens"](body) == {"input": 3, "cache_read": 0, "output": 2}
+    assert providers["reply_tokens"](body) == {"input": 3, "cache_read": 0, "output": 2, "cache_write": 0, "cache_write_1h": 0}
     assert providers["reply_tokens"](zlib.compress(b"upstream error")) is None
     assert providers["reply_tokens"](None) is None
 
