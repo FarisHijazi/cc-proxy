@@ -114,6 +114,26 @@ def test_discovery_shows_the_owners_title_machine_and_live_state():
     asyncio.run(check())
 
 
+def test_discovery_lists_a_remote_control_session_once_under_its_tmux_pane():
+    async def check():
+        bridge = "cse_" + "b" * 32
+        hq = mock_hq(listing=[
+            row(id="pane", transport="tmux", provider="claude", tmux_session="build", host="Work / Work",
+                bridge_session_id=bridge),
+            row(id="rc", transport="native", provider="claude", tmux_session=bridge, host="Remote Control"),
+            row(id="other", transport="native", provider="claude", tmux_session="cse_" + "c" * 32,
+                host="Remote Control"),
+        ])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        response = await agent.list_sessions("/local/fleet")
+        assert {entry.session_id: entry.field_meta["t3.codes/externalSessionIdentity"].get("duplicateOf")
+                for entry in response.sessions} == {"pane": None, "rc": "pane", "other": None}
+        assert hq.actions == []
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(("changes", "expected"), [
     ({"transport": "tmux", "tmux_session": "build", "title": "build"}, "build"),
     ({"transport": "tmux", "tmux_session": "build", "title": None}, "build"),

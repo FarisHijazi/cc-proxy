@@ -289,11 +289,18 @@ class FleetAgent(Agent):
             if matching:
                 start = matching[0] + 1
         selected = rows[start:start + 100]
+        # A Remote Control session running inside a listed tmux pane is that pane's session.
+        panes = {row["bridge_session_id"]: row["id"] for row in rows
+                 if row.get("transport") == "tmux" and row.get("bridge_session_id")}
         sessions = []
         for row in selected:
             tmux_session = row.get("tmux_session") if row.get("transport", "tmux") == "tmux" else None
             title = row.get("title") or tmux_session or row.get("session") or row["id"]
-            meta = ({**(identity_meta(external_identity(row)) or {}),
+            identity = external_identity(row)
+            pane = panes.get(row.get("tmux_session")) if row.get("transport") == "native" else None
+            if identity and pane:
+                identity["duplicateOf"] = pane
+            meta = ({**(identity_meta(identity) or {}),
                      "t3.codes/externalSessionState": {"version": 1, "state": external_state(row)}}
                     if self.external_session else None)
             sessions.append(s.SessionInfo(session_id=row["id"], cwd=row.get("workdir") or cwd or "/",
