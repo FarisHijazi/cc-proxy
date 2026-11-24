@@ -68,6 +68,7 @@ def test_untagged_rows_are_classified_by_the_requested_model():
         (NOW - 50, None, "gemini-3-pro[1m]", 200, STREAMED),
         (NOW - 60, None, "kimi-k3", 200, None),
         (NOW - 70, None, "grok-4.5", 200, None),
+        (NOW - 75, None, "glm-4.6", 200, None),
         (NOW - 80, None, "claude-opus-5", 400, None),
         (NOW - 90, None, "opus", 200, None),
         (NOW - 95, None, "made-up-model", 400, None),
@@ -78,7 +79,7 @@ def test_untagged_rows_are_classified_by_the_requested_model():
     ])
     found = providers["provider_usage"](db, now=NOW)["providers"]
     assert {name: card["requests"] for name, card in found.items()} == {
-        "codex": 0, "cursor-cli": 2, "agy": 2, "cursor": 2, "gemini": 2, "kimi": 1, "grok": 1}
+        "codex": 0, "cursor-cli": 2, "agy": 2, "cursor": 2, "gemini": 2, "kimi": 1, "grok": 1, "zai": 1}
     assert found["agy"]["last_model"] == "agy:claude-sonnet-4-6", "agy's claude ids are not Claude's"
     assert found["cursor-cli"]["errors"] == 1 and found["cursor-cli"]["last_model"] == "cursor-cli:claude-4.6-opus"
     assert found["gemini"]["last_model"] == "gemini-3-flash", "the router's served_by wins over the requested id"

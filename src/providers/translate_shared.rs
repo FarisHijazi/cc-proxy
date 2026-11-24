@@ -14,15 +14,17 @@ pub enum ProxyReasoning {
     Gemini,
     CursorCli,
     Agy,
+    Zai,
 }
 
 impl ProxyReasoning {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::Kimi,
         Self::Gemini,
         Self::CursorCli,
         Self::Agy,
+        Self::Zai,
     ];
 
     pub const fn prefix(self) -> &'static str {
@@ -32,6 +34,7 @@ impl ProxyReasoning {
             Self::Gemini => "ccp:gemini:v1:",
             Self::CursorCli => "ccp:cursor-cli:v1:",
             Self::Agy => "ccp:agy:v1:",
+            Self::Zai => "ccp:zai:v1:",
         }
     }
 
