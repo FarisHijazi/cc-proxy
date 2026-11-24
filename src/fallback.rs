@@ -1012,10 +1012,15 @@ pub async fn dispatch(
             };
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
-        // A native-document request is rarer and differently shaped than ordinary traffic, so
-        // its rejection must not cool an account that is still serving everything else.
+        // A session with a native document in its history can get a bare 429 that is about
+        // the request, not the account: only an authoritative rejection or a 401 cools it.
+        let authoritative = status == StatusCode::UNAUTHORIZED
+            || response
+                .headers()
+                .get("anthropic-ratelimit-unified-status")
+                .is_some_and(|v| v.as_bytes() == b"rejected");
         if !count_tokens
-            && !native_document
+            && (!native_document || authoritative)
             && !server_error
             && !unavailable
             && refused == Refusal::Other
