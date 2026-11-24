@@ -79,6 +79,7 @@ pub struct InputSupport {
     pub backend: &'static str,
     pub images: ImageInput,
     pub tool_result_images: ImageInput,
+    pub tool_result_documents_as_text: bool,
 }
 
 impl InputSupport {
@@ -111,6 +112,9 @@ impl InputSupport {
                         for part in parts.into_iter().flatten() {
                             match block_kind(part) {
                                 "text" | "tool_reference" => {}
+                                "document" if self.tool_result_documents_as_text => {
+                                    document_to_text(part)?;
+                                }
                                 "image" => ensure_image(
                                     self.tool_result_images,
                                     part,
@@ -250,6 +254,69 @@ pub fn public_history_text(block: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+pub fn requires_native_tool_document(req: &MessagesRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message
+            .content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|block| {
+                block_kind(block) == "tool_result"
+                    && block["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|part| {
+                            block_kind(part) == "document" && document_to_text(part).is_err()
+                        })
+            })
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "document content requires a document-capable backend; this source cannot be converted losslessly to text"
+)]
+pub struct UnsupportedDocument;
+
+/// Text-only tool protocols must not replace unread document contents with a placeholder.
+pub fn document_to_text(block: &Value) -> Result<String, UnsupportedDocument> {
+    let source = &block["source"];
+    let text = match source["type"].as_str() {
+        Some("text") => source["data"].as_str().map(str::to_owned),
+        Some("base64") if source["media_type"] == "text/plain" => source["data"]
+            .as_str()
+            .and_then(decode_image_data)
+            .and_then(|data| String::from_utf8(data).ok()),
+        Some("content") => match &source["content"] {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(parts) => parts
+                .iter()
+                .map(|part| {
+                    if block_kind(part) == "text" {
+                        part["text"].as_str().map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.join("\n")),
+            _ => None,
+        },
+        _ => None,
+    }
+    .ok_or(UnsupportedDocument)?;
+    let mut parts = Vec::new();
+    for (key, label) in [("title", "Document title"), ("context", "Document context")] {
+        if let Some(value) = block[key].as_str() {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.push(text);
+    Ok(parts.join("\n"))
 }
 
 /// Claude Code's ToolSearch result: a pointer to a schema already in `tools`.
@@ -533,6 +600,7 @@ mod tests {
         backend: "toy",
         images: ImageInput::Unsupported,
         tool_result_images: ImageInput::Unsupported,
+        tool_result_documents_as_text: false,
     };
 
     #[test]

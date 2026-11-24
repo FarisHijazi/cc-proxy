@@ -58,7 +58,12 @@ changes made on top of it.
   They must not become client-executed function calls. Anthropic-native web search
   stays untouched; foreign X-search blocks are downgraded to public text there too.
 - Unsupported documents, audio, video, unknown content, and unsupported images
-  must fail explicitly at translation, before calling upstream. Gemini/local
+  must fail explicitly at translation, before calling upstream. Codex tool-result
+  documents use `translate_shared::document_to_text` only when lossless text is
+  available. Otherwise `fallback::dispatch` tries only configured targets declaring
+  `preserves_native_tool_documents`; the original document stays intact. Capability
+  skips do not cool providers down, and exhausted capable targets still return 429.
+  Gemini/local
   move tool-result images into the following user image parts; Cursor API takes
   base64 selected images, while Cursor CLI and agy take text only. Grok retains its
   explicitly configured image policy. Do not infer model-specific vision or tool

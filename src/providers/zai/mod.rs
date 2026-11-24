@@ -347,6 +347,10 @@ fn unusable(message: &str) -> Response {
 
 #[async_trait]
 impl Provider for ZaiProvider {
+    fn preserves_native_tool_documents(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "zai"
     }
