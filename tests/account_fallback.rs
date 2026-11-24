@@ -126,15 +126,41 @@ async fn pdf_tool_results_fall_back_intact_before_codex_for_json_and_streaming()
     assert_eq!(seen.lock().unwrap().len(), 2);
     let exhausted = anthropic_upstream().await;
     let exhausted_router = gateway(&exhausted.base, vec![codex.clone()]);
-    for _ in 0..2 {
+    let send_document = |token: &'static str| {
         let mut request = make_request(&payload, json!({}));
         request
             .headers_mut()
-            .insert(POOL, pool(&[("dead", "dead")]).parse().unwrap());
-        let response = exhausted_router.clone().oneshot(request).await.unwrap();
+            .insert(POOL, pool(&[(token, token)]).parse().unwrap());
+        exhausted_router.clone().oneshot(request)
+    };
+    // A bare 429 on a document request is about the request: it never cools the account.
+    for _ in 0..2 {
+        let response = send_document("bare429").await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
-    assert_eq!(exhausted.seen.lock().unwrap().len(), 1);
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 2);
+    let (status, _) = send(
+        exhausted_router.clone(),
+        "claude-opus-5-5",
+        Some(pool(&[("bare429", "bare429")])),
+        false,
+    )
+    .await;
+    // The account is still tried (then Codex answers): no cooldown skipped it.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 3);
+    // An authoritative exhaustion still cools the account, document or not.
+    for _ in 0..2 {
+        let response = send_document("dead").await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 4);
+    // So does an explicit retry-after.
+    for _ in 0..2 {
+        let response = send_document("retry429").await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 5);
     task.abort();
 }
 
@@ -220,6 +246,12 @@ async fn anthropic_upstream() -> Upstream {
             }
             if auth.starts_with("Bearer basic") && model.as_deref().is_some_and(|m| m.starts_with("claude-mythos")) {
                 return (StatusCode::NOT_FOUND, axum::Json(json!({"type":"error","error":{"type":"not_found_error","message":format!("model: {}", model.unwrap())}}))).into_response();
+            }
+            if auth.starts_with("Bearer retry429") {
+                return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "300")], axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"spent"}}))).into_response();
+            }
+            if auth.starts_with("Bearer bare429") {
+                return (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"Error"}}))).into_response();
             }
             if auth.starts_with("Bearer dead") {
                 return (
