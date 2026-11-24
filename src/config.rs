@@ -391,6 +391,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_KIMI_BASE_URL") {
         out.push("kimi.baseUrl (env)".to_string());
     }
+    if env.contains_key("CCP_KIMI_API_KEY_BASE_URL") {
+        out.push("kimi.apiKeyBaseUrl (env)".to_string());
+    }
     if env.contains_key("CCP_CURSOR_BASE_URL") {
         out.push("cursor.baseUrl (env)".to_string());
     }
@@ -602,6 +605,12 @@ pub fn kimi_base_url() -> String {
         return url;
     }
     "https://api.kimi.com/coding/v1".to_string()
+}
+
+pub fn kimi_api_key_base_url() -> String {
+    std::env::var("CCP_KIMI_API_KEY_BASE_URL").unwrap_or_else(|_| {
+        crate::providers::kimi::translate::model_allowlist::MOONSHOT_BASE_URL.to_string()
+    })
 }
 
 pub fn kimi_user_agent(default: &str) -> String {

@@ -1,4 +1,4 @@
-"""Read Moonshot monetary credit with the router's access-only Kimi auth store.
+"""Read Moonshot monetary credit with the router's Moonshot API key, else its Kimi auth store.
 
 The caller supplies the router's current endpoint from its model catalogue metadata.
 Coding quota has no verified API here. Never refresh, write auth, or infer token limits.
@@ -19,6 +19,12 @@ TIMEOUT = 10
 def read_login():
     root = Path(os.environ.get("CCP_CONFIG_DIR") or
                 Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "claude-code-proxy")
+    try:
+        key = (root / "kimi/api_key").read_text().strip()
+    except OSError:
+        key = ""
+    if key:
+        return key
     paths = [root / "kimi/auth.json", Path.home() / ".config/claude-code-proxy/kimi/auth.json"]
     for path in dict.fromkeys(paths):
         try:

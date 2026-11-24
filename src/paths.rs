@@ -84,6 +84,11 @@ pub fn kimi_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("kimi").join("auth.json")
 }
 
+/// The Moonshot Open Platform API key, tried after the Kimi login runs out.
+pub fn kimi_api_key_file(deps: &DirResolverEnv) -> PathBuf {
+    resolve_config_dir(deps).join("kimi").join("api_key")
+}
+
 pub fn cursor_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("cursor").join("auth.json")
 }

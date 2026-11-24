@@ -434,3 +434,116 @@ fn kimi_reducer_waits_for_fragmented_tool_identity() {
     assert_eq!(json["stop_reason"], "tool_use");
     assert!(claude_codex::providers::kimi::translate::stream::translate_stream_bytes(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\"}]}}]}\n\ndata: [DONE]\n\n","m","k").is_err());
 }
+
+#[tokio::test]
+async fn kimi_login_quota_falls_back_to_api_key_then_to_the_chain_without_surfacing_balance() {
+    use claude_codex::{config::AliasProvider, registry::Registry, server::app};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("kimi")).unwrap();
+    let login = temp.path().join("kimi/auth.json");
+    std::fs::write(
+        &login,
+        json!({"access":"toy-login","refresh":"","expires":4102444800000u64}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("kimi/api_key"), "toy-key\n").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let key_has_balance = Arc::new(AtomicUsize::new(1));
+    let router = axum::Router::new().route("/chat/completions", axum::routing::post({
+        let (seen, key_has_balance) = (seen.clone(), key_has_balance.clone());
+        move |headers: http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+            let (seen, key_has_balance) = (seen.clone(), key_has_balance.clone());
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                let model = body["model"].as_str().unwrap().to_string();
+                seen.lock().unwrap().push(format!("{auth}|{model}"));
+                let broke = auth == "Bearer toy-login"
+                    || key_has_balance.load(Ordering::SeqCst) == 0 && model.contains("3.1");
+                if broke {
+                    let error = json!({"error":{"type":"exceeded_current_quota_error","message":"Your account is suspended due to insufficient balance"}});
+                    return (http::StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response();
+                }
+                (
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"answered by {model}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                    ),
+                )
+                    .into_response()
+            }
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let _env = Env::set(&[
+        ("CCP_CONFIG_DIR", temp.path().display().to_string()),
+        ("CCP_KIMI_BASE_URL", format!("http://{address}")),
+        ("CCP_KIMI_API_KEY_BASE_URL", format!("http://{address}")),
+        ("NO_PROXY", "127.0.0.1,localhost".into()),
+    ]);
+    let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+    let generation = KimiProvider::new()
+        .generate_anthropic_stream(request(), context())
+        .await
+        .unwrap();
+    assert_eq!(generation.resolved_model, "kimi-k3.1-pro");
+    let GenerationBody::LiveSse(body) = generation.body else {
+        panic!("stream was buffered")
+    };
+    assert!(collect(body).await.contains("answered by kimi-k3.1-pro"));
+    assert_eq!(
+        take(),
+        ["Bearer toy-login|k3.1-pro", "Bearer toy-key|kimi-k3.1-pro"]
+    );
+
+    key_has_balance.store(0, Ordering::SeqCst);
+    let error = KimiProvider::new()
+        .generate_anthropic_stream(request(), context())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(take().len(), 2, "a spent balance is not retried");
+
+    let registry = Registry::from_providers(
+        AliasProvider::Kimi,
+        [Arc::new(KimiProvider::new()) as Arc<dyn Provider>],
+    );
+    let response = app(Arc::new(registry))
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-codex-account-pool", "[]")
+                .header(
+                    "x-claude-codex-fallback",
+                    r#"{"chains":{"kimi":["kimi","kimi-k3"]},"on":{"rate_limit":true}}"#,
+                )
+                .body(Body::from(serde_json::to_vec(&request()).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let output = collect(response.into_body()).await;
+    assert!(output.contains("answered by kimi-k3"), "{output}");
+    assert!(!output.contains("insufficient balance"));
+    assert!(!output.contains("event: error"));
+    take();
+
+    std::fs::remove_file(&login).unwrap();
+    key_has_balance.store(1, Ordering::SeqCst);
+    let generation = KimiProvider::new()
+        .generate_anthropic_stream(request(), context())
+        .await
+        .unwrap();
+    assert_eq!(generation.resolved_model, "kimi-k3.1-pro");
+    assert_eq!(take(), ["Bearer toy-key|kimi-k3.1-pro"]);
+    assert!(KimiProvider::new().availability().is_ready());
+    server.abort();
+}

@@ -56,3 +56,11 @@ def test_access_store_is_read_only_and_matches_router_paths(tmp_path, monkeypatc
     path.write_text(original)
     assert reader()["read_login"]() == "toy-access"
     assert path.read_text() == original
+
+
+def test_moonshot_api_key_wins_over_the_kimi_login(tmp_path, monkeypatch):
+    monkeypatch.setenv("CCP_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "kimi").mkdir()
+    (tmp_path / "kimi" / "auth.json").write_text(json.dumps({"access": "toy-login"}))
+    (tmp_path / "kimi" / "api_key").write_text("toy-key\n")
+    assert reader()["read_login"]() == "toy-key"

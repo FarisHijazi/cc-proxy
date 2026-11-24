@@ -43,14 +43,16 @@ const MOONSHOT_MODELS: &[(&str, &str)] = &[
     ("k3.1-pro-highspeed", "kimi-k3.1-pro-highspeed"),
 ];
 
+pub const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EndpointKind {
+pub enum EndpointKind {
     Coding,
     MoonshotOpenPlatform,
 }
 
 impl EndpointKind {
-    fn from_base_url(base_url: &str) -> Self {
+    pub fn from_base_url(base_url: &str) -> Self {
         match url::Url::parse(base_url) {
             Ok(url)
                 if url.scheme() == "https"
@@ -71,7 +73,7 @@ pub fn resolve_model(model: &str) -> String {
     )
 }
 
-fn resolve_model_for_endpoint(model: &str, endpoint: EndpointKind) -> String {
+pub fn resolve_model_for_endpoint(model: &str, endpoint: EndpointKind) -> String {
     let coding_model = ALIAS_TARGETS.get(model).copied().unwrap_or(model);
     match endpoint {
         EndpointKind::Coding => coding_model,
@@ -129,16 +131,19 @@ pub fn is_k3(model: &str) -> bool {
         .starts_with("k3")
 }
 
-pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    let endpoint =
-        EndpointKind::from_base_url(&crate::providers::kimi::auth::constants::api_base_url());
-    let allowed = match endpoint {
+pub fn allowed_on(model: &str, endpoint: EndpointKind) -> bool {
+    match endpoint {
         EndpointKind::Coding => ALLOWED_MODELS.contains(&model),
         EndpointKind::MoonshotOpenPlatform => {
             MOONSHOT_MODELS.iter().any(|(_, open)| *open == model)
         }
-    };
-    if allowed {
+    }
+}
+
+pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
+    let endpoint =
+        EndpointKind::from_base_url(&crate::providers::kimi::auth::constants::api_base_url());
+    if allowed_on(model, endpoint) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
