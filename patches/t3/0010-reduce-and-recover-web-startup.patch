@@ -1,0 +1,259 @@
+From b5e4810dd9d0eb494757e810bd9375368eb517a6 Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Mon, 23 Nov 2026 14:22:34 +0000
+Subject: [PATCH] fix(web): reduce startup requests and retry a failed main
+ chunk
+
+---
+ apps/web/index.html                  |  2 +-
+ apps/web/src/bootstrap.test.ts       | 70 ++++++++++++++++++++++++++++
+ apps/web/src/bootstrap.ts            |  9 +++-
+ apps/web/src/bundledDev.test.ts      |  8 +++-
+ apps/web/src/lib/chunkReloadGuard.ts | 12 +++++
+ apps/web/src/main.test.ts            |  6 +--
+ apps/web/src/main.tsx                | 14 ++----
+ apps/web/vite.config.ts              |  8 ++++
+ 8 files changed, 112 insertions(+), 17 deletions(-)
+ create mode 100644 apps/web/src/bootstrap.test.ts
+
+diff --git a/apps/web/index.html b/apps/web/index.html
+index 051e3090..c594674a 100644
+--- a/apps/web/index.html
++++ b/apps/web/index.html
+@@ -9,7 +9,7 @@
+     <meta name="theme-color" content="#000000" />
+     <link rel="icon" href="/favicon.ico" sizes="48x48" />
+     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+-    <link rel="manifest" href="/manifest.webmanifest" />
++    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+     <script>
+       (() => {
+         const LIGHT_BACKGROUND = "#ffffff";
+diff --git a/apps/web/src/bootstrap.test.ts b/apps/web/src/bootstrap.test.ts
+new file mode 100644
+index 00000000..ef20c322
+--- /dev/null
++++ b/apps/web/src/bootstrap.test.ts
+@@ -0,0 +1,70 @@
++import { describe, expect, it, vi } from "vite-plus/test";
++
++const mocks = vi.hoisted(() => ({ showBootError: vi.fn().mockName("showBootError") }));
++
++vi.mock("./lib/bootError", () => ({ showBootError: mocks.showBootError }));
++
++// Mirrors Vite's build preload helper when main's CSS or JS chunk fails to load.
++vi.mock("./main", () => {
++  const error = new TypeError("Failed to fetch dynamically imported module: /assets/main.js");
++  const event = Object.assign(new Event("vite:preloadError", { cancelable: true }), {
++    payload: error,
++  });
++  window.dispatchEvent(event);
++  throw error;
++});
++
++function createStorageStub(initial: Record<string, string> = {}): Storage {
++  const store = new Map(Object.entries(initial));
++  return {
++    getItem: (key) => store.get(key) ?? null,
++    setItem: (key, value) => {
++      store.set(key, value);
++    },
++    removeItem: (key) => {
++      store.delete(key);
++    },
++    clear: () => store.clear(),
++    key: (index) => [...store.keys()][index] ?? null,
++    get length() {
++      return store.size;
++    },
++  };
++}
++
++async function bootWithFailingMainChunk(storage: Storage) {
++  vi.resetModules();
++  mocks.showBootError.mockClear();
++  const reload = vi.fn().mockName("location.reload");
++  const page = Object.assign(new EventTarget(), { sessionStorage: storage, location: { reload } });
++  const dispatch = vi.spyOn(page, "dispatchEvent");
++  vi.stubGlobal("window", page);
++  try {
++    const { boot } = await import("./bootstrap");
++    await boot;
++    const event = dispatch.mock.calls[0]?.[0];
++    return { reload, showBootError: mocks.showBootError, event };
++  } finally {
++    vi.unstubAllGlobals();
++  }
++}
++
++describe("bootstrap", () => {
++  it("reloads once instead of showing the boot error when the main chunk fails to load", async () => {
++    const { reload, showBootError, event } = await bootWithFailingMainChunk(createStorageStub());
++
++    expect(event?.defaultPrevented).toBe(true);
++    expect(reload).toHaveBeenCalledTimes(1);
++    expect(showBootError).not.toHaveBeenCalled();
++  });
++
++  it("shows the boot error when the main chunk fails again after the reload", async () => {
++    const { reload, showBootError, event } = await bootWithFailingMainChunk(
++      createStorageStub({ "t3code:chunk-load-reloaded": import.meta.env.APP_VERSION }),
++    );
++
++    expect(event?.defaultPrevented).toBe(false);
++    expect(reload).not.toHaveBeenCalled();
++    expect(showBootError).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/apps/web/src/bootstrap.ts b/apps/web/src/bootstrap.ts
+index b6f422c5..fe07e58b 100644
+--- a/apps/web/src/bootstrap.ts
++++ b/apps/web/src/bootstrap.ts
+@@ -1,4 +1,11 @@
+ import { showBootError } from "./lib/bootError";
++import { chunkLoadState, handleChunkLoadErrors } from "./lib/chunkReloadGuard";
++
++handleChunkLoadErrors();
+ 
+ // Shared dev chunks need the React refresh preamble first. Catch failures before React mounts.
+-void import("./main").then(({ startup }) => startup).catch(showBootError);
++export const boot = import("./main")
++  .then(({ startup }) => startup)
++  .catch((error: unknown) => {
++    if (!chunkLoadState.reloadScheduled) showBootError(error);
++  });
+diff --git a/apps/web/src/bundledDev.test.ts b/apps/web/src/bundledDev.test.ts
+index 770b26e0..5517910d 100644
+--- a/apps/web/src/bundledDev.test.ts
++++ b/apps/web/src/bundledDev.test.ts
+@@ -26,7 +26,12 @@ it("initializes React refresh before a shared UI chunk runs in bundled dev", asy
+   try {
+     await NodeFSP.mkdir(NodePath.join(root, "src/lib"), { recursive: true });
+     await NodeFSP.writeFile(NodePath.join(root, "package.json"), '{"type":"module"}');
+-    for (const file of ["index.html", "src/bootstrap.ts", "src/lib/bootError.ts"]) {
++    for (const file of [
++      "index.html",
++      "src/bootstrap.ts",
++      "src/lib/bootError.ts",
++      "src/lib/chunkReloadGuard.ts",
++    ]) {
+       await NodeFSP.copyFile(new URL(`../${file}`, import.meta.url), NodePath.join(root, file));
+     }
+     await NodeFSP.writeFile(
+@@ -94,6 +99,7 @@ export const startup = Promise.resolve().then(() => globalThis.onStarted(Shared(
+       `import assert from "node:assert/strict";
+ const started = Promise.withResolvers();
+ globalThis.window = globalThis;
++globalThis.addEventListener = () => {};
+ globalThis.document = {
+   createElement: () => ({ relList: { supports: () => true } }),
+   getElementById: () => null,
+diff --git a/apps/web/src/lib/chunkReloadGuard.ts b/apps/web/src/lib/chunkReloadGuard.ts
+index 10f4dc8b..43034ccb 100644
+--- a/apps/web/src/lib/chunkReloadGuard.ts
++++ b/apps/web/src/lib/chunkReloadGuard.ts
+@@ -34,3 +34,15 @@ export function isChunkLoadError(error: unknown): boolean {
+     message !== undefined && CHUNK_LOAD_ERROR_PREFIXES.some((prefix) => message.startsWith(prefix))
+   );
+ }
++
++export const chunkLoadState = { reloadScheduled: false };
++
++// Registered from the entry before main loads, so main-chunk and route-chunk failures share one decision.
++export function handleChunkLoadErrors() {
++  window.addEventListener("vite:preloadError", (event) => {
++    if (reloadOnceForChunkLoadError()) {
++      chunkLoadState.reloadScheduled = true;
++      event.preventDefault();
++    }
++  });
++}
+diff --git a/apps/web/src/main.test.ts b/apps/web/src/main.test.ts
+index 56be0867..11b9b68c 100644
+--- a/apps/web/src/main.test.ts
++++ b/apps/web/src/main.test.ts
+@@ -5,7 +5,7 @@ vi.mock("./AppRoot", () => ({ AppRoot: () => null }));
+ vi.mock("./i18n/runtime", () => ({ whenLocaleReady: async () => {} }));
+ vi.mock("react-dom/client", () => ({ default: { createRoot: () => ({ render: () => {} }) } }));
+ 
+-// Boots main in a fresh page that shares the tab's sessionStorage, as a reload does.
++// Boots the entry in a fresh page that shares the tab's sessionStorage, as a reload does.
+ async function bootThenFailLazyChunk(sessionStorage: Map<string, string>) {
+   vi.resetModules();
+   const reload = vi.fn().mockName("location.reload");
+@@ -20,8 +20,8 @@ async function bootThenFailLazyChunk(sessionStorage: Map<string, string>) {
+   vi.stubGlobal("window", page);
+   vi.stubGlobal("document", { getElementById: () => ({}) });
+   try {
+-    const { startup } = await import("./main");
+-    await startup;
++    const { boot } = await import("./bootstrap");
++    await boot;
+     page.dispatchEvent(new Event("vite:preloadError", { cancelable: true }));
+     return reload;
+   } finally {
+diff --git a/apps/web/src/main.tsx b/apps/web/src/main.tsx
+index 112de484..51aeeade 100644
+--- a/apps/web/src/main.tsx
++++ b/apps/web/src/main.tsx
+@@ -9,20 +9,12 @@ import { isElectron } from "./env";
+ import { startAppServices } from "./appInit";
+ import { AppRoot } from "./AppRoot";
+ import { whenLocaleReady } from "./i18n/runtime";
+-import { reloadOnceForChunkLoadError } from "./lib/chunkReloadGuard";
++import { chunkLoadState } from "./lib/chunkReloadGuard";
+ 
+ const router = startAppServices();
+ 
+ const clerkPublishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY as string | undefined;
+ 
+-let reloadScheduled = false;
+-window.addEventListener("vite:preloadError", (event) => {
+-  if (reloadOnceForChunkLoadError()) {
+-    reloadScheduled = true;
+-    event.preventDefault();
+-  }
+-});
+-
+ const app = <AppRoot router={router} />;
+ 
+ // Split by runtime to keep Clerk out of local startup and clerk-js out of browser builds.
+@@ -40,7 +32,7 @@ export const startup = Promise.all([
+ ])
+   .then(([ManagedAuthShell]) => {
+     // Route chunk failures resolve router.load() and surface later through the error boundary.
+-    if (reloadScheduled) return;
++    if (chunkLoadState.reloadScheduled) return;
+     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+       <React.StrictMode>
+         {ManagedAuthShell && clerkPublishableKey ? (
+@@ -52,6 +44,6 @@ export const startup = Promise.all([
+     );
+   })
+   .catch((error: unknown) => {
+-    if (reloadScheduled) return;
++    if (chunkLoadState.reloadScheduled) return;
+     throw error;
+   });
+diff --git a/apps/web/vite.config.ts b/apps/web/vite.config.ts
+index c791cc5c..4a2e5cc1 100644
+--- a/apps/web/vite.config.ts
++++ b/apps/web/vite.config.ts
+@@ -437,6 +437,14 @@ export default defineConfig(({ command }) => {
+             asset.originalFileNames.some((path) => /[/\\]pdfjs-dist[/\\]wasm[/\\]/.test(path))
+               ? `assets/pdfjs-${pdfjsPkg.version}/[name][extname]`
+               : "assets/[name]-[hash][extname]",
++          // Per-icon chunks multiplied startup requests, overflowing proxies like Tailscale Serve
++          // on macOS. minShareCount 3 leaves out icons only the lazy whole-set entries reach
++          // (lucideIconByName and its picker); otherwise ~550 KB of icons would load at startup.
++          codeSplitting: {
++            groups: [
++              { name: "icons", test: /[\\/]node_modules[\\/]lucide-react[\\/]/, minShareCount: 3 },
++            ],
++          },
+         },
+       },
+     },
+-- 
+2.47.3
+
