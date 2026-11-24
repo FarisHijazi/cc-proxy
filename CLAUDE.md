@@ -253,7 +253,9 @@ still reaches other vendors. The explicit primary-account marker prevents a filt
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
 Completed fallback routes are keyed only by conversation identity (session plus optional agent),
 not by the temporarily usable pool or its primary alias. A remembered account is tried only
-if it remains in the current authorized pool and policy chain. Changing the requested model
+if it remains in the current authorized pool and policy chain. A remembered target serving a
+different model than requested (Kimi's Claude tier fallback, say) never jumps ahead of the requested
+model: it only leads the fallbacks, so a recovered Kimi answers the next turn. Changing the requested model
 clears the route; count, title, compaction and auto-review requests do not change it.
 Claude model: accounts, then Codex. Codex model: Codex, then Claude accounts.
 Cursor is never a default target; it requires an explicitly configured chain. The accounts file's

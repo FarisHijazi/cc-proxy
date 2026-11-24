@@ -760,6 +760,13 @@ fn with_model(raw: &axum::body::Bytes, model: &str, cross: bool) -> Option<axum:
     serde_json::to_vec(&value).ok().map(Into::into)
 }
 
+fn step_model<'a>(step: &'a Step, requested: &'a str) -> &'a str {
+    match step {
+        Step::Original => requested,
+        Step::Account(_, model) | Step::Substitute(model) => model,
+    }
+}
+
 fn note(log: &Logger, req_id: &str, requested: &str, served: &str) {
     log.info(
         "quota fallback",
@@ -819,8 +826,19 @@ pub async fn dispatch(
                 .position(|step| &Served::of(step, &pool) == pinned)
         })
     {
+        // A remembered account serving the requested model keeps the conversation there; a
+        // remembered substitute model only leads the fallbacks, so the requested model is
+        // always tried first and a recovered one answers again.
         let step = steps.remove(index);
-        steps.insert(0, step);
+        let front = if step_model(&step, &requested) == requested {
+            0
+        } else {
+            steps
+                .iter()
+                .position(|other| step_model(other, &requested) != requested)
+                .unwrap_or(steps.len())
+        };
+        steps.insert(front, step);
     }
     let cross = provider.name() != "anthropic";
     let last = steps.len().saturating_sub(1);

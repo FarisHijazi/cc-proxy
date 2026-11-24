@@ -1633,3 +1633,38 @@ async fn opus_4_8_is_served_by_kimi_k3_1_pro_and_falls_back_along_kimis_chain() 
         "kimi's chain, in kimi-k3.1-pro's tier"
     );
 }
+
+#[tokio::test]
+async fn a_conversation_returns_to_its_requested_model_once_that_model_recovers() {
+    let upstream = anthropic_upstream().await;
+    let kimi = stub("kimi", "kimi-k3.1-pro", StatusCode::SERVICE_UNAVAILABLE);
+    let router = gateway(&upstream.base, vec![kimi.clone()]);
+    let accounts = pool(&[("a1", "live-a1"), ("a2", "live-a2")]);
+    assert_eq!(
+        served(&router, &["s1"], "kimi-k3.1-pro", &accounts).await,
+        "Bearer live-a1",
+        "kimi down: its tier's Claude model answers"
+    );
+    *kimi.status.lock().unwrap() = StatusCode::OK;
+    assert_eq!(
+        served(&router, &["s1"], "kimi-k3.1-pro", &accounts).await,
+        "kimi",
+        "a remembered fallback to another model never outranks the requested model"
+    );
+    *kimi.status.lock().unwrap() = StatusCode::SERVICE_UNAVAILABLE;
+    let other_first = pool(&[("a2", "live-a2"), ("a1", "live-a1")]);
+    assert_eq!(
+        served(&router, &["s2"], "kimi-k3.1-pro", &accounts).await,
+        "Bearer live-a1"
+    );
+    assert_eq!(
+        served(&router, &["s2"], "kimi-k3.1-pro", &other_first).await,
+        "Bearer live-a1",
+        "while kimi is down the conversation keeps its fallback account"
+    );
+    assert_eq!(
+        *kimi.seen.lock().unwrap(),
+        ["kimi-k3.1-pro"; 4],
+        "kimi is asked first on every turn"
+    );
+}
