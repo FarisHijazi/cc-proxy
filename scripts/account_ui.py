@@ -47,7 +47,7 @@ RECENT_SESSION_LIMIT = 50
 # The usage view lists at most this many sessions, largest first, over at most 90 days.
 USAGE_SESSION_LIMIT = 300
 USAGE_MAX_HOURS = 90 * 24
-PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "grok"]
+PROVIDERS = ["anthropic", "codex", "cursor", "cursor-cli", "gemini", "kimi", "grok", "zai"]
 _providers = runpy.run_path(str(HERE / "account_providers.py"), run_name="account_providers")
 provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cursor_card_quota"]
 cursor_quota = runpy.run_path(str(HERE / "account_cursor_quota.py"), run_name="account_cursor_quota")["cursor_quota"]

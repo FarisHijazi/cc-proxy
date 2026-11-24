@@ -17,6 +17,8 @@ Messages API, so the proxy speaks it too and forwards or translates each request
 - `gpt-5.6-*` (and the other codex ids) go to the Codex backend using the
   ChatGPT subscription that the Codex CLI already logged in.
 - `kimi-*`, `grok-*`, and `cursor*` ids go to their own translators.
+- `glm-*` ids go to Z.ai's Anthropic-compatible API with the proxy's Z.ai key
+  (`zai` backend, no translation; root `CLAUDE.md` trap 13).
 
 The headline use is running the opus slot on a Claude subscription and the
 sonnet slot on a ChatGPT/Codex subscription in the same session, switching
@@ -42,7 +44,7 @@ changes made on top of it.
 ## Invariants to preserve
 
 - The Anthropic passthrough stays byte-exact for native traffic. It drops unsigned
-  `thinking` and proxy-signed `thinking` (Codex, Kimi, Gemini/local, Cursor CLI),
+  `thinking` and proxy-signed `thinking` (Codex, Kimi, Gemini/local, Cursor CLI, Z.ai),
   removing an assistant turn left empty. Genuine Anthropic signed and redacted
   thinking stays untouched. Only a changed body is reserialized.
 - Private reasoning is never converted to visible assistant text. Cross-provider

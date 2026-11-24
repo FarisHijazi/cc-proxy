@@ -208,6 +208,7 @@ fn default_tiers() -> &'static [Tier] {
                     "k3",
                     "kimi-k3-256k",
                     "k3-256k",
+                    "glm-",
                 ],
                 [
                     ("anthropic", "claude-sonnet-5-5"),
@@ -255,7 +256,12 @@ fn normalize(model: &str) -> String {
 /// The router's own defaults, for dashboards to show and edit from.
 pub fn defaults() -> Value {
     json!({
-        "chains": {"claude": DEFAULT_CLAUDE, "codex": DEFAULT_CODEX, "kimi": DEFAULT_KIMI},
+        "chains": {
+            "claude": DEFAULT_CLAUDE,
+            "codex": DEFAULT_CODEX,
+            "kimi": DEFAULT_KIMI,
+            "zai": DEFAULT_ZAI,
+        },
         "tiers": default_tiers(),
     })
 }
@@ -275,6 +281,7 @@ pub const GLOBAL: &str = "*";
 const DEFAULT_CLAUDE: &[&str] = &["accounts", "codex"];
 const DEFAULT_CODEX: &[&str] = &["codex", "accounts"];
 const DEFAULT_KIMI: &[&str] = &["kimi", "accounts", "codex"];
+const DEFAULT_ZAI: &[&str] = &["zai", "accounts", "codex"];
 
 /// Built-in tier providers retain their provider-target meaning, as do other backend
 /// names that are not routable model ids. `cursor-cli` remains a literal model.
@@ -309,6 +316,7 @@ fn chain(
         (None, None) if family == "claude" => DEFAULT_CLAUDE.to_vec(),
         (None, None) if family == "codex" => DEFAULT_CODEX.to_vec(),
         (None, None) if family == "kimi" => DEFAULT_KIMI.to_vec(),
+        (None, None) if family == "zai" => DEFAULT_ZAI.to_vec(),
         (None, None) => Vec::new(),
     };
     let tier = policy.tier(model);
@@ -1044,6 +1052,7 @@ mod tests {
         "grok",
         "kimi",
         "local",
+        "zai",
     ];
 
     fn names() -> Vec<String> {
@@ -1297,6 +1306,27 @@ mod tests {
 
     fn policy(value: Value) -> Policy {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn glm_falls_back_to_claude_then_codex_and_claude_never_reaches_glm() {
+        let policy = Policy::default();
+        assert_eq!(
+            chain("zai", "glm-4.6", 1, &policy),
+            [
+                Step::Original,
+                Step::Account(0, "claude-sonnet-5-5".into()),
+                sub("gpt-6-luna")
+            ]
+        );
+        for (provider, model) in [("anthropic", "claude-opus-5-5"), ("kimi", "kimi-k3")] {
+            assert!(
+                !chain(provider, model, 1, &policy)
+                    .iter()
+                    .any(|step| matches!(step, Step::Substitute(m) if m.starts_with("glm-"))),
+                "{model}"
+            );
+        }
     }
 
     #[test]

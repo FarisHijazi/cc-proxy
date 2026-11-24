@@ -613,6 +613,11 @@ pub fn kimi_api_key_base_url() -> String {
     })
 }
 
+pub fn zai_base_url() -> String {
+    std::env::var("CCP_ZAI_BASE_URL")
+        .unwrap_or_else(|_| crate::providers::zai::DEFAULT_BASE_URL.to_string())
+}
+
 pub fn kimi_user_agent(default: &str) -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {

@@ -77,7 +77,8 @@ contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain link
 Claude Code subscription, the Codex CLI login, `cursor-agent login`, a
 signed-in Google account. Before adding a backend, check it can work without a
 per-token-billed key — if it cannot, it does not belong here. The owner explicitly authorized
-Moonshot Open Platform API-key use for Kimi on 2026-11-19; this is a Kimi-only exception.
+Moonshot Open Platform API-key use for Kimi on 2026-11-19, and a Z.ai API key for GLM (`zai`) on 2026-11-24;
+these are the only vendor-key exceptions.
 On 2026-11-23 the owner also authorized one Anthropic Console API key as a pool member tried before
 the subscriptions; the proxy's own monthly budget stops it before Anthropic does (quota fallback paragraph).
 
@@ -95,6 +96,7 @@ that over duplicating per-backend logic.
 | `kimi`, `grok`, `cursor` | each vendor's API | own, per backend |
 | `gemini` | gemini-web-api, OpenAI-compatible | none — lives in that server |
 | `cursor-cli` | the `cursor-agent` binary | none — reuses the CLI's |
+| `zai` | Z.ai's Anthropic-compatible Messages API | API key file `zai/api_key` |
 
 ## What this fork adds
 
@@ -188,6 +190,17 @@ any of the three.
    OpenAI-compatible endpoint from config. It is kept to avoid running a second
    gateway alongside the Claude/Codex subscription logic here — see the devlog
    before extending it. `cursor-cli` has no equivalent anywhere.
+13. **`zai` routes every `glm-*` id and nothing else** (`src/providers/zai/`). Z.ai speaks the Messages API, so
+   the request is re-serialized from `MessagesRequest` (a fallback substitute's model wins) and sent with only
+   `x-api-key`, `anthropic-version` and `anthropic-beta`: never the caller's `Authorization`. The key is
+   `<config dir>/zai/api_key` (plain text, mode 600; on ftower a symlink to `~/.config/claude-codex/zai/api_key`),
+   base URL `CCP_ZAI_BASE_URL` (default `https://api.z.ai/api/anthropic`). `ZAI_MODELS` is only what is listed:
+   the ids Z.ai's `/v1/models` lists and that answered on 2026-11-24. GLM's own thinking signatures are rewritten
+   to `ccp:zai:v1:<sig>` (`ProxyReasoning::Zai`) on the way out and unwrapped on the way back, so the Anthropic
+   passthrough drops them instead of 400ing. Z.ai reports a bad key as 401 and balance/plan trouble as 429 with
+   codes 1113/1309/1311: all become a generic 429 (`retry-after: 300`; the vendor text is only logged), so the
+   default chain `zai, accounts, codex` (GLM ids sit in the sonnet-luna tier) answers and a recovered GLM leads
+   again. No default chain ever substitutes GLM for another model.
 
 ## Working on it
 

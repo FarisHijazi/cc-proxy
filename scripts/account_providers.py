@@ -13,7 +13,7 @@ WINDOW_HOURS = 24
 # Bodies are decoded only for these providers' rows in the window, newest first, at most this many.
 ROW_LIMIT = 2000
 # Claude accounts have their own cards; served_by for them is "<alias>/<model>".
-PROVIDERS = ["codex", "cursor-cli", "cursor", "gemini", "kimi", "grok"]
+PROVIDERS = ["codex", "cursor-cli", "cursor", "gemini", "kimi", "grok", "zai"]
 # Rows recorded before the router tagged direct (non-fallback) replies have no served_by, so their
 # backend comes from the requested id, in src/registry.rs provider_for_model's order: Claude ids
 # first, cursor-cli before the cursor prefixes, exact ids, then the gpt-/gemini- families.
@@ -27,6 +27,7 @@ ROUTES = [
     ("grok", ["grok-composer-2.5-fast", "grok-4.5"], []),
     ("codex", [], ["gpt-"]),
     ("gemini", [], ["gemini-"]),
+    ("zai", [], ["glm-"]),
 ]
 
 

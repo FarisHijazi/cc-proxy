@@ -86,6 +86,13 @@ impl Registry {
                 .collect(),
         );
         models.insert(
+            "zai".into(),
+            crate::providers::zai::ZAI_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
+        );
+        models.insert(
             "local".into(),
             crate::providers::gemini::GeminiProvider::local().supported_models(),
         );
@@ -100,6 +107,7 @@ impl Registry {
                 "gemini" => Arc::new(crate::providers::gemini::GeminiProvider::new()),
                 "local" => Arc::new(crate::providers::gemini::GeminiProvider::local()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "zai" => Arc::new(crate::providers::zai::ZaiProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -250,6 +258,7 @@ impl Registry {
             ("gemini", "Gemini"),
             ("grok", "Grok"),
             ("local", "Local"),
+            ("zai", "Z.ai GLM"),
         ];
         let mut catalog = serde_json::Map::new();
         for (provider, models) in groups {
@@ -342,6 +351,10 @@ impl Registry {
         // the server adds, or one we deliberately stop listing, still routes.
         if normalized.starts_with("gemini-") {
             return self.handlers.get("gemini").cloned();
+        }
+        // Z.ai serves every GLM id behind one endpoint, listed or not.
+        if normalized.starts_with("glm-") {
+            return self.handlers.get("zai").cloned();
         }
 
         None
@@ -556,6 +569,25 @@ mod tests {
                     "{provider} offers {model} but it routes nowhere"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn only_glm_ids_route_to_zai() {
+        let registry = Registry::with_default_alias();
+        for model in ["glm-4.6", "glm-5.4", "glm-4.6[1m]", "glm-9-unlisted"] {
+            let provider = registry.provider_for_model(model, None).unwrap();
+            assert_eq!(provider.name(), "zai", "{model}");
+        }
+        for model in [
+            "opus",
+            "claude-sonnet-5-5",
+            "kimi-k3",
+            "gpt-6-luna",
+            "claude-opus-4-8",
+        ] {
+            let provider = registry.provider_for_model(model, None);
+            assert_ne!(provider.map(|p| p.name()), Some("zai"), "{model}");
         }
     }
 

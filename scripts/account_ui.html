@@ -555,9 +555,10 @@ async function openFlow(id) {
 }
 
 const FAMILIES = [["claude", "Claude models"], ["codex", "Codex / GPT models"], ["gemini", "Gemini models"],
-                  ["cursor-cli", "cursor-agent CLI"], ["cursor", "Cursor API"], ["kimi", "Kimi models"], ["grok", "Grok models"]];
+                  ["cursor-cli", "cursor-agent CLI"], ["cursor", "Cursor API"], ["kimi", "Kimi models"], ["grok", "Grok models"],
+                  ["zai", "Z.ai GLM models"]];
 const PROVIDER = {anthropic: "Claude", codex: "Codex", cursor: "Cursor API", "cursor-cli": "cursor-agent CLI",
-                  gemini: "Gemini", kimi: "Kimi", grok: "Grok"};
+                  gemini: "Gemini", kimi: "Kimi", grok: "Grok", zai: "Z.ai GLM"};
 const TRIGGERS = [["rate_limit", "Rate limited (429)", "Quota used up: try the next target, skip this one until it resets"],
                   ["auth", "Login rejected (401)", "A Claude account's login failed: skip it for a minute"],
                   ["server_error", "Server error (5xx)", "Backend down or overloaded: try the next target right away"],
