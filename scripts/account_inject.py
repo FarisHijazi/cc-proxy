@@ -441,8 +441,6 @@ class AccountInject:
         self.session_models = dict(session_models)
         self.api_keys = {k["sha256"]: k["name"] for k in data.get("api_keys", [])}
         self.keys, self.preferred, self.budgets = key_accounts(data.get("api_key_accounts", {}), accounts)
-        if self.budgets and not data.get("traffic_db"):
-            raise ValueError("a key's monthly_budget_usd needs traffic_db, where its spend is read from")
         self.main = data.get("main")
         if not set(self.renamed.values()) <= set(self.accounts):
             raise ValueError("renamed must point at configured aliases")
@@ -456,8 +454,12 @@ class AccountInject:
         ).expanduser()
 
     def track_spend(self):
-        """Keep each budgeted key's month-to-date spend fresh, reading the traffic database read-only."""
+        """Keep each budgeted key's month-to-date spend fresh, reading the traffic database read-only.
+        Without one the spend stays unknown, so a budgeted key is never used; the proxy still serves."""
         while True:
+            if not self.traffic_db:
+                time.sleep(SPEND_EVERY_S)
+                continue
             try:
                 path = Path(self.traffic_db).expanduser()
                 db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
