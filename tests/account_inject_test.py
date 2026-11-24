@@ -986,6 +986,7 @@ def test_a_malformed_budget_is_refused(monkeypatch, tmp_path, member):
         with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, **member}, traffic_db=str(tmp_path / "t.sqlite3"))
 
 
-def test_a_budget_without_a_traffic_database_is_refused(monkeypatch, tmp_path):
-    with pytest.raises(ValueError):
-        with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "monthly_budget_usd": 180})
+def test_a_budget_without_a_traffic_database_leaves_the_key_out_but_the_proxy_serving(monkeypatch, tmp_path):
+    # deploy-main.py's canary drops traffic_db; refusing the file there (or on a restart) took mitmdump down.
+    inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True, "monthly_budget_usd": 180})
+    assert [e["alias"] for e in pool_of(inject)[1]] == ["a", "b"]
