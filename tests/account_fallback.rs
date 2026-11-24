@@ -155,6 +155,12 @@ async fn pdf_tool_results_fall_back_intact_before_codex_for_json_and_streaming()
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
     assert_eq!(exhausted.seen.lock().unwrap().len(), 4);
+    // So does an explicit retry-after.
+    for _ in 0..2 {
+        let response = send_document("retry429").await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 5);
     task.abort();
 }
 
@@ -240,6 +246,9 @@ async fn anthropic_upstream() -> Upstream {
             }
             if auth.starts_with("Bearer basic") && model.as_deref().is_some_and(|m| m.starts_with("claude-mythos")) {
                 return (StatusCode::NOT_FOUND, axum::Json(json!({"type":"error","error":{"type":"not_found_error","message":format!("model: {}", model.unwrap())}}))).into_response();
+            }
+            if auth.starts_with("Bearer retry429") {
+                return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "300")], axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"spent"}}))).into_response();
             }
             if auth.starts_with("Bearer bare429") {
                 return (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({"type":"error","error":{"type":"rate_limit_error","message":"Error"}}))).into_response();

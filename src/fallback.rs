@@ -1013,8 +1013,10 @@ pub async fn dispatch(
         }
         // Model access can change without a reset header. Only quota/auth failures cool down.
         // A session with a native document in its history can get a bare 429 that is about
-        // the request, not the account: only an authoritative rejection or a 401 cools it.
+        // the request, not the account: only a 401, an authoritative rejection or an explicit
+        // `retry-after` (Z.ai's key/balance refusals) cools it. The measured bare 429 had none.
         let authoritative = status == StatusCode::UNAUTHORIZED
+            || response.headers().contains_key("retry-after")
             || response
                 .headers()
                 .get("anthropic-ratelimit-unified-status")

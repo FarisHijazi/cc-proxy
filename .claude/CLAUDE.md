@@ -63,8 +63,8 @@ changes made on top of it.
   available. Otherwise `fallback::dispatch` tries only configured targets declaring
   `preserves_native_tool_documents`; the original document stays intact. A capability
   skip never cools a target. In a session with a native document in its history, a bare
-  429 does not cool the account either (it was measured to be about the request); a 401
-  or an `anthropic-ratelimit-unified-status: rejected` reply still does. Exhausted capable
+  429 does not cool the account either (it was measured to be about the request); a 401,
+  a `retry-after`, or an `anthropic-ratelimit-unified-status: rejected` reply still does. Exhausted capable
   targets return 429.
   Gemini/local
   move tool-result images into the following user image parts; Cursor API takes
