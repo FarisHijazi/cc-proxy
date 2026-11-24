@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, ImageInput, InputSupport, flatten_system_text, image_source_to_url,
-    normalize_content, parallel_tool_calls, read_effort, tool_reference_text,
+    ContentBlock, ImageInput, InputSupport, document_to_text, flatten_system_text,
+    image_source_to_url, normalize_content, parallel_tool_calls, read_effort, tool_reference_text,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -453,6 +453,7 @@ const INPUT_SUPPORT: InputSupport = InputSupport {
     backend: "codex",
     images: ImageInput::Any,
     tool_result_images: ImageInput::Base64,
+    tool_result_documents_as_text: true,
 };
 
 fn translate_request_inner(
@@ -463,7 +464,7 @@ fn translate_request_inner(
     INPUT_SUPPORT.ensure(req)?;
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
+    let input = build_input(req)?;
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
@@ -795,7 +796,7 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
@@ -826,7 +827,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let mut rendered = render_tool_result(content);
+                            let mut rendered = render_tool_result(content)?;
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
@@ -925,7 +926,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
@@ -1030,17 +1031,20 @@ impl RenderedToolResult {
     }
 }
 
-fn render_tool_result(content: &Value) -> RenderedToolResult {
+fn render_tool_result(content: &Value) -> anyhow::Result<RenderedToolResult> {
     let parts = match content {
         Value::String(text) => vec![RenderedToolResultPart::Text(text.clone())],
-        Value::Array(blocks) => blocks.iter().map(render_tool_result_block).collect(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(render_tool_result_block)
+            .collect::<anyhow::Result<_>>()?,
         _ => Vec::new(),
     };
-    RenderedToolResult { parts }
+    Ok(RenderedToolResult { parts })
 }
 
-fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
-    match block.get("type").and_then(Value::as_str) {
+fn render_tool_result_block(block: &Value) -> anyhow::Result<RenderedToolResultPart> {
+    Ok(match block.get("type").and_then(Value::as_str) {
         Some("text") => block
             .get("text")
             .and_then(Value::as_str)
@@ -1049,6 +1053,7 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
         Some("image") => render_tool_result_image(block),
+        Some("document") => RenderedToolResultPart::Text(document_to_text(block)?),
         // Claude Code's ToolSearch returns references to schemas that are already
         // registered in `tools`. Dropping these tells Codex that discovery failed,
         // making native Chrome and other deferred MCP tools unusable.
@@ -1064,7 +1069,7 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
             RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
         }
         None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
-    }
+    })
 }
 
 fn render_tool_result_image(block: &Value) -> RenderedToolResultPart {
@@ -1148,6 +1153,109 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn document_tool_result_request(document: Value) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"doc-1", "name":"read_document", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"doc-1", "content":[
+                        {"type":"text", "text":"before"}, document,
+                        {"type":"text", "text":"after"}
+                    ]}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn document_tool_result_preserves_text_and_order() {
+        let req = document_tool_result_request(json!({
+            "type":"document", "source":{"type":"text", "media_type":"text/plain", "data":"fixture document α"}
+        }));
+        let out = translate_request(&req, opts()).unwrap();
+        let wire = serde_json::to_value(out).unwrap();
+        assert_eq!(
+            wire["input"][1]["output"],
+            "before\nfixture document α\nafter"
+        );
+    }
+
+    #[test]
+    fn document_tool_results_decode_text_and_explicitly_report_unavailable_sources() {
+        for (source, expected) in [
+            (
+                json!({"type":"base64", "media_type":"text/plain", "data":"ZG9jIHRleHQ="}),
+                "doc text",
+            ),
+            (json!({"type":"content", "content":"doc text"}), "doc text"),
+            (
+                json!({"type":"content", "content":[{"type":"text", "text":"first"}, {"type":"text", "text":"second"}]}),
+                "first\nsecond",
+            ),
+        ] {
+            let req = document_tool_result_request(json!({"type":"document", "source":source}));
+            let wire = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+            assert_eq!(
+                wire["input"][1]["output"],
+                format!("before\n{expected}\nafter")
+            );
+        }
+        for source in [
+            json!({"type":"base64", "media_type":"application/pdf", "data":"JVBERi0="}),
+            json!({"type":"base64", "media_type":"text/plain", "data":"invalid!"}),
+            json!({"type":"base64", "media_type":"text/plain", "data":"/w=="}),
+            json!({"type":"url", "url":"https://example.invalid/document.pdf"}),
+            json!({"type":"text"}),
+            json!({}),
+        ] {
+            let req = document_tool_result_request(json!({"type":"document", "source":source}));
+            let error = translate_request(&req, opts()).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::providers::translate_shared::UnsupportedDocument>()
+                    .is_some()
+            );
+            assert!(error.to_string().contains("document-capable backend"));
+        }
+    }
+
+    #[test]
+    fn document_tool_result_retains_metadata_partial_content_and_image_order() {
+        let document = json!({"type":"document", "title":"Fixture", "context":"Public fixture",
+        "source":{"type":"content", "content":[
+            {"type":"text", "text":"first"},
+            {"type":"text", "text":"last"}
+        ]}});
+        let req = document_tool_result_request(document);
+        let wire = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+        let output = wire["input"][1]["output"].as_str().unwrap();
+        assert_eq!(
+            output,
+            "before\nDocument title: Fixture\nDocument context: Public fixture\nfirst\nlast\nafter"
+        );
+        let mut unsupported = req.clone();
+        unsupported.messages[1].content[0]["content"][1]["source"]["content"][0] =
+            json!({"type":"image", "source":{}});
+        assert!(translate_request(&unsupported, opts()).is_err());
+
+        let rendered = render_tool_result(&json!([
+            {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":PNG_BASE64}},
+            {"type":"document", "source":{"type":"text", "data":"document text"}},
+            {"type":"text", "text":"after"}
+        ]));
+        let wire = serde_json::to_value(function_call_output(rendered.unwrap())).unwrap();
+        assert_eq!(wire[0]["type"], "input_image");
+        assert_eq!(
+            wire[1],
+            json!({"type":"input_text", "text":"document text"})
+        );
+        assert_eq!(wire[2], json!({"type":"input_text", "text":"after"}));
+    }
 
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -2143,7 +2251,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            serde_json::to_value(function_call_output(rendered)).unwrap(),
+            serde_json::to_value(function_call_output(rendered.unwrap())).unwrap(),
             json!([
                 {"type": "input_image", "image_url": format!("data:image/png;base64,{PNG_BASE64}")},
                 {"type": "input_text", "text": "caption"}
@@ -2173,7 +2281,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            serde_json::to_value(function_call_output(rendered)).unwrap(),
+            serde_json::to_value(function_call_output(rendered.unwrap())).unwrap(),
             json!(
                 "before\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\nafter"
             )
@@ -2200,7 +2308,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            serde_json::to_value(function_call_output(rendered)).unwrap(),
+            serde_json::to_value(function_call_output(rendered.unwrap())).unwrap(),
             json!("first\nsecond")
         );
     }
@@ -2238,7 +2346,8 @@ mod tests {
             {"type": "text"},
             {"type": "image"},
             {}
-        ]));
+        ]))
+        .unwrap();
 
         assert_eq!(
             rendered.joined_text(),

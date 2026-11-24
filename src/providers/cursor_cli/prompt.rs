@@ -27,6 +27,7 @@ const INPUT_SUPPORT: InputSupport = InputSupport {
     backend: "cursor-cli",
     images: ImageInput::Unsupported,
     tool_result_images: ImageInput::Unsupported,
+    tool_result_documents_as_text: false,
 };
 
 pub fn render_prompt(req: &MessagesRequest) -> anyhow::Result<String> {

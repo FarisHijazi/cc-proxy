@@ -23,6 +23,121 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
 const POOL: &str = "x-claude-codex-account-pool";
+
+#[tokio::test]
+async fn pdf_tool_results_fall_back_intact_before_codex_for_json_and_streaming() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = seen.clone();
+    let upstream = Router::new().fallback(move |axum::Json(body): axum::Json<Value>| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().unwrap().push(body.clone());
+            if body["stream"] == true {
+                ([("content-type", "text/event-stream")], sse_reply("done")).into_response()
+            } else {
+                axum::Json(json!({"type":"message", "stop_reason":"end_turn", "content":[{"type":"text", "text":"fixture read"}]})).into_response()
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let codex = stub("codex", "gpt-6.1-sol", StatusCode::OK);
+    let kimi = stub("kimi", "kimi-k3.1-pro", StatusCode::OK);
+    let router = gateway(&base, vec![codex.clone(), kimi.clone()]);
+    let document = json!({"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":"JVBERi0xLjcKZml4dHVyZQ=="}});
+    let mut payload = json!({"model":"gpt-6.1-sol", "max_tokens":16, "messages":[
+        {"role":"assistant", "content":[{"type":"tool_use", "id":"read-1", "name":"Read", "input":{"file_path":"fixture.pdf"}}]},
+        {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"read-1", "content":[document]}]}
+    ]});
+    let make_request = |payload: &Value, policy: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer toy")
+            .header("x-claude-code-session-id", "document-fixture-session")
+            .header(POOL, pool(&[("ready", "ready")]))
+            .header(POLICY, policy.to_string())
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    for streaming in [false, true] {
+        payload["stream"] = json!(streaming);
+        let response = router
+            .clone()
+            .oneshot(make_request(
+                &payload,
+                json!({"chains":{"codex":["codex","kimi","accounts"]}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["x-claude-codex-served-by"]
+                .to_str()
+                .unwrap()
+                .starts_with("ready/claude-")
+        );
+        let output = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        assert!(!output.is_empty());
+        let captured = seen.lock().unwrap();
+        assert_eq!(
+            captured.last().unwrap()["messages"][1]["content"][0]["content"][0],
+            document
+        );
+        assert_eq!(captured.last().unwrap()["stream"], streaming);
+    }
+    assert!(codex.seen.lock().unwrap().is_empty());
+    assert!(kimi.seen.lock().unwrap().is_empty());
+    // A capability skip neither cools the primary nor pins the next text turn elsewhere.
+    payload["messages"] = json!([{"role":"user", "content":"ordinary text"}]);
+    payload["stream"] = json!(false);
+    let response = router
+        .clone()
+        .oneshot(make_request(&payload, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(codex.seen.lock().unwrap().len(), 1);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    // Configured chains remain authoritative: never add an unauthorized fallback.
+    payload["messages"] = json!([{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"read-1", "content":[document]}]}]);
+    let response = router
+        .oneshot(make_request(
+            &payload,
+            json!({"chains":{"codex":["codex","kimi"]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let output = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("document-capable fallback")
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let exhausted = anthropic_upstream().await;
+    let exhausted_router = gateway(&exhausted.base, vec![codex.clone()]);
+    for _ in 0..2 {
+        let mut request = make_request(&payload, json!({}));
+        request
+            .headers_mut()
+            .insert(POOL, pool(&[("dead", "dead")]).parse().unwrap());
+        let response = exhausted_router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(exhausted.seen.lock().unwrap().len(), 1);
+    task.abort();
+}
+
 const POLICY: &str = "x-claude-codex-fallback";
 
 struct Upstream {

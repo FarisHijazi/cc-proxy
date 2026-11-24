@@ -112,6 +112,7 @@ pub fn translate_request_with(
         backend: if native_reasoning { "local" } else { "gemini" },
         images: ImageInput::Any,
         tool_result_images: ImageInput::Any,
+        tool_result_documents_as_text: false,
     }
     .ensure(req)?;
     let mut messages = Vec::new();

@@ -811,6 +811,7 @@ pub async fn dispatch(
         registry.provider_for_model(default_tiers()[0].models["anthropic"].as_str(), None);
     let mut rejection: Option<Response> = None;
     let mut skipped_cooling = false;
+    let native_document = crate::providers::translate_shared::requires_native_tool_document(&body);
 
     let mut steps = chain(
         provider.name(),
@@ -891,6 +892,9 @@ pub async fn dispatch(
                 (target.name().to_string(), model.clone(), target, substitute)
             }
         };
+        if native_document && !target.preserves_native_tool_documents() {
+            continue;
+        }
         let cooling = if count_tokens {
             registry.cooldowns.cooling(&owner, EVERY_MODEL)
         } else {
@@ -1029,6 +1033,13 @@ pub async fn dispatch(
         }
     }
 
+    if native_document && rejection.is_none() && !skipped_cooling {
+        return crate::anthropic::json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "document content cannot be converted losslessly to text and no configured document-capable fallback served it; use a document-capable model or request extracted text",
+        );
+    }
     rejection
         .filter(|response| response.status() != StatusCode::NOT_FOUND || !skipped_cooling)
         .unwrap_or_else(|| {

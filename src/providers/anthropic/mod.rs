@@ -453,6 +453,10 @@ impl Default for AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn preserves_native_tool_documents(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "anthropic"
     }

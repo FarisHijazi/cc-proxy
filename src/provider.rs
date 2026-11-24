@@ -59,6 +59,12 @@ pub trait Provider: Send + Sync {
     fn supported_models(&self) -> Vec<String>;
     fn cli(&self) -> &'static dyn CliHandlers;
 
+    /// Whether native tool-result documents reach upstream intact rather than being flattened.
+    /// The upstream still validates its supported document sources and model capabilities.
+    fn preserves_native_tool_documents(&self) -> bool {
+        false
+    }
+
     /// Whether the upstream retains Anthropic message-thread history. Stateless
     /// translators must negotiate full-history requests before accepting deltas.
     fn supports_message_threads(&self) -> bool {

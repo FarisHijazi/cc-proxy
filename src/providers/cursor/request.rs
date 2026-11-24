@@ -8,6 +8,7 @@ const INPUT_SUPPORT: InputSupport = InputSupport {
     backend: "cursor",
     images: ImageInput::Base64,
     tool_result_images: ImageInput::Base64,
+    tool_result_documents_as_text: false,
 };
 
 /// A selected image extracted from the request content blocks.
