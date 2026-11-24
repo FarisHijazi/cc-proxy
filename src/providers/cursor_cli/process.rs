@@ -90,6 +90,12 @@ pub struct RunningAgent {
 }
 
 impl RunningAgent {
+    /// Wrap a child spawned with piped stdout and stderr.
+    pub(crate) fn from_child(mut child: Child) -> Self {
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Self { child, stdout }
+    }
+
     /// Kill the process and reap it, so a timed-out run leaves nothing behind.
     ///
     /// Targets the child by its own handle — never by name or command-line
@@ -252,17 +258,28 @@ mod tests {
 /// systemd user unit gets a bare `PATH` without `~/.local/bin`, which hid this
 /// backend on a host where the CLI was installed and signed in.
 pub fn cursor_agent_binary() -> String {
+    installed_binary(crate::config::cursor_cli_binary(), "cursor-agent")
+}
+
+/// `configured`, or `~/.local/bin/<default_name>` when it is still the default
+/// name and that name is not on `PATH`.
+pub(crate) fn installed_binary(configured: String, default_name: &str) -> String {
     resolve_binary(
-        crate::config::cursor_cli_binary(),
+        configured,
+        default_name,
         std::env::var_os("HOME").map(std::path::PathBuf::from),
     )
 }
 
-fn resolve_binary(configured: String, home: Option<std::path::PathBuf>) -> String {
-    if configured != "cursor-agent" || binary_is_runnable(&configured) {
+fn resolve_binary(
+    configured: String,
+    default_name: &str,
+    home: Option<std::path::PathBuf>,
+) -> String {
+    if configured != default_name || binary_is_runnable(&configured) {
         return configured;
     }
-    home.map(|home| home.join(".local/bin/cursor-agent"))
+    home.map(|home| home.join(".local/bin").join(default_name))
         .filter(|path| is_executable_file(path))
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or(configured)
@@ -315,15 +332,18 @@ mod availability_tests {
         let home = Some(home.path().to_path_buf());
 
         assert_eq!(
-            resolve_binary("cursor-agent".into(), home.clone()),
+            resolve_binary("cursor-agent".into(), "cursor-agent", home.clone()),
             agent.to_string_lossy()
         );
         // An explicit choice is never second-guessed.
         assert_eq!(
-            resolve_binary("/opt/cursor-agent".into(), home),
+            resolve_binary("/opt/cursor-agent".into(), "cursor-agent", home),
             "/opt/cursor-agent"
         );
-        assert_eq!(resolve_binary("cursor-agent".into(), None), "cursor-agent");
+        assert_eq!(
+            resolve_binary("cursor-agent".into(), "cursor-agent", None),
+            "cursor-agent"
+        );
     }
 
     #[test]

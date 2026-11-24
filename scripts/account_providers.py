@@ -13,7 +13,7 @@ WINDOW_HOURS = 24
 # Bodies are decoded only for these providers' rows in the window, newest first, at most this many.
 ROW_LIMIT = 2000
 # Claude accounts have their own cards; served_by for them is "<alias>/<model>".
-PROVIDERS = ["codex", "cursor-cli", "cursor", "gemini", "kimi", "grok", "zai"]
+PROVIDERS = ["codex", "cursor-cli", "agy", "cursor", "gemini", "kimi", "grok", "zai"]
 # Rows recorded before the router tagged direct (non-fallback) replies have no served_by, so their
 # backend comes from the requested id, in src/registry.rs provider_for_model's order: Claude ids
 # first, cursor-cli before the cursor prefixes, exact ids, then the gpt-/gemini- families.
@@ -21,6 +21,7 @@ ROUTES = [
     ("anthropic", ["haiku", "sonnet", "opus", "fable"], ["claude-"]),
     ("cursor-cli", ["cursor-cli", "cursor-cli-ask", "cursor-cli-plan", "cursor-cli-agent"],
      ["cursor-cli-agent:", "cursor-cli-plan:", "cursor-cli-ask:", "cursor-cli:"]),
+    ("agy", ["agy", "agy-agent"], ["agy-agent:", "agy:"]),
     ("cursor", ["cursor", "cursor-agent", "cursor-composer", "cursor-composer-fast", "cursor-plan", "cursor-ask",
                 "composer-2.5", "composer-2.5-fast"], ["cursor:", "cursor-plan:", "cursor-ask:"]),
     ("kimi", ["k2.6", "k3"], ["kimi-"]),

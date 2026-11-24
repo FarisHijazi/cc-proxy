@@ -850,11 +850,15 @@ Added by this fork:
 | `CCP_CURSOR_CLI_WORKSPACE` | Pin `cursor-agent` to one directory. Default: follow the caller's cwd. |
 | `CCP_CURSOR_CLI_TIMEOUT_SECS` | Kill a run after this long. Default `900`. |
 | `CCP_CURSOR_CLI_DEFAULT_MODEL` | Model for bare `cursor-cli`. Default `auto`. |
+| `CCP_AGY_BINARY` | Path to `agy`. Default: found on `PATH`, then `~/.local/bin/agy`. |
+| `CCP_AGY_ALLOW_WRITE` | `1` lets `agy-agent:` edit files and run commands. Default off. |
+| `CCP_AGY_WORKSPACE` | Pin `agy` to one directory. Default: follow the caller's cwd. |
+| `CCP_AGY_TIMEOUT_SECS` | Kill an `agy` run after this long. Default `900`. |
 | `CCP_CURSOR_MESSAGES_BASE_URL` | Optional loopback Anthropic Messages broker for exact `cursor:<catalog-id>` models. Unset keeps the legacy Cursor path. |
 | `CCP_CURSOR_MESSAGES_API_KEY` | Local broker key sent only to that loopback broker. It is not a Cursor or paid vendor key. |
 
-The same settings can live in `config.json` under `auth`, `gemini`, and
-`cursorCli`.
+The same settings can live in `config.json` under `auth`, `gemini`,
+`cursorCli`, and `agy` (`binary`, `allowWrite`, `workspace`, `timeoutSecs`).
 
 Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`. Either one overrides
 the Claude subscription login and the Claude route returns 401.
@@ -879,6 +883,7 @@ are listed, never on the request path.
 | `codex` | the Codex CLI has written `~/.codex/auth.json` |
 | `cursor` | signed in through this proxy, **or** `cursor-agent` is signed in |
 | `cursor-cli` | the `cursor-agent` binary is on `PATH` or at `~/.local/bin/cursor-agent` |
+| `agy` | the `agy` binary is on `PATH` or at `~/.local/bin/agy` |
 | `gemini` | something is listening at `gemini.baseUrl` |
 | `kimi`, `grok` | signed in through this proxy |
 
@@ -1113,6 +1118,45 @@ opt-in, and the id stays out of `/model` until you give it:
 ```sh
 CCP_CURSOR_CLI_ALLOW_WRITE=1 CCP_CURSOR_CLI_WORKSPACE=~/code/project claude-codex serve
 ```
+
+### Antigravity CLI (`agy`)
+
+Drives Google's **Antigravity CLI you already have signed in**, the same way
+`cursor-cli` drives `cursor-agent`: no API key, no login of the proxy's own.
+Install it with the official script and run `agy` once to sign in (over SSH it
+prints a URL; open it anywhere and paste the code back):
+
+```sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy                      # sign in once, then /quit
+claude-codex agy auth status
+```
+
+| Model id | Mode | Can edit files |
+| --- | --- | --- |
+| `agy` | read-only, agy's default model | no |
+| `agy:<model>` | read-only | no |
+| `agy-agent:<model>` | agy `auto` mode: edits and safe commands | **yes**, and it is off by default |
+
+`<model>` is any id `agy models` prints (`gemini-3.8-flash-high`,
+`claude-sonnet-4-6`, …); `/v1/models` lists each as `agy:<model>`. The prefix is
+required, because agy's `claude-*` ids would otherwise go to Anthropic.
+
+Read-only runs pass agy deny rules for every file write and every command,
+which win over any allow rule in your own agy settings; reads, searches and
+agy's own reasoning still run. A turn that needed a denied action says so.
+`agy-agent:` needs `CCP_AGY_ALLOW_WRITE=1` (or `agy.allowWrite`) as well.
+
+Like `cursor-cli` it follows the caller's working directory, is an agent rather
+than a model (no `tool_use`, its tools show as thinking lines), and gets the
+whole flattened conversation each turn, on stdin. agy drops the end of a turn
+past roughly 50k tokens, which is where the newest message is, so the proxy
+sends only the newest 150,000 characters of a longer conversation.
+
+The dashboard's agy card shows the five-hour and weekly limits that agy's own
+`/usage` panel shows, read with agy's stored access token. It is never
+refreshed by the dashboard, so the card says unknown once that token expires,
+until agy's next run renews it.
 
 ### Locking the proxy (optional)
 

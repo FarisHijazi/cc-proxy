@@ -96,6 +96,7 @@ that over duplicating per-backend logic.
 | `kimi`, `grok`, `cursor` | each vendor's API | own, per backend |
 | `gemini` | gemini-web-api, OpenAI-compatible | none — lives in that server |
 | `cursor-cli` | the `cursor-agent` binary | none — reuses the CLI's |
+| `agy` | the Antigravity `agy` binary | none — reuses the CLI's |
 | `zai` | Z.ai's Anthropic-compatible Messages API | API key file `zai/api_key` |
 
 ## What this fork adds
@@ -111,6 +112,11 @@ any of the three.
    `cursor-agent` and maps its `stream-json` events to Anthropic SSE.
 3. **Optional inbound auth** (`src/inbound_auth.rs`) — off unless a token is
    configured.
+4. **`agy`** (`src/providers/agy/`) — spawns headless Antigravity `agy` and maps its
+   `stream-json` steps to Anthropic SSE, sharing `cursor_cli`'s run loop
+   (`AgentTranslator`), prompt rendering and workspace detection. No existing bridge
+   reuses agy's own login: the HTTP ones (CLIProxyAPI, antigravity-claude-proxy) call
+   Cloud Code with their own OAuth, agy-headless-bridge is MCP only.
 
 ## Traps
 
@@ -190,7 +196,16 @@ any of the three.
    OpenAI-compatible endpoint from config. It is kept to avoid running a second
    gateway alongside the Claude/Codex subscription logic here — see the devlog
    before extending it. `cursor-cli` has no equivalent anywhere.
-13. **`zai` routes every `glm-*` id and nothing else** (`src/providers/zai/`). Z.ai speaks the Messages API, so
+13. **agy traps** (all measured on agy 1.5.16, fixtures in `tests/fixtures/agy/`). The turn goes on stdin
+   (`--input-format stream-json` + `-p=`): a bare `-p` swallows the next flag as its prompt. A turn past
+   roughly 50k tokens loses its END, the newest message, so `agy::keep_newest` caps the prompt. Read-only is
+   `--settings` deny rules (`write_file(*)`, `command(*)`), not `--mode plan`: plan mode still tries commands
+   and, denied, answers nothing. `text_delta`s are pure deltas and `result.response` repeats them, so it is
+   only a fallback. agy's ids include `claude-*`, so only `agy:`/`agy-agent:` route here. Without a keyring
+   (SSH, systemd) agy keeps its token in `~/.gemini/antigravity-cli/antigravity-oauth-token`, which
+   `scripts/account_agy_quota.py` reads (daily-cloudcode-pa `retrieveUserQuotaSummary`, plus
+   `retrieveUserQuota` for the Gemini group a Starter summary omits) and never refreshes.
+14. **`zai` routes every `glm-*` id and nothing else** (`src/providers/zai/`). Z.ai speaks the Messages API, so
    the request is re-serialized from `MessagesRequest` (a fallback substitute's model wins) and sent with only
    `x-api-key`, `anthropic-version` and `anthropic-beta`: never the caller's `Authorization`. The key is
    `<config dir>/zai/api_key` (plain text, mode 600; on ftower a symlink to `~/.config/claude-codex/zai/api_key`),
@@ -399,8 +414,9 @@ clears one. `account_inject` strips client-supplied `x-claude-codex-session-mode
 model for inference/counts; `server.rs` strips it and rewrites only an actual model change before routing.
 A changed-model thread delta must negotiate full-history resend. The client's `/model` state is unchanged.
 Source-labeled non-Claude usage cards use `scripts/account_providers.py` (24-hour traffic window,
-newest 2,000 replies for token totals). `scripts/account_cursor_quota.py` reads Cursor's own quota RPCs
-and `scripts/account_codex_quota.py` reads ChatGPT's `wham/usage` (Codex CLI `/status`), each with its
+newest 2,000 replies for token totals). `scripts/account_cursor_quota.py` reads Cursor's own quota RPCs,
+`scripts/account_codex_quota.py` reads ChatGPT's `wham/usage` (Codex CLI `/status`) and
+`scripts/account_agy_quota.py` reads agy's `/usage` limits, each with its
 CLI's access token, never refreshing or writing it. Vendor failures are sanitized and isolated;
 other providers' unknown remaining quota must not become zero. `scripts/account_kimi_quota.py` reads
 Moonshot monetary credit using the existing Kimi access credential and the router's safe endpoint metadata.
