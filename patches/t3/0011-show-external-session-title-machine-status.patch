@@ -1,0 +1,543 @@
+From e1207143644b2fb5c7308271363dd9bad6b7f2ac Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 24 Nov 2026 01:11:06 +0000
+Subject: [PATCH] fix(fleet): show external sessions' own title, machine and
+ status
+
+Discovery now records the owner's live activity on the external session
+identity, follows the owner's title on existing threads until someone renames
+the thread in T3, and the sidebar and thread panel show the machine the
+session runs on instead of the T3 environment that discovered it.
+
+Claude-Session: https://claude.ai/code/session_20cc9c1a6a80484ca54b4895500b171c
+---
+ .../src/provider/AcpRegistrySessions.test.ts  | 122 +++++++++++++++++-
+ .../src/provider/AcpRegistrySessions.ts       |  51 +++++++-
+ apps/web/src/components/ChatView.tsx          |  14 +-
+ apps/web/src/components/Sidebar.logic.test.ts |  29 +++++
+ apps/web/src/components/Sidebar.logic.ts      |   6 +-
+ .../components/sidebar/SidebarThreadRow.tsx   |   6 +-
+ .../src/externalSessionPresentation.test.ts   |  14 ++
+ apps/web/src/externalSessionPresentation.ts   |  17 +++
+ packages/contracts/src/externalSession.ts     |   2 +
+ .../src/server/probe.test.ts                  |   5 +
+ .../provider-acp-registry/src/server/probe.ts |   6 +-
+ .../testing/externalSession.fixture.mjs       |   9 +-
+ .../src/server/externalSession.ts             |   2 +-
+ 13 files changed, 265 insertions(+), 18 deletions(-)
+
+diff --git a/apps/server/src/provider/AcpRegistrySessions.test.ts b/apps/server/src/provider/AcpRegistrySessions.test.ts
+index 134b3d44..4b1b4344 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.test.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.test.ts
+@@ -121,9 +121,12 @@ const fixture = Effect.fn(function* () {
+           writeIfProviderThreadUnchanged: ({ events }) =>
+             Effect.sync(() => {
+               metadataEvents.push(...events);
+-              const event = events[0];
+-              if (event?.type === "provider-thread.updated")
+-                identityRecord = { ...identityRecord!, providerThreads: [event.payload] };
++              for (const event of events) {
++                if (event.type === "provider-thread.updated")
++                  identityRecord = { ...identityRecord!, providerThreads: [event.payload] };
++                if (event.type === "thread.metadata-updated")
++                  identityRecord = { ...identityRecord!, thread: event.payload };
++              }
+               return { committed: true, storedEvents: [] };
+             }),
+         }),
+@@ -191,12 +194,18 @@ const fixture = Effect.fn(function* () {
+   return {
+     sessions,
+     metadataEvents,
+-    setIdentityRecord: (providerThread: OrchestrationV2ProviderThread, deleted = false) => {
++    setIdentityRecord: (
++      providerThread: OrchestrationV2ProviderThread,
++      deleted = false,
++      title?: string,
++    ) => {
+       identityRecord = {
+         thread: {
+           id: providerThread.appThreadId!,
+           activeProviderThreadId: providerThread.id,
+           deletedAt: deleted ? providerThread.createdAt : null,
++          updatedAt: providerThread.updatedAt,
++          ...(title === undefined ? {} : { title }),
+         },
+         providerThreads: [providerThread],
+       } as unknown as OrchestrationV2ThreadProjection;
+@@ -468,3 +477,108 @@ it.effect(
+       assert.deepEqual(f.historyLoads, []);
+     }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+ );
++
++it.effect(
++  "follows the owner's title, machine and activity on existing threads until renamed here",
++  () =>
++    Effect.gen(function* () {
++      const f = yield* fixture();
++      const capabilities = {
++        send: true,
++        interrupt: true,
++        respond: false,
++        setModel: false,
++        setPermissionMode: false,
++        terminal: false,
++      };
++      const imported = {
++        version: 1 as const,
++        engine: "claude-code" as const,
++        connection: {
++          kind: "fleet" as const,
++          host: "Work / Work",
++          transport: "tmux" as const,
++        },
++        capabilities,
++      };
++      const discovered = {
++        ...imported,
++        connection: { ...imported.connection, host: "Work" },
++        state: "running" as const,
++      };
++      const id = threadId("existing");
++      yield* f.seed(id);
++      const at = DateTime.makeUnsafe(timestamp);
++      const oldTitle = "[Work / Work · tmux] hq-reply-radar-1 — coach";
++      const owner = {
++        id: ProviderThreadId.make("existing-provider"),
++        appThreadId: id,
++        driver,
++        providerInstanceId: instanceId,
++        providerSessionId: null,
++        ownerNodeId: null,
++        nativeThreadRef: { driver, nativeId: "existing", strength: "strong" as const },
++        nativeConversationHeadRef: null,
++        nativeMetadata: { title: oldTitle, externalSession: { ...imported, model: "observed" } },
++        lastRunOrdinal: null,
++        handoffIds: [],
++        forkedFrom: null,
++        status: "idle" as const,
++        firstRunOrdinal: 1,
++        createdAt: at,
++        updatedAt: at,
++      };
++      const listing = (title: string, state: "running" | "idle") =>
++        Effect.succeed({
++          ...page(["existing"]),
++          sessions: page(["existing"]).sessions.map((session) => ({
++            ...session,
++            title,
++            externalSession: { ...discovered, state },
++          })),
++        });
++      f.setIdentityRecord(owner, false, oldTitle);
++      f.setResult(() => listing("Reply drafts runway", "running"));
++      yield* f.sessions.reconcile;
++      assert.deepEqual(
++        f.metadataEvents.map((event) => event.type),
++        ["provider-thread.updated", "thread.metadata-updated"],
++      );
++      const [provider, thread] = f.metadataEvents;
++      if (provider?.type !== "provider-thread.updated") return assert.fail();
++      if (thread?.type !== "thread.metadata-updated") return assert.fail();
++      assert.isTrue(provider.metadataOnly);
++      assert.deepEqual(provider.payload.nativeMetadata?.externalSession, {
++        ...discovered,
++        model: "observed",
++      });
++      assert.equal(provider.payload.nativeMetadata?.title, "Reply drafts runway");
++      assert.equal(thread.payload.title, "Reply drafts runway");
++      assert.deepEqual(thread.payload.updatedAt, at);
++      // An unchanged pass writes nothing; a changed activity writes only metadata.
++      yield* f.sessions.reconcile;
++      assert.equal(f.metadataEvents.length, 2);
++      f.setResult(() => listing("Reply drafts runway", "idle"));
++      yield* f.sessions.reconcile;
++      assert.deepEqual(
++        f.metadataEvents.slice(2).map((event) => event.type),
++        ["provider-thread.updated"],
++      );
++      // A title someone chose in T3 is never overwritten by the owner.
++      f.setIdentityRecord(
++        {
++          ...owner,
++          nativeMetadata: { ...owner.nativeMetadata, title: "Reply drafts runway" },
++        },
++        false,
++        "My own name",
++      );
++      f.setResult(() => listing("Renamed by the owner", "idle"));
++      yield* f.sessions.reconcile;
++      assert.isFalse(
++        f.metadataEvents.slice(3).some((event) => event.type === "thread.metadata-updated"),
++      );
++      assert.deepEqual(f.launched, []);
++      assert.deepEqual(f.historyLoads, []);
++    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
+diff --git a/apps/server/src/provider/AcpRegistrySessions.ts b/apps/server/src/provider/AcpRegistrySessions.ts
+index 9b1e46a1..f8fc7f73 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.ts
+@@ -110,13 +110,35 @@ const make = Effect.gen(function* () {
+           candidate.nativeThreadRef?.nativeId === input.sessionId,
+       );
+       if (owner === undefined) return;
+-      // Discovery seeds metadata; an observed session owns its richer model and capabilities.
++      // Discovery owns where the session runs and what it is doing; an observed session owns
++      // its richer model and capabilities.
+       const existing = owner.nativeMetadata?.externalSession;
++      const { state: _previousState, ...observed } = existing ?? identity;
+       const externalSession =
+         existing === undefined
+           ? identity
+-          : { ...identity, ...existing, connection: identity.connection };
+-      if (existing !== undefined && equivalentExternalSession(existing, externalSession)) return;
++          : {
++              ...identity,
++              ...observed,
++              connection: identity.connection,
++              ...(identity.state === undefined ? {} : { state: identity.state }),
++            };
++      // Follow the owner's title until someone renames the thread here.
++      const discoveredTitle = owner.nativeMetadata?.title;
++      const title =
++        typeof input.title === "string" &&
++        discoveredTitle !== undefined &&
++        records.thread.title === discoveredTitle &&
++        input.title !== records.thread.title
++          ? input.title
++          : undefined;
++      if (
++        title === undefined &&
++        existing !== undefined &&
++        equivalentExternalSession(existing, externalSession)
++      )
++        return;
++      const occurredAt = yield* DateTime.now;
+       yield* eventSink.writeIfProviderThreadUnchanged({
+         expected: owner,
+         events: [
+@@ -127,9 +149,28 @@ const make = Effect.gen(function* () {
+             threadId,
+             driver: owner.driver,
+             providerInstanceId: owner.providerInstanceId,
+-            occurredAt: yield* DateTime.now,
+-            payload: { ...owner, nativeMetadata: { ...owner.nativeMetadata, externalSession } },
++            occurredAt,
++            payload: {
++              ...owner,
++              nativeMetadata: {
++                ...owner.nativeMetadata,
++                externalSession,
++                ...(title === undefined ? {} : { title }),
++              },
++            },
+           },
++          ...(title !== undefined
++            ? [
++                {
++                  id: EventId.make(yield* random.uuidV4()),
++                  type: "thread.metadata-updated" as const,
++                  threadId,
++                  occurredAt,
++                  // The payload keeps the thread's own activity time.
++                  payload: { ...records.thread, title },
++                },
++              ]
++            : []),
+         ],
+       });
+     },
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 8e07cb38..59f1ae41 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -1,4 +1,7 @@
+-import { externalSessionSendDisabledReason } from "../externalSessionPresentation";
++import {
++  environmentsForExternalSession,
++  externalSessionSendDisabledReason,
++} from "../externalSessionPresentation";
+ import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
+ import { workspaceAreaProps } from "../lib/workspaceFocus";
+ import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+@@ -1228,6 +1231,11 @@ export default function ChatView(props: ChatViewProps) {
+     activeProjectIsScratch && draftId !== null,
+   );
+   const hasMultipleEnvironments = logicalProjectEnvironments.length > 1;
++  const displayedProjectEnvironments = environmentsForExternalSession(
++    logicalProjectEnvironments,
++    activeThread?.environmentId,
++    activeThread?.externalSession,
++  );
+   const canAutoBalanceEnvironments = hasMultipleEnvironments && !activeProjectIsScratch;
+   const activeEnvironmentOption =
+     logicalProjectEnvironments.find(
+@@ -3860,7 +3868,7 @@ export default function ChatView(props: ChatViewProps) {
+                                       ? onAutoEnvironmentStable
+                                       : undefined
+                                   }
+-                                  availableEnvironments={logicalProjectEnvironments}
++                                  availableEnvironments={displayedProjectEnvironments}
+                                   {...(isServerThread
+                                     ? {}
+                                     : {
+@@ -3949,7 +3957,7 @@ export default function ChatView(props: ChatViewProps) {
+                   workspaceMutationId={workspaceMutationId}
+                   isGitRepo={isGitRepo}
+                   envLocked={envLocked}
+-                  availableEnvironments={logicalProjectEnvironments}
++                  availableEnvironments={displayedProjectEnvironments}
+                   autoEnvironmentLabel={autoEnvironmentLabel}
+                   onAutoEnvironment={
+                     draftId &&
+diff --git a/apps/web/src/components/Sidebar.logic.test.ts b/apps/web/src/components/Sidebar.logic.test.ts
+index 4380b801..4dfaa48b 100644
+--- a/apps/web/src/components/Sidebar.logic.test.ts
++++ b/apps/web/src/components/Sidebar.logic.test.ts
+@@ -206,6 +206,35 @@ describe("resolveSidebarThreadStatus", () => {
+     ).toBe("approval");
+   });
+ 
++  it("shows the activity another machine reports for an external session", () => {
++    const externalSession = (state?: "running" | "idle" | "requires_action" | "unavailable") => ({
++      version: 1 as const,
++      engine: "claude-code" as const,
++      connection: { kind: "fleet" as const, host: "Work", transport: "tmux" as const },
++      capabilities: {
++        send: true,
++        interrupt: true,
++        respond: false,
++        setModel: false,
++        setPermissionMode: false,
++        terminal: false,
++      },
++      ...(state === undefined ? {} : { state }),
++    });
++    expect(
++      resolveSidebarThreadStatus({ ...idle, externalSession: externalSession("running") }),
++    ).toBe("working");
++    expect(
++      resolveSidebarThreadStatus({ ...idle, externalSession: externalSession("requires_action") }),
++    ).toBe("input");
++    expect(resolveSidebarThreadStatus({ ...idle, externalSession: externalSession("idle") })).toBe(
++      "ready",
++    );
++    expect(resolveSidebarThreadStatus({ ...idle, externalSession: externalSession() })).toBe(
++      "ready",
++    );
++  });
++
+   it("shows a waiting guest message as a Request, below the agent's own requests", () => {
+     expect(resolveSidebarThreadStatus({ ...idle, pendingGuestMessageCount: 1, runtime })).toBe(
+       "request",
+diff --git a/apps/web/src/components/Sidebar.logic.ts b/apps/web/src/components/Sidebar.logic.ts
+index 351505c4..16e28aad 100644
+--- a/apps/web/src/components/Sidebar.logic.ts
++++ b/apps/web/src/components/Sidebar.logic.ts
+@@ -926,7 +926,8 @@ type SidebarThreadStatusInput = Pick<
+   | "pendingGuestMessageCount"
+   | "runtime"
+   | "blockedOnThreadWait"
+->;
++> &
++  Partial<Pick<SidebarThreadSummary, "externalSession">>;
+ 
+ export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): SidebarThreadStatus {
+   if (thread.hasPendingApprovals || thread.pendingSubagentRequest === "approval") {
+@@ -939,6 +940,9 @@ export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): Si
+   if ((thread.pendingGuestMessageCount ?? 0) > 0) {
+     return "request";
+   }
++  // A session another machine owns reports its own activity; T3 runs nothing for it.
++  if (thread.externalSession?.state === "requires_action") return "input";
++  if (thread.externalSession?.state === "running") return "working";
+   if (thread.runtime?.status === "running" && thread.blockedOnThreadWait === true) {
+     return "waiting";
+   }
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index f489292e..dca653ee 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -299,13 +299,15 @@ function SidebarThreadTooltip({
+             <div className="min-w-0 truncate text-foreground/75">{projectDisplayName}</div>
+           </div>
+         ) : null}
+-        {environmentLabel ? (
++        {(external?.machineLabel ?? environmentLabel) ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <EnvironmentMachineIcon
+               kind={environmentMachine}
+               className="size-3 shrink-0 stroke-muted-foreground"
+             />
+-            <div className="min-w-0 truncate text-foreground/75">{environmentLabel}</div>
++            <div className="min-w-0 truncate text-foreground/75">
++              {external?.machineLabel ?? environmentLabel}
++            </div>
+           </div>
+         ) : null}
+         {external ? (
+diff --git a/apps/web/src/externalSessionPresentation.test.ts b/apps/web/src/externalSessionPresentation.test.ts
+index 03766372..11ac8674 100644
+--- a/apps/web/src/externalSessionPresentation.test.ts
++++ b/apps/web/src/externalSessionPresentation.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vite-plus/test";
+ import {
++  environmentsForExternalSession,
+   externalSessionPresentation,
+   externalSessionSendDisabledReason,
+ } from "./externalSessionPresentation";
+@@ -25,6 +26,7 @@ describe("externalSessionPresentation", () => {
+       displayName: "Claude Code",
+       modelLabel: "Model unknown",
+       connectionLabel: "node-one · Fleet · tmux",
++      machineLabel: "node-one",
+     });
+     expect(
+       externalSessionPresentation({ ...identity, engine: "codex", model: "gpt-5.4" }),
+@@ -53,3 +55,15 @@ it("gates input by the current session capability and preserves live request res
+   );
+   expect(externalSessionSendDisabledReason(undefined, undefined, false)).toBeNull();
+ });
++
++it("shows the machine an external session runs on instead of the discovering environment", () => {
++  const environments = [
++    { environmentId: "dev", label: "dev", isPrimary: true },
++    { environmentId: "other", label: "other", isPrimary: false },
++  ];
++  expect(environmentsForExternalSession(environments, "dev", identity)).toEqual([
++    { environmentId: "dev", label: "node-one", isPrimary: true },
++    { environmentId: "other", label: "other", isPrimary: false },
++  ]);
++  expect(environmentsForExternalSession(environments, "dev", undefined)).toBe(environments);
++});
+diff --git a/apps/web/src/externalSessionPresentation.ts b/apps/web/src/externalSessionPresentation.ts
+index 10b88640..418ca4e4 100644
+--- a/apps/web/src/externalSessionPresentation.ts
++++ b/apps/web/src/externalSessionPresentation.ts
+@@ -11,6 +11,7 @@ export function externalSessionPresentation(
+           displayName: "Agent unknown",
+           modelLabel: "Model unknown",
+           connectionLabel: "Fleet connection",
++          machineLabel: null,
+         }
+       : null;
+   return {
+@@ -18,9 +19,25 @@ export function externalSessionPresentation(
+     displayName: session.engine === "claude-code" ? "Claude Code" : "Codex",
+     modelLabel: session.model ?? "Model unknown",
+     connectionLabel: `${session.connection.host} · Fleet · ${session.connection.transport}`,
++    /** The machine the session runs on, not the T3 environment that discovered it. */
++    machineLabel: session.connection.host,
+   };
+ }
+ 
++/** Environment options as an external thread should show them: its own machine in place of T3's. */
++export function environmentsForExternalSession<T extends { environmentId: string; label: string }>(
++  environments: readonly T[],
++  environmentId: string | undefined,
++  session: ExternalSessionIdentity | null | undefined,
++): readonly T[] {
++  if (!session) return environments;
++  return environments.map((environment) =>
++    environment.environmentId === environmentId
++      ? { ...environment, label: session.connection.host }
++      : environment,
++  );
++}
++
+ export function externalSessionSendDisabledReason(
+   session: ExternalSessionIdentity | null | undefined,
+   connectionRole: "discovery" | undefined,
+diff --git a/packages/contracts/src/externalSession.ts b/packages/contracts/src/externalSession.ts
+index 384a82ec..6a6c7c88 100644
+--- a/packages/contracts/src/externalSession.ts
++++ b/packages/contracts/src/externalSession.ts
+@@ -22,5 +22,7 @@ export const ExternalSessionIdentity = Schema.Struct({
+   model: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+   nativeSessionId: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(1_024))),
+   capabilities: ExternalSessionCapabilities,
++  /** The owner's latest activity report from discovery; absent when the owner reports none. */
++  state: Schema.optionalKey(Schema.Literals(["running", "idle", "requires_action", "unavailable"])),
+ });
+ export type ExternalSessionIdentity = typeof ExternalSessionIdentity.Type;
+diff --git a/packages/provider-acp-registry/src/server/probe.test.ts b/packages/provider-acp-registry/src/server/probe.test.ts
+index 9de95172..b8651cf0 100644
+--- a/packages/provider-acp-registry/src/server/probe.test.ts
++++ b/packages/provider-acp-registry/src/server/probe.test.ts
+@@ -66,6 +66,11 @@ it.live(
+       );
+       assert.equal(result.sessions[0]?.externalSession?.connection.host, "worker");
+       assert.isTrue(result.sessions[0]?.externalSession?.capabilities.send);
++      // The owner's live activity travels with discovery so the sidebar can show it unopened.
++      assert.deepEqual(
++        result.sessions.map((row) => row.externalSession?.state),
++        ["requires_action", "requires_action", undefined],
++      );
+       assert.deepEqual((yield* fs.readFileString(log)).trim().split("\n"), [
+         "initialize",
+         "session/list",
+diff --git a/packages/provider-acp-registry/src/server/probe.ts b/packages/provider-acp-registry/src/server/probe.ts
+index 91775351..e71e52de 100644
+--- a/packages/provider-acp-registry/src/server/probe.ts
++++ b/packages/provider-acp-registry/src/server/probe.ts
+@@ -3,6 +3,7 @@ import {
+   supportsExternalSession,
+   externalSessionIdentity,
+   externalSessionConnectionRole,
++  externalSessionState,
+ } from "@t3tools/provider-acp/server/externalSession";
+ import {
+   AcpRegistryListProvidersResult,
+@@ -732,9 +733,12 @@ export const listAcpRegistrySessions = Effect.fn("AcpRegistryProbe.listSessions"
+       const sessionId = boundedOpaqueValue(session.sessionId, 1_024);
+       const cwd = boundedOpaqueValue(session.cwd, 4_096);
+       if (sessionId === undefined || cwd === undefined) return [];
+-      const identity = supportsExternalSession(initialized._meta)
++      const discovered = supportsExternalSession(initialized._meta)
+         ? externalSessionIdentity(session._meta)
+         : undefined;
++      const state = discovered === undefined ? null : externalSessionState(session._meta);
++      const identity =
++        discovered === undefined || state === null ? discovered : { ...discovered, state };
+       return [
+         {
+           ...(identity === undefined ? {} : { externalSession: identity }),
+diff --git a/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs b/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
+index 57970409..7efa2785 100644
+--- a/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
++++ b/packages/provider-acp-registry/src/server/testing/externalSession.fixture.mjs
+@@ -41,7 +41,14 @@ NodeReadline.createInterface({ input: process.stdin }).on("line", (line) => {
+         sessionId,
+         cwd: "/remote/project",
+         title: "Existing session",
+-        ...(negotiated ? { _meta: { "t3.codes/externalSessionIdentity": value } } : {}),
++        ...(negotiated
++          ? {
++              _meta: {
++                "t3.codes/externalSessionIdentity": value,
++                "t3.codes/externalSessionState": { version: 1, state: "requires_action" },
++              },
++            }
++          : {}),
+       })),
+     };
+   } else {
+diff --git a/packages/provider-acp/src/server/externalSession.ts b/packages/provider-acp/src/server/externalSession.ts
+index e2ea04ad..beb1c482 100644
+--- a/packages/provider-acp/src/server/externalSession.ts
++++ b/packages/provider-acp/src/server/externalSession.ts
+@@ -52,7 +52,7 @@ export function supportsExternalSession(
+ 
+ export function externalSessionState(
+   metadata: Readonly<Record<string, unknown>> | null | undefined,
+-) {
++): NonNullable<ExternalSessionIdentity["state"]> | null {
+   const value = metadata?.["t3.codes/externalSessionState"];
+   if (
+     typeof value !== "object" ||
+-- 
+2.47.3
+

@@ -85,36 +85,72 @@ def test_discovery_preserves_opaque_identity_and_skips_unreachable_sessions():
 
 
 
-def test_discovery_distinguishes_tmux_sessions_with_the_same_project_title():
+def test_discovery_shows_the_owners_title_machine_and_live_state():
     async def check():
         hq = mock_hq(listing=[
-            row(id="one", transport="tmux", tmux_session="build", title="Shared project"),
-            row(id="two", transport="tmux", tmux_session="review", title="Shared project"),
+            row(id="a", transport="tmux", provider="claude", tmux_session="hq-reply-radar-1",
+                title="Reply drafts runway", host="Work / Work", status="running"),
+            row(id="b", transport="codex", provider="codex", tmux_session="01a1", title="emulators",
+                host="MacBook / Codex", status="idle"),
+            row(id="c", transport="tmux", provider="claude", tmux_session="ha-db", title="HA DB",
+                host="Client / Client", status="waiting", waiting_on_question=True),
+            row(id="d", transport="native", provider="claude", title="dev-mutable-boot",
+                host="Remote Control", status="waiting"),
         ])
-        response = await FleetAgent(hq, observe=False).list_sessions("/local/fleet")
-        assert [(entry.session_id, entry.title) for entry in response.sessions] == [
-            ("one", "[node-one · tmux] build — Shared project"),
-            ("two", "[node-one · tmux] review — Shared project"),
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        response = await agent.list_sessions("/local/fleet")
+        listed = [(entry.session_id, entry.title,
+                   entry.field_meta["t3.codes/externalSessionIdentity"]["connection"]["host"],
+                   entry.field_meta["t3.codes/externalSessionState"]) for entry in response.sessions]
+        assert listed == [
+            ("a", "Reply drafts runway", "Work", {"version": 1, "state": "running"}),
+            ("b", "emulators", "MacBook", {"version": 1, "state": "idle"}),
+            ("c", "HA DB", "Client", {"version": 1, "state": "requires_action"}),
+            ("d", "dev-mutable-boot", "Remote Control", {"version": 1, "state": "requires_action"}),
         ]
         assert hq.actions == []
     asyncio.run(check())
 
 
+def test_discovery_lists_a_remote_control_session_once_under_its_tmux_pane():
+    async def check():
+        bridge = "cse_" + "b" * 32
+        hq = mock_hq(listing=[
+            row(id="pane", transport="tmux", provider="claude", tmux_session="build", host="Work / Work",
+                bridge_session_id=bridge),
+            row(id="rc", transport="native", provider="claude", tmux_session=bridge, host="Remote Control"),
+            row(id="other", transport="native", provider="claude", tmux_session="cse_" + "c" * 32,
+                host="Remote Control"),
+        ])
+        agent = FleetAgent(hq, observe=False)
+        await agent.initialize(1, client_capabilities=s.ClientCapabilities.model_validate({
+            "_meta": {"t3.codes/externalSession": {"version": 1}}}))
+        response = await agent.list_sessions("/local/fleet")
+        assert {entry.session_id: entry.field_meta["t3.codes/externalSessionIdentity"].get("duplicateOf")
+                for entry in response.sessions} == {"pane": None, "rc": "pane", "other": None}
+        assert hq.actions == []
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(("changes", "expected"), [
-    ({"transport": "tmux", "tmux_session": "build", "title": "build"}, "[node-one · tmux] build"),
-    ({"transport": "tmux", "tmux_session": "build", "title": None}, "[node-one · tmux] build"),
-    ({"transport": "tmux", "session": "legacy", "title": None}, "[node-one · tmux] legacy"),
-    ({"transport": "native", "tmux_session": "build"}, "[node-one · native] Existing work"),
-    ({"transport": "native", "provider": "codex", "tmux_session": "build"}, "[node-one · native] Existing work"),
+    ({"transport": "tmux", "tmux_session": "build", "title": "build"}, "build"),
+    ({"transport": "tmux", "tmux_session": "build", "title": None}, "build"),
+    ({"transport": "tmux", "session": "legacy", "title": None}, "legacy"),
+    ({"transport": "native", "tmux_session": "build"}, "Existing work"),
+    ({"transport": "native", "provider": "codex", "tmux_session": "build"}, "Existing work"),
 ])
-def test_discovery_keeps_tmux_names_unambiguous_without_changing_native_titles(changes, expected):
+def test_discovery_title_is_the_owners_title_without_transport_labels(changes, expected):
     async def check():
         hq = mock_hq(listing=[row(**changes)])
         response = await FleetAgent(hq, observe=False).list_sessions("/local/fleet")
         assert response.sessions[0].title == expected
         assert response.sessions[0].session_id == SID
+        assert response.sessions[0].field_meta is None
         assert hq.actions == []
     asyncio.run(check())
+
 
 def test_provider_probe_and_history_load_never_write_to_original_process():
     async def check():
@@ -856,7 +892,7 @@ def test_external_session_v1_metadata_is_explicit_and_observed_state_is_not_a_lo
         states = [update["_meta"]["t3.codes/externalSessionState"] for _, update in conn.updates
                   if update["sessionUpdate"] == "session_info_update"]
         assert states == [{"version": 1, "state": state} for state in
-                          ["running", "idle", "unavailable", "requires_action"]]
+                          ["running", "idle", "requires_action"]]
         assert attached.pending is None
         assert hq.actions == []
     asyncio.run(check())

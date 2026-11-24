@@ -66,9 +66,24 @@ def metadata_text(value, limit=256):
                      and not any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)) else None
 
 
+def machine(row):
+    # HQ labels a session "<machine> / <local host or Codex>"; the transport is reported separately.
+    label = metadata_text(row.get("host_label") or row.get("host"))
+    return label.split(" / ")[0].strip() or None if label else None
+
+
+def external_state(row):
+    if row is None or not available(row):
+        return "unavailable"
+    activity = row.get("activity") or row.get("status")
+    if row.get("native_control") or row.get("menu") or row.get("waiting_on_question") or activity == "waiting":
+        return "requires_action"
+    return {"running": "running", "working": "running", "idle": "idle"}.get(activity, "unavailable")
+
+
 def external_identity(row):
     provider, transport = row.get("provider"), row.get("transport")
-    host = metadata_text(row.get("host_label") or row.get("host"))
+    host = machine(row)
     if not host or (provider, transport) not in (("claude", "tmux"), ("claude", "native"), ("codex", "codex")):
         return None
     live = available(row)
@@ -234,17 +249,22 @@ class FleetAgent(Agent):
             if matching:
                 start = matching[0] + 1
         selected = rows[start:start + 100]
+        # A Remote Control session running inside a listed tmux pane is that pane's session.
+        panes = {row["bridge_session_id"]: row["id"] for row in rows
+                 if row.get("transport") == "tmux" and row.get("bridge_session_id")}
         sessions = []
         for row in selected:
-            host = row.get("host_label") or row.get("host") or "Fleet"
-            transport = row.get("transport", "tmux")
-            tmux_session = row.get("tmux_session") if transport == "tmux" else None
+            tmux_session = row.get("tmux_session") if row.get("transport", "tmux") == "tmux" else None
             title = row.get("title") or tmux_session or row.get("session") or row["id"]
-            if tmux_session and tmux_session != title:
-                title = f"{tmux_session} — {title}"
+            identity = external_identity(row)
+            pane = panes.get(row.get("tmux_session")) if row.get("transport") == "native" else None
+            if identity and pane:
+                identity["duplicateOf"] = pane
+            meta = ({**(identity_meta(identity) or {}),
+                     "t3.codes/externalSessionState": {"version": 1, "state": external_state(row)}}
+                    if self.external_session else None)
             sessions.append(s.SessionInfo(session_id=row["id"], cwd=row.get("workdir") or cwd or "/",
-                                           title=f"[{host} · {transport}] {title}",
-                                           field_meta=identity_meta(external_identity(row)) if self.external_session else None))
+                                           title=title, field_meta=meta))
         return s.ListSessionsResponse(sessions=sessions,
             next_cursor=selected[-1]["id"] if start + len(selected) < len(rows) else None)
 
@@ -330,15 +350,7 @@ class FleetAgent(Agent):
     async def emit_state(self, session_id, row, attached):
         if not self.external_session:
             return
-        state = "unavailable"
-        if row is not None and available(row):
-            activity = row.get("activity") or row.get("status")
-            if row.get("native_control") or row.get("menu"):
-                state = "requires_action"
-            elif activity in {"running", "working"}:
-                state = "running"
-            elif activity == "idle":
-                state = "idle"
+        state = external_state(row)
         identity = external_identity(row) if row is not None else None
         if identity is None and attached.identity is not None:
             identity = {**attached.identity, "capabilities": {key: False for key in attached.identity["capabilities"]}}

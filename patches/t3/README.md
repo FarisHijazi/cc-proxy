@@ -1,9 +1,9 @@
 # T3 fleet sessions and self-hosted sign-in
 
-Apply the eight patches in filename order with `git am` from a clean worktree at
+Apply the twelve patches in filename order with `git am` from a clean worktree at
 official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 `16695c812fffe75e85f8cc3084d2c561aa3ca93f`. The maintained source commit is
-`556d84aa10429b8c0d76030e80bad7b6d106d683`.
+`489f81204160425b6983a4a631e1831b4bc74b78`.
 
 | Patch | Purpose |
 | --- | --- |
@@ -15,6 +15,10 @@ official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 | `0006-separate-native-engine-and-connection.patch` | Preserve native Claude Code/Codex identity, classify fleet as a discovery connection, gate native controls and keep metadata enrichment out of activity timestamps. |
 | `0007-stabilize-discovery-and-sign-in.patch` | Negotiate identity on the catalog connection, recover a lost refresh response through the existing secret owner, and retain the displayed route's sidebar provider during OIDC callbacks. |
 | `0008-show-remote-session-connections.patch` | Use the existing environment selector for Session connections, including saved remotes when the desktop local backend is disabled. |
+| `0009-avoid-repeating-sso-session-retries.patch` | Preserve one session retry budget and reuse the known sign-in policy after a rejected refresh. |
+| `0010-reduce-and-recover-web-startup.patch` | Group shared icons, install the bounded chunk-reload guard before main loads, and authenticate manifest requests. |
+| `0011-show-external-session-title-machine-status.patch` | Record the owner's live activity on discovered sessions, follow the owner's title until renamed in T3, and show the session's machine instead of the discovering environment. Built and deployed as `0.1.10-ccfleet.20261124.1` (server and web). |
+| `0012-show-row-machine-status-merge-duplicates.patch` | Show the machine and a Working/Needs input/Idle/Offline status on each external row, mark sessions discovery stops listing offline, replace legacy `[host · transport]` titles with the owner's title, normalize legacy `machine / local host` names, and hide a row discovery reports as `duplicateOf` another (a Remote Control session inside a listed tmux pane). Built and deployed as `0.1.10-ccfleet.20261124.3`. |
 
 External observation requires the versioned provider/client capability; ordinary
 ACP providers retain their existing lifecycle. Provider `autoImportProjectId`
@@ -49,7 +53,7 @@ an older runtime directory.
 
 The completed Linux x64 archive version is `0.1.10-ccfleet.20261117.6`;
 SHA-256: `f150f7a927a794d25a2c47cf999ecb3d00ecff2b9b45bd3faf07701d8a03605c`.
-Its release manifest records the maintained source commit above and no configured
+Its release manifest records source `556d84aa10429b8c0d76030e80bad7b6d106d683` and no configured
 hosted Connect service. The matching macOS ARM64 build has these SHA-256 checksums:
 
 - DMG: `45d6a684468f4f778af9b666a5bdc2cb033ad722aae613a1619c5283f4ad788d`
@@ -61,14 +65,30 @@ runtime's `t3 service install --base-dir <existing-t3-home>` to reconcile the
 existing service. `service.env` and userdata stay with that home. This does not
 require a second T3 deployment or a systemwide update policy.
 
+The two additional web patches build with `APP_VERSION=0.1.10-ccfleet.20261123.1`.
+This identifies the frontend separately from the unchanged `.6` server and desktop
+artifacts. A distinct web version also gives the chunk-reload guard one retry for
+the new deployment. The icon grouping reuses the configuration from
+https://github.com/pingdotgg/t3code/pull/36427; early chunk recovery reuses merged
+commit `91d2d90f467bfb61127ac57ed8e9f0b467ce1238` from
+https://github.com/pingdotgg/t3code/pull/26451.
+
+When activating only a web build, retain old hashed assets for open clients and
+switch the static tree atomically. The running server snapshots its asset manifest:
+new hashes require revalidation until the existing service reloads that manifest.
+Before restarting that service, inspect its exact cgroup and live provider state;
+never stop an active agent to refresh static files. Keep the rollback static tree
+and database backup outside the runtime updater's version-pruning directory.
+
 T3's server does not update itself automatically. A manual official update can
 replace these patches, including the code that enforces the OIDC configuration;
 rebase and retest before updating. Keep the user's release-channel preference.
 
 ## Verification and recovery
 
-Replaying all eight patches from the pinned base reproduces the maintained
-source tree `c26335aed41316ab41988f856477024bc200dfa5`. Source validation records
+The first eight patches reproduce source tree
+`c26335aed41316ab41988f856477024bc200dfa5`; the ten-patch tree is
+`d06bbdd98f7c3bed595fb855111b322a69974306`. Source validation records
 are separate runs, not a sum of unique tests:
 
 | Change | Tests passed | Package typechecks | React Compiler checks |
@@ -78,6 +98,10 @@ are separate runs, not a sum of unique tests:
 | Native engine / connection separation (`fd7572e7`) | 825 in 44 files | 37 | 22 |
 | Catalog negotiation, refresh receipt and callback layout (`97d15c9d`) | 22 in 4 files | 10 | 1 |
 | Remote-only Session connections (`556d84aa`) | 26 in 2 files | 2 | 1 |
+
+For web build `0.1.10-ccfleet.20261123.1`, the changed-file check passed all
+seven stages. The focused auth suites passed 25 tests, and the startup suites
+passed 11. The final test-only amendment passed both affected assertions.
 
 The identity run's initial test-import type error was corrected and all five
 unfinished typecheck targets subsequently passed; the 825 tests and 22 compiler

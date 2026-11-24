@@ -1,0 +1,135 @@
+From e6a09ed7c16ace003d2721d68dd7182c2903a0c7 Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Mon, 23 Nov 2026 14:22:23 +0000
+Subject: [PATCH] fix(web): avoid retrying an exhausted SSO session check
+
+Browser startup could enter the 15-second retry loop twice when the session endpoint was unreachable. Propagate the completed request failure and reuse the known auth policy when a refresh is rejected.
+
+Implemented with GPT-6 in Codex.
+---
+ apps/web/src/authBootstrap.test.ts        | 53 +++++++++++++++++++----
+ apps/web/src/environments/primary/auth.ts |  8 +++-
+ 2 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/apps/web/src/authBootstrap.test.ts b/apps/web/src/authBootstrap.test.ts
+index 1462a07b..077142ae 100644
+--- a/apps/web/src/authBootstrap.test.ts
++++ b/apps/web/src/authBootstrap.test.ts
+@@ -92,6 +92,15 @@ function sequence<A>(...values: ReadonlyArray<A>) {
+   return () => values[Math.min(index++, values.length - 1)]!;
+ }
+ 
++function connectionRefused() {
++  return new HttpClientError.HttpClientError({
++    reason: new HttpClientError.TransportError({
++      request: HttpClientRequest.get("http://localhost:3773/api/auth/session"),
++      cause: new TypeError("Failed to fetch"),
++    }),
++  });
++}
++
+ function createSignal() {
+   let resolve = () => {};
+   const promise = new Promise<void>((resolvePromise) => {
+@@ -189,18 +198,11 @@ describe("resolveInitialServerAuthGateState", () => {
+       session: nextSession,
+       browserSession: () => Effect.succeed(browserSession(["orchestration:read", "access:write"])),
+     });
+-    // What FetchHttpClient yields when nothing listens on the backend port.
+-    const connectionRefused = new HttpClientError.HttpClientError({
+-      reason: new HttpClientError.TransportError({
+-        request: HttpClientRequest.get("http://localhost:3773/api/auth/session"),
+-        cause: new TypeError("Failed to fetch"),
+-      }),
+-    });
+     let unreachableAttempts = 1;
+     __setPrimaryHttpRunnerForTests((effect) => {
+       if (unreachableAttempts > 0) {
+         unreachableAttempts -= 1;
+-        return Promise.reject(connectionRefused);
++        return Promise.reject(connectionRefused());
+       }
+       return testApi.run(effect);
+     });
+@@ -485,6 +487,40 @@ describe("resolveInitialServerAuthGateState", () => {
+     },
+   );
+ 
++  it.each([false, true])(
++    "reports an unreachable SSO session after one retry window (after refresh=%s)",
++    async (afterRefresh) => {
++      oidc.readPrimaryOidcConfig.mockResolvedValue({
++        enabled: true,
++        providerName: "Example SSO",
++        authorizationPath: "/api/auth/oidc/authorize",
++      });
++      const testApi = await installAuthApi({
++        session: () => unauthenticatedSession(LOOPBACK_AUTH),
++      });
++      const unreachable = connectionRefused();
++      const firstFailure = createSignal();
++      __setPrimaryHttpRunnerForTests((effect) => {
++        if (afterRefresh && testApi.calls.session === 0) return testApi.run(effect);
++        firstFailure.resolve();
++        return Promise.reject(unreachable);
++      });
++      const { resolveInitialServerAuthGateState } = await import("./environments/primary");
++      vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
++      const onError = vi.fn();
++      const gate = resolveInitialServerAuthGateState().catch(onError);
++
++      await firstFailure.promise;
++      await vi.advanceTimersByTimeAsync(15_000);
++
++      expect(onError).toHaveBeenCalledWith(
++        expect.objectContaining({ operation: "fetch-session-state", cause: unreachable }),
++      );
++      await gate;
++      expect(oidc.refreshPrimaryOidcSession).toHaveBeenCalledTimes(afterRefresh ? 1 : 0);
++    },
++  );
++
+   it("finishes the SSO callback before checking the session", async () => {
+     oidc.readPrimaryOidcConfig.mockResolvedValue({
+       enabled: true,
+@@ -518,6 +554,7 @@ describe("resolveInitialServerAuthGateState", () => {
+       oidc: config,
+       errorMessage: "Sign-in was revoked.",
+     });
++    expect(testApi.calls.session).toBe(1);
+     expect(testApi.calls.browserSession).toEqual([]);
+   });
+ });
+diff --git a/apps/web/src/environments/primary/auth.ts b/apps/web/src/environments/primary/auth.ts
+index 4b944e29..cb7796ab 100644
+--- a/apps/web/src/environments/primary/auth.ts
++++ b/apps/web/src/environments/primary/auth.ts
+@@ -323,11 +323,12 @@ function isTransportError(error: unknown): boolean {
+ async function bootstrapServerAuth(urlCredential: string | null): Promise<ServerAuthGateState> {
+   const oidc = await readPrimaryOidcConfig();
+   if (oidc.enabled) {
++    let session: AuthSessionState | undefined;
+     try {
+       if (window.location.pathname === OIDC_CALLBACK_PATH) {
+         await completePrimaryOidcSignIn();
+       }
+-      let session = await fetchSessionState();
++      session = await fetchSessionState();
+       if (!session.authenticated) {
+         await refreshPrimaryOidcSession(true);
+         session = await fetchSessionState();
+@@ -336,7 +337,10 @@ async function bootstrapServerAuth(urlCredential: string | null): Promise<Server
+       if (session.expiresAt) rememberPrimaryOidcExpiry(DateTime.toEpochMillis(session.expiresAt));
+       return { status: "authenticated" };
+     } catch (error) {
+-      const session = await fetchSessionState();
++      if (isPrimaryEnvironmentRequestError(error) && error.operation === "fetch-session-state") {
++        throw error;
++      }
++      session ??= await fetchSessionState();
+       return {
+         status: "requires-auth",
+         auth: session.auth,
+-- 
+2.47.3
+
