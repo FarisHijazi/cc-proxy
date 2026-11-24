@@ -1,9 +1,9 @@
 # T3 fleet sessions and self-hosted sign-in
 
-Apply the eleven patches in filename order with `git am` from a clean worktree at
+Apply the twelve patches in filename order with `git am` from a clean worktree at
 official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 `16695c812fffe75e85f8cc3084d2c561aa3ca93f`. The maintained source commit is
-`b5e4810dd9d0eb494757e810bd9375368eb517a6`.
+`489f81204160425b6983a4a631e1831b4bc74b78`.
 
 | Patch | Purpose |
 | --- | --- |
@@ -18,6 +18,7 @@ official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 | `0009-avoid-repeating-sso-session-retries.patch` | Preserve one session retry budget and reuse the known sign-in policy after a rejected refresh. |
 | `0010-reduce-and-recover-web-startup.patch` | Group shared icons, install the bounded chunk-reload guard before main loads, and authenticate manifest requests. |
 | `0011-show-external-session-title-machine-status.patch` | Record the owner's live activity on discovered sessions, follow the owner's title until renamed in T3, and show the session's machine instead of the discovering environment. Built and deployed as `0.1.10-ccfleet.20261124.1` (server and web). |
+| `0012-show-row-machine-status-merge-duplicates.patch` | Show the machine and a Working/Needs input/Idle/Offline status on each external row, mark sessions discovery stops listing offline, replace legacy `[host · transport]` titles with the owner's title, normalize legacy `machine / local host` names, and hide a row discovery reports as `duplicateOf` another (a Remote Control session inside a listed tmux pane). Built and deployed as `0.1.10-ccfleet.20261124.3`. |
 
 External observation requires the versioned provider/client capability; ordinary
 ACP providers retain their existing lifecycle. Provider `autoImportProjectId`
