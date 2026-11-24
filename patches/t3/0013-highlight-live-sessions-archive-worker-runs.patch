@@ -1,0 +1,319 @@
+From e243a12ee321deff9029788874d056d648755fe0 Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 24 Nov 2026 09:10:37 +0000
+Subject: [PATCH] fix(fleet): highlight live sessions and archive ended worker
+ runs
+
+Fleet rows keep T3's order. A live external session now tints its row by
+what it is doing: Needs input pulses in the warning color, Working breathes in
+the info color, Idle holds a static success tint, and Offline has none. Both
+animations are the existing stepped status animations and stop under reduced
+motion.
+
+Discovery records which unattended worker (a scheduled routine or delegated
+task) a session is a run of. When such a run ends, discovery archives its
+thread once, so routine runs stop flooding the list while their history stays
+in the archive. Unarchiving one is left alone.
+
+Claude-Session: https://claude.ai/code/session_20cc9c1a6a80484ca54b4895500b171c
+---
+ .../src/provider/AcpRegistrySessions.test.ts  | 81 +++++++++++++++++++
+ .../src/provider/AcpRegistrySessions.ts       | 27 ++++++-
+ .../components/sidebar/SidebarThreadRow.tsx   | 10 ++-
+ .../src/externalSessionPresentation.test.ts   | 19 +++++
+ apps/web/src/externalSessionPresentation.ts   | 22 ++++-
+ packages/contracts/src/externalSession.ts     |  2 +
+ 6 files changed, 154 insertions(+), 7 deletions(-)
+
+diff --git a/apps/server/src/provider/AcpRegistrySessions.test.ts b/apps/server/src/provider/AcpRegistrySessions.test.ts
+index ada83b1b..21c74a9b 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.test.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.test.ts
+@@ -66,6 +66,7 @@ const fixture = Effect.fn(function* () {
+   let shell: OrchestrationV2ThreadShell | null = null;
+   let identityRecord: OrchestrationV2ThreadProjection | undefined;
+   const metadataEvents: OrchestrationV2DomainEvent[] = [];
++  const dispatched: Array<{ readonly type: string; readonly threadId?: string }> = [];
+   let enabled = true;
+   let optedIn = true;
+   let observable = true;
+@@ -156,6 +157,11 @@ const fixture = Effect.fn(function* () {
+         }),
+         Layer.mock(ThreadManagementService.ThreadManagementService)({
+           getThreadShell: () => Effect.sync(() => shell),
++          dispatch: (command) =>
++            Effect.sync(() => {
++              dispatched.push(command);
++              return {} as never;
++            }),
+         }),
+         Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+           launch: (input) =>
+@@ -194,6 +200,7 @@ const fixture = Effect.fn(function* () {
+   return {
+     sessions,
+     metadataEvents,
++    dispatched,
+     setIdentityRecord: (
+       providerThread: OrchestrationV2ProviderThread,
+       deleted = false,
+@@ -204,6 +211,7 @@ const fixture = Effect.fn(function* () {
+           id: providerThread.appThreadId!,
+           activeProviderThreadId: providerThread.id,
+           deletedAt: deleted ? providerThread.createdAt : null,
++          archivedAt: null,
+           updatedAt: providerThread.updatedAt,
+           ...(title === undefined ? {} : { title }),
+         },
+@@ -699,6 +707,79 @@ it.effect("replaces a legacy fleet label on a listed thread and marks unlisted o
+     // Already settled: another pass writes nothing.
+     yield* f.sessions.reconcile;
+     assert.equal(f.metadataEvents.length, 2);
++    // A session someone works in stays listed after it ends.
++    assert.deepEqual(f.dispatched, []);
++    assert.deepEqual(f.launched, []);
++    assert.deepEqual(f.historyLoads, []);
++  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
++);
++
++it.effect("archives an unattended worker run once when it ends, keeping its history", () =>
++  Effect.gen(function* () {
++    const f = yield* fixture();
++    const sql = yield* SqlClient.SqlClient;
++    const at = DateTime.makeUnsafe(timestamp);
++    const identity = {
++      version: 1 as const,
++      engine: "claude-code" as const,
++      connection: { kind: "fleet" as const, host: "Work", transport: "tmux" as const },
++      capabilities: {
++        send: true,
++        interrupt: true,
++        respond: false,
++        setModel: false,
++        setPermissionMode: false,
++        terminal: false,
++      },
++      state: "idle" as const,
++      worker: "hq-reply-radar-1",
++    };
++    const run = {
++      id: ProviderThreadId.make("run-provider"),
++      appThreadId: threadId("run"),
++      driver,
++      providerInstanceId: instanceId,
++      providerSessionId: null,
++      ownerNodeId: null,
++      nativeThreadRef: { driver, nativeId: "run", strength: "strong" as const },
++      nativeConversationHeadRef: null,
++      nativeMetadata: { title: "Reply drafts", externalSession: identity },
++      lastRunOrdinal: null,
++      handoffIds: [],
++      forkedFrom: null,
++      status: "idle" as const,
++      firstRunOrdinal: 1,
++      createdAt: at,
++      updatedAt: at,
++    };
++    yield* sql`
++      INSERT INTO orchestration_v2_projection_threads (
++        thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
++        active_provider_thread_id, created_at, updated_at, payload_json
++      ) VALUES (
++        ${threadId("run")}, ${projectId}, 'Reply drafts', ${instanceId}, 'approval-required',
++        'default', ${run.id}, ${timestamp}, ${timestamp}, '{}'
++      )
++    `;
++    yield* sql`
++      INSERT INTO orchestration_v2_projection_provider_threads (
++        provider_thread_id, thread_id, provider, status, updated_at, payload_json, driver, provider_instance_id
++      ) VALUES (
++        ${run.id}, ${threadId("run")}, ${instanceId}, 'idle', ${timestamp},
++        ${JSON.stringify({ nativeThreadRef: { nativeId: "run" }, nativeMetadata: { externalSession: identity } })},
++        ${driver}, ${instanceId}
++      )
++    `;
++    f.setIdentityRecord(run, false, "Reply drafts");
++    f.setResult(() => Effect.succeed(page([])));
++    yield* f.sessions.reconcile;
++    assert.deepEqual(
++      f.dispatched.map(({ type, threadId }) => ({ type, threadId })),
++      [{ type: "thread.archive", threadId: threadId("run") }],
++    );
++    // Unarchiving it again is the user's choice; a later pass leaves it alone.
++    yield* f.sessions.reconcile;
++    assert.equal(f.dispatched.length, 1);
+     assert.deepEqual(f.launched, []);
+     assert.deepEqual(f.historyLoads, []);
+   }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+diff --git a/apps/server/src/provider/AcpRegistrySessions.ts b/apps/server/src/provider/AcpRegistrySessions.ts
+index 9a7c7f51..a68f380f 100644
+--- a/apps/server/src/provider/AcpRegistrySessions.ts
++++ b/apps/server/src/provider/AcpRegistrySessions.ts
+@@ -212,6 +212,23 @@ const make = Effect.gen(function* () {
+         },
+         title,
+       });
++      // An ended unattended run moves to the archive once; unarchiving it is not undone here.
++      if (
++        existing?.worker !== undefined &&
++        existing.state !== "unavailable" &&
++        records.thread.archivedAt === null
++      )
++        yield* threadManagement
++          .dispatch({
++            type: "thread.archive",
++            commandId: CommandId.make(yield* random.uuidV4()),
++            threadId,
++          })
++          .pipe(
++            Effect.catch((cause) =>
++              Effect.logWarning("Could not archive an ended worker run", { threadId, cause }),
++            ),
++          );
+     }
+   });
+ 
+@@ -233,8 +250,13 @@ const make = Effect.gen(function* () {
+       // Discovery owns where the session runs and what it is doing; an observed session owns
+       // its richer model and capabilities.
+       const existing = owner.nativeMetadata?.externalSession;
+-      const { state: _state, duplicateOf: _duplicateOf, ...observed } = existing ?? identity;
+-      const { state, duplicateOf } = identity;
++      const {
++        state: _state,
++        duplicateOf: _duplicateOf,
++        worker: _worker,
++        ...observed
++      } = existing ?? identity;
++      const { state, duplicateOf, worker } = identity;
+       const externalSession =
+         existing === undefined
+           ? identity
+@@ -244,6 +266,7 @@ const make = Effect.gen(function* () {
+               connection: identity.connection,
+               ...(state === undefined ? {} : { state }),
+               ...(duplicateOf === undefined ? {} : { duplicateOf }),
++              ...(worker === undefined ? {} : { worker }),
+             };
+       // Follow the owner's title until someone renames the thread here.
+       const discoveredTitle = owner.nativeMetadata?.title;
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index c56aefae..7954359b 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -1001,7 +1001,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   };
+ 
+   const rowSurfaceClassName = cn(
+-    "group/sidebar-row relative w-full cursor-pointer overflow-hidden rounded-md text-left outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
++    "group/sidebar-row relative isolate w-full cursor-pointer overflow-hidden rounded-md text-left outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+     variantAction === "unsettle" &&
+       !props.isActive &&
+       "[&:not(:hover):not(:focus-within)_*]:text-secondary-label",
+@@ -1188,6 +1188,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   const diff = latestRunDiff(thread);
+   const externalSession = thread.externalSession ?? null;
+   const externalStatus = externalSession === null ? null : externalSessionStatus(externalSession);
++  const statusHighlight = externalStatus?.highlightClass ? (
++    <span
++      aria-hidden
++      className={cn("pointer-events-none absolute inset-0 -z-10", externalStatus.highlightClass)}
++    />
++  ) : null;
+   // Only the trailing icons would remain, so the row moves them to the title line instead.
+   const metaLineEmpty =
+     externalStatus === null &&
+@@ -1300,6 +1306,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+               />
+             }
+           >
++            {statusHighlight}
+             {/* `contents` keeps one-line rows a single flex row. */}
+             <div className={multiline ? "flex h-6 min-w-0 items-center gap-2.5" : "contents"}>
+               {inFolder ? null : (
+@@ -1490,6 +1497,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+             />
+           }
+         >
++          {statusHighlight}
+           <div
+             className={cn(
+               "relative z-10 h-[4.875rem] px-(--sidebar-row-content-inset) py-(--sidebar-content-inset)",
+diff --git a/apps/web/src/externalSessionPresentation.test.ts b/apps/web/src/externalSessionPresentation.test.ts
+index e4496a8d..06e7ded6 100644
+--- a/apps/web/src/externalSessionPresentation.test.ts
++++ b/apps/web/src/externalSessionPresentation.test.ts
+@@ -80,6 +80,25 @@ it("labels each reported activity and treats a session with no report as offline
+   expect(externalSessionStatus(identity).label).toBe("Offline");
+ });
+ 
++it("highlights live sessions by urgency, animating only with motion allowed", () => {
++  const highlight = (state?: "running" | "idle" | "requires_action" | "unavailable") =>
++    externalSessionStatus(state === undefined ? identity : { ...identity, state }).highlightClass;
++  expect(highlight("requires_action")).toContain("bg-warning");
++  expect(highlight("requires_action")).toContain("motion-safe:animate-");
++  expect(highlight("running")).toContain("bg-info");
++  expect(highlight("running")).toContain("motion-safe:animate-");
++  expect(highlight("idle")).toContain("bg-success");
++  expect(highlight("idle")).not.toContain("animate-");
++  expect(highlight("unavailable")).toBeNull();
++  expect(highlight()).toBeNull();
++  for (const state of ["running", "requires_action"] as const)
++    expect(
++      highlight(state)
++        ?.split(" ")
++        .filter((name) => name.includes("animate-")),
++    ).toSatisfy((names: string[]) => names.every((name) => name.startsWith("motion-safe:")));
++});
++
+ it("lists a session reachable over two connections once", () => {
+   const row = (id: string, externalSession: typeof identity & { duplicateOf?: string }) => ({
+     id,
+diff --git a/apps/web/src/externalSessionPresentation.ts b/apps/web/src/externalSessionPresentation.ts
+index 1e9f64f1..723b4eab 100644
+--- a/apps/web/src/externalSessionPresentation.ts
++++ b/apps/web/src/externalSessionPresentation.ts
+@@ -1,10 +1,24 @@
+ import { ProviderDriverKind, type ExternalSessionIdentity } from "@t3tools/contracts";
+ 
++// Row tints use stepped animations, like the other status pulses, so a long list stays cheap.
+ const EXTERNAL_SESSION_STATUS = {
+-  running: { label: "Working", dotClass: "bg-sky-500 dark:bg-sky-300/80" },
+-  requires_action: { label: "Needs input", dotClass: "bg-indigo-500 dark:bg-indigo-300/90" },
+-  idle: { label: "Idle", dotClass: "bg-emerald-500 dark:bg-emerald-300/90" },
+-  unavailable: { label: "Offline", dotClass: "bg-sidebar-muted-foreground/50" },
++  running: {
++    label: "Working",
++    dotClass: "bg-info",
++    highlightClass: "bg-info/8 motion-safe:animate-skeleton",
++  },
++  requires_action: {
++    label: "Needs input",
++    dotClass: "bg-warning",
++    highlightClass:
++      "bg-warning/16 ring-1 ring-inset ring-warning/45 motion-safe:animate-status-pulse",
++  },
++  idle: { label: "Idle", dotClass: "bg-success", highlightClass: "bg-success/6" },
++  unavailable: {
++    label: "Offline",
++    dotClass: "bg-sidebar-muted-foreground/50",
++    highlightClass: null,
++  },
+ } as const;
+ 
+ /** What the owner last reported the session doing; a session with no report is offline. */
+diff --git a/packages/contracts/src/externalSession.ts b/packages/contracts/src/externalSession.ts
+index f0d8d679..8e4fff6b 100644
+--- a/packages/contracts/src/externalSession.ts
++++ b/packages/contracts/src/externalSession.ts
+@@ -26,5 +26,7 @@ export const ExternalSessionIdentity = Schema.Struct({
+   state: Schema.optionalKey(Schema.Literals(["running", "idle", "requires_action", "unavailable"])),
+   /** Another listed session that is this same live session over a preferred connection. */
+   duplicateOf: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(1_024))),
++  /** The unattended worker this session is one run of, such as a scheduled routine. */
++  worker: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+ });
+ export type ExternalSessionIdentity = typeof ExternalSessionIdentity.Type;
+-- 
+2.47.3
+
