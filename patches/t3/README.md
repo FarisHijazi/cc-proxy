@@ -1,9 +1,9 @@
 # T3 fleet sessions and self-hosted sign-in
 
-Apply the thirteen patches in filename order with `git am` from a clean worktree at
+Apply the fourteen patches in filename order with `git am` from a clean worktree at
 official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 `16695c812fffe75e85f8cc3084d2c561aa3ca93f`. The maintained source commit is
-`e243a12ee321deff9029788874d056d648755fe0`.
+`68a0db53a41b67c95df5d0d4893b378afa815bdf`.
 
 | Patch | Purpose |
 | --- | --- |
@@ -20,6 +20,7 @@ official T3 Code nightly `v0.1.10-nightly.20261116.4774`, commit
 | `0011-show-external-session-title-machine-status.patch` | Record the owner's live activity on discovered sessions, follow the owner's title until renamed in T3, and show the session's machine instead of the discovering environment. Built and deployed as `0.1.10-ccfleet.20261124.1` (server and web). |
 | `0012-show-row-machine-status-merge-duplicates.patch` | Show the machine and a Working/Needs input/Idle/Offline status on each external row, mark sessions discovery stops listing offline, replace legacy `[host · transport]` titles with the owner's title, normalize legacy `machine / local host` names, and hide a row discovery reports as `duplicateOf` another (a Remote Control session inside a listed tmux pane). Built and deployed as `0.1.10-ccfleet.20261124.3`. |
 | `0013-highlight-live-sessions-archive-worker-runs.patch` | Tint external rows by live status without reordering them (Needs input pulses in the warning color, Working breathes in the info color, Idle is a static success tint, Offline none; stepped animations, static under reduced motion), record the unattended `worker` a session is a run of, and archive that thread once when the run ends. Built and deployed as `0.1.10-ccfleet.20261124.4`. |
+| `0014-make-idle-row-tint-visible-in-dark-mode.patch` | Raise the static Idle row tint from 6% to 12% success in dark mode only, the same light/dark step as T3's warning surface; light mode, Working and Needs input are unchanged. Built and deployed as `0.1.10-ccfleet.20261124.5`. |
 
 External observation requires the versioned provider/client capability; ordinary
 ACP providers retain their existing lifecycle. Provider `autoImportProjectId`

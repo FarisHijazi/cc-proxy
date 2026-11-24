@@ -1,0 +1,48 @@
+From 68a0db53a41b67c95df5d0d4893b378afa815bdf Mon Sep 17 00:00:00 2001
+From: Faris Hijazi <theefaris@gmail.com>
+Date: Tue, 24 Nov 2026 12:30:26 +0000
+Subject: [PATCH] fix(fleet): make the idle row tint visible in dark mode
+
+The static Idle tint was 6% success over the near-black dark sidebar, which
+barely shows. Dark mode now uses 12%, the same light/dark step T3 uses for its
+warning surface (8% light, 16% dark). Light mode and the Working and Needs
+input highlights are unchanged.
+
+Claude-Session: https://claude.ai/code/session_20cc9c1a6a80484ca54b4895500b171c
+---
+ apps/web/src/externalSessionPresentation.test.ts | 1 +
+ apps/web/src/externalSessionPresentation.ts      | 6 +++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/apps/web/src/externalSessionPresentation.test.ts b/apps/web/src/externalSessionPresentation.test.ts
+index 06e7ded6..446a3c0e 100644
+--- a/apps/web/src/externalSessionPresentation.test.ts
++++ b/apps/web/src/externalSessionPresentation.test.ts
+@@ -89,6 +89,7 @@ it("highlights live sessions by urgency, animating only with motion allowed", ()
+   expect(highlight("running")).toContain("motion-safe:animate-");
+   expect(highlight("idle")).toContain("bg-success");
+   expect(highlight("idle")).not.toContain("animate-");
++  expect(highlight("idle")).toContain("dark:bg-success/");
+   expect(highlight("unavailable")).toBeNull();
+   expect(highlight()).toBeNull();
+   for (const state of ["running", "requires_action"] as const)
+diff --git a/apps/web/src/externalSessionPresentation.ts b/apps/web/src/externalSessionPresentation.ts
+index 723b4eab..e54d4988 100644
+--- a/apps/web/src/externalSessionPresentation.ts
++++ b/apps/web/src/externalSessionPresentation.ts
+@@ -13,7 +13,11 @@ const EXTERNAL_SESSION_STATUS = {
+     highlightClass:
+       "bg-warning/16 ring-1 ring-inset ring-warning/45 motion-safe:animate-status-pulse",
+   },
+-  idle: { label: "Idle", dotClass: "bg-success", highlightClass: "bg-success/6" },
++  idle: {
++    label: "Idle",
++    dotClass: "bg-success",
++    highlightClass: "bg-success/6 dark:bg-success/12",
++  },
+   unavailable: {
+     label: "Offline",
+     dotClass: "bg-sidebar-muted-foreground/50",
+-- 
+2.47.3
+
