@@ -222,6 +222,7 @@ fn mark_json(bytes: &[u8]) -> Bytes {
 #[derive(Default)]
 struct LineMarker {
     pending: Vec<u8>,
+    signed_blocks: std::collections::HashSet<u64>,
 }
 
 impl LineMarker {
@@ -233,30 +234,42 @@ impl LineMarker {
         let complete: Vec<u8> = self.pending.drain(..=end).collect();
         let mut out = Vec::with_capacity(complete.len());
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
-            out.extend_from_slice(&mark_line(line));
+            out.extend_from_slice(&self.mark_line(line));
         }
         Bytes::from(out)
     }
-}
 
-fn mark_line(line: &[u8]) -> Vec<u8> {
-    let Some(data) = line.strip_prefix(b"data:") else {
-        return line.to_vec();
-    };
-    if !data.windows(11).any(|window| window == b"\"signature\"") {
-        return line.to_vec();
-    }
-    let ending = if line.ends_with(b"\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    match serde_json::from_slice::<Value>(data) {
-        Ok(mut value) => {
-            mark_signatures(&mut value);
-            format!("data: {value}{ending}").into_bytes()
+    fn mark_line(&mut self, line: &[u8]) -> Vec<u8> {
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return line.to_vec();
+        };
+        if !data.windows(11).any(|window| window == b"\"signature\"") {
+            return line.to_vec();
         }
-        Err(_) => line.to_vec(),
+        let ending = if line.ends_with(b"\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        match serde_json::from_slice::<Value>(data) {
+            Ok(mut value) => {
+                let index = value["index"].as_u64();
+                let block = match value["type"].as_str() {
+                    Some("content_block_start") => value.get_mut("content_block"),
+                    Some("content_block_delta") => value.get_mut("delta"),
+                    _ => None,
+                };
+                if let (Some(index), Some(block)) = (index, block)
+                    && matches!(block["type"].as_str(), Some("thinking" | "signature_delta"))
+                    && block["signature"].as_str().is_some_and(|s| !s.is_empty())
+                    && self.signed_blocks.insert(index)
+                {
+                    mark_signatures(block);
+                }
+                format!("data: {value}{ending}").into_bytes()
+            }
+            Err(_) => line.to_vec(),
+        }
     }
 }
 
@@ -436,6 +449,45 @@ mod tests {
         .unwrap();
         assert_eq!(data["delta"]["signature"], "ccp:zai:v1:abc");
         assert!(text.ends_with("\n\ndata: {\"type\": \"ping\"}\n"));
+    }
+
+    #[test]
+    fn split_signature_is_prefixed_once_per_block_and_round_trips() {
+        for initial in ["", "start"] {
+            let mut marker = LineMarker::default();
+            let mut signatures = [String::new(), String::new()];
+            for index in [0, 1] {
+                let events = [
+                    json!({"type":"content_block_start", "index":index,
+                        "content_block":{"type":"thinking", "thinking":"", "signature":initial}}),
+                    json!({"type":"content_block_delta", "index":index,
+                        "delta":{"type":"signature_delta", "signature":"abc"}}),
+                    json!({"type":"content_block_delta", "index":index,
+                        "delta":{"type":"signature_delta", "signature":"def"}}),
+                ];
+                for event in events {
+                    let bytes = marker.push(format!("data: {event}\n\n").as_bytes());
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    let parsed: Value =
+                        serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+                    signatures[index] += parsed["content_block"]["signature"]
+                        .as_str()
+                        .or_else(|| parsed["delta"]["signature"].as_str())
+                        .unwrap();
+                }
+            }
+            for signature in signatures {
+                assert_eq!(signature, format!("ccp:zai:v1:{initial}abcdef"));
+                let mut request = json!({"messages":[{"role":"assistant", "content":[
+                    {"type":"thinking", "thinking":"t", "signature":signature}
+                ]}]});
+                prepare_request(&mut request);
+                assert_eq!(
+                    request["messages"][0]["content"][0]["signature"],
+                    format!("{initial}abcdef")
+                );
+            }
+        }
     }
 
     async fn error_parts(status: u16, body: Value) -> (StatusCode, Option<String>, String) {

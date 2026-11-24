@@ -213,7 +213,7 @@ any of the three.
    the ids Z.ai's `/v1/models` lists and that answered on 2026-11-24. GLM's own thinking signatures are rewritten
    to `ccp:zai:v1:<sig>` (`ProxyReasoning::Zai`) on the way out and unwrapped on the way back, so the Anthropic
    passthrough drops them instead of 400ing. Z.ai reports a bad key as 401 and balance/plan trouble as 429 with
-   codes 1113/1309/1311: all become a generic 429 (`retry-after: 300`; the vendor text is only logged), so the
+   codes 1113/1309/1311: all become a generic 429 (`retry-after: 300`; only the vendor status/code is logged), so the
    default chain `zai, accounts, codex` (GLM ids sit in the sonnet-luna tier) answers and a recovered GLM leads
    again. No default chain ever substitutes GLM for another model.
 
