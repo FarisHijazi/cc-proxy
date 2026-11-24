@@ -53,6 +53,7 @@ provider_usage, cursor_card_quota = _providers["provider_usage"], _providers["cu
 cursor_quota = runpy.run_path(str(HERE / "account_cursor_quota.py"), run_name="account_cursor_quota")["cursor_quota"]
 kimi_quota = runpy.run_path(str(HERE / "account_kimi_quota.py"), run_name="account_kimi_quota")["kimi_quota"]
 codex_quota = runpy.run_path(str(HERE / "account_codex_quota.py"), run_name="account_codex_quota")["codex_quota"]
+agy_quota = runpy.run_path(str(HERE / "account_agy_quota.py"), run_name="account_agy_quota")["agy_quota"]
 RemoteLinks = runpy.run_path(str(HERE / "account_remote_links.py"), run_name="account_remote_links")["RemoteLinks"]
 MCPRelay = runpy.run_path(str(HERE / "account_mcp_relay.py"), run_name="account_mcp_relay")["MCPRelay"]
 LINKS_CACHE_S = 60
@@ -317,7 +318,7 @@ class Dashboard:
         hit = self.cache.get("provider_quota")
         if not hit or time.time() - hit[0] >= QUOTA_CACHE_S or hit[2] != base:
             readers = {"codex": codex_quota, "cursor-cli": lambda: cursor_card_quota(cursor_quota()),
-                       "kimi": lambda: kimi_quota(base_url=base)}
+                       "kimi": lambda: kimi_quota(base_url=base), "agy": agy_quota}
             with ThreadPoolExecutor(len(readers)) as pool:
                 futures = {name: pool.submit(read) for name, read in readers.items()}
             snapshots = {}

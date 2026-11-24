@@ -34,7 +34,7 @@ pub fn resolve(req: &MessagesRequest) -> Option<String> {
 ///
 /// Scanned newest-first: the environment block is re-sent every turn, and the
 /// last one is the only one still true.
-fn detect(req: &MessagesRequest) -> Option<String> {
+pub(crate) fn detect(req: &MessagesRequest) -> Option<String> {
     for message in req.messages.iter().rev() {
         let blocks = normalize_content(&message.content, serde_json::json!({}));
         for block in blocks.iter().rev() {

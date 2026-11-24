@@ -71,12 +71,15 @@ def test_untagged_rows_are_classified_by_the_requested_model():
         (NOW - 80, None, "claude-opus-5", 400, None),
         (NOW - 90, None, "opus", 200, None),
         (NOW - 95, None, "made-up-model", 400, None),
+        (NOW - 96, None, "agy:claude-sonnet-4-6", 200, STREAMED),
+        (NOW - 97, None, "agy-agent", 200, None),
         (NOW - 5, None, "gemini-3-pro", 200, None, "https://api.anthropic.com/v1/messages/count_tokens?beta=true"),
         (NOW - 1, "gemini/gemini-3-flash", "claude-sonnet-5", 200, None),
     ])
     found = providers["provider_usage"](db, now=NOW)["providers"]
     assert {name: card["requests"] for name, card in found.items()} == {
-        "codex": 0, "cursor-cli": 2, "cursor": 2, "gemini": 2, "kimi": 1, "grok": 1}
+        "codex": 0, "cursor-cli": 2, "agy": 2, "cursor": 2, "gemini": 2, "kimi": 1, "grok": 1}
+    assert found["agy"]["last_model"] == "agy:claude-sonnet-4-6", "agy's claude ids are not Claude's"
     assert found["cursor-cli"]["errors"] == 1 and found["cursor-cli"]["last_model"] == "cursor-cli:claude-4.6-opus"
     assert found["gemini"]["last_model"] == "gemini-3-flash", "the router's served_by wins over the requested id"
     assert found["gemini"]["tokens_reported"] == 1
@@ -148,8 +151,9 @@ def test_dashboard_caches_the_cursor_read_on_the_cli_card_only():
     board.cache = {}
     board.provider_quota.__func__.__globals__["cursor_quota"] = lambda: calls.append(1) or CURSOR
     board.provider_quota.__func__.__globals__["codex_quota"] = lambda: None
+    board.provider_quota.__func__.__globals__["agy_quota"] = lambda: None
     first = board.provider_quota()
-    assert sorted(first) == ["codex", "cursor-cli", "kimi"] and first["codex"] is None
+    assert sorted(first) == ["agy", "codex", "cursor-cli", "kimi"] and first["codex"] is None and first["agy"] is None
     assert first["cursor-cli"]["windows"][0]["used"] == 18.25
     assert board.provider_quota() is first and calls == [1]
 
@@ -162,9 +166,10 @@ def test_malformed_cursor_fields_are_isolated_and_cached():
     bad = {**CURSOR, "included": {**CURSOR["included"], "total_percent": "private-value"}}
     board.provider_quota.__func__.__globals__["cursor_quota"] = lambda: calls.append(1) or bad
     board.provider_quota.__func__.__globals__["codex_quota"] = lambda: 1 / 0
+    board.provider_quota.__func__.__globals__["agy_quota"] = lambda: None
     first = board.provider_quota()
     assert first["kimi"]["state"] == "unavailable"
-    assert {k: v for k, v in first.items() if k != "kimi"} == {"codex": {"error": "codex quota: ZeroDivisionError"},
+    assert {k: v for k, v in first.items() if k != "kimi"} == {"agy": None, "codex": {"error": "codex quota: ZeroDivisionError"},
                      "cursor-cli": {"error": "cursor-cli quota: ValueError"}}
     assert "private-value" not in json.dumps(first)
     assert board.provider_quota() is first and calls == [1]
