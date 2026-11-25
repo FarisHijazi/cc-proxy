@@ -70,6 +70,13 @@ launcher's saved `session_mod: true` uses the existing forward proxy; HQ's key
 stays on the proxy owner. Direct HQ configuration remains optional. The opt-in applies only to new interactive sessions;
 do not reload or stop existing sessions to enable it. SDK/API and configuration
 contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain links).
+The same Mod owns the Actual Serving AbovePrompt band; saved `model_metadata: true`
+loads only its UI when event publishing is disabled. It uses authoritative response
+`x-claude-codex-served-by` only, never inferred from requested model or model text.
+Native HTTP hooks lack turn IDs: tool-less/ambiguous calls remain unknown, and
+pending/errors/model switches distinguish the previous confirmed response.
+Do not consume the inference stream, change prompts/transcripts, or add another
+metadata listener/registry/poller. Read the Mod README for correlation boundaries.
 
 ## The constraint that drives everything
 

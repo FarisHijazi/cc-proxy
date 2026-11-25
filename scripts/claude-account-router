@@ -857,16 +857,23 @@ def placeholder_login(alias, profile, config, secure, remote_control=None, priva
     )
 
 
-def session_mod(config, forwarded, env):
-    """Opt new interactive launches into the existing HQ's event ingestion."""
+def session_mod(config, forwarded, env, model_metadata=False):
+    """Opt new interactive launches into the existing Mod's UI and/or events."""
     env.pop("CC_PROXY_SESSION_EVENTS_URL", None)
     env.pop("CC_PROXY_SESSION_EVENTS_KEY_FILE", None)
-    if config in (None, False):
+    if not isinstance(model_metadata, bool):
+        raise ValueError("model_metadata must be a boolean")
+    if config in (None, False) and not model_metadata:
         return forwarded
     options = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded
     if any(arg in {"-p", "--print", "--bare", "--safe-mode", "--no-remote-control"} or
            arg.startswith("--print=") for arg in options):
         return forwarded
+    plugin = Path(__file__).resolve().parent / "session-mod"
+    if config in (None, False):
+        if not (plugin / ".claude-plugin/plugin.json").is_file():
+            raise ValueError("cc-proxy session Mod is missing from this installation")
+        return with_flags(forwarded, "--plugin-dir", str(plugin))
     if config is True:
         if not env.get("HTTPS_PROXY"):
             raise ValueError("session_mod=true needs the launcher's existing HTTPS proxy")
@@ -956,7 +963,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
             extra_settings,
             identify=True,
         )
-        forwarded = session_mod(getattr(args, "session_mod", None), forwarded, env)
+        forwarded = session_mod(getattr(args, "session_mod", None), forwarded, env, getattr(args, "model_metadata", False))
         print(f"Main account: {main_account} via {origin.hostname}:{origin.port}", file=sys.stderr)
         return subprocess.call(["claude", "--settings", settings, *forwarded], env=env)
     finally:
@@ -1056,6 +1063,7 @@ def main():
     args = parser.parse_args()
     saved = json.loads(args.accounts_file.read_text()) if args.accounts_file else {}
     args.session_mod = saved.get("session_mod")
+    args.model_metadata = saved.get("model_metadata", False)
     if not (args.via or args.serve) and saved.get("via"):
         # The proxy's addresses, tried in order by reach(); via_ca is its CA.
         args.via = saved["via"]
@@ -1208,7 +1216,7 @@ def main():
             wait_listener(proxy, port, log.name, ca)
             (state / "client-ca.pem").write_bytes(certificate_bundle(ca))
             env, settings = client_environment(state, port, main_secure, extra=extra_settings)
-            forwarded = session_mod(args.session_mod, forwarded, env)
+            forwarded = session_mod(args.session_mod, forwarded, env, args.model_metadata)
             print(
                 f"Inference → {args.router}; account → {'router → Anthropic' if args.all_endpoints else 'Anthropic'}; config: {state / 'claude'} (shares ~/.claude)",
                 file=sys.stderr,

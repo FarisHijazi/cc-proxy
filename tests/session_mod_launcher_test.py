@@ -90,6 +90,40 @@ def test_prompt_after_option_separator_does_not_disable_interactive_mod():
     assert args.count("--remote-control") == 1
 
 
+def test_metadata_only_loads_existing_mod_without_event_transport_or_remote_control():
+    env = {"CC_PROXY_SESSION_EVENTS_URL": "https://old.example.com", "CC_PROXY_SESSION_EVENTS_KEY_FILE": "/old"}
+    original = ["--plugin-dir", "/existing-plugin", "--model", "sol"]
+    args = mod(False, original, env, model_metadata=True)
+    assert args.count("--plugin-dir") == 2
+    assert "/existing-plugin" in args
+    assert args[args.index("--model") + 1] == "sol"
+    assert "--remote-control" not in args
+    assert env == {}
+
+
+@pytest.mark.parametrize("events", [None, False, True])
+@pytest.mark.parametrize("metadata", [False, True])
+def test_metadata_and_event_combinations_preserve_independent_enablement(events, metadata):
+    env = {"HTTPS_PROXY": "http://127.0.0.1:19000"}
+    args = mod(events, ["--model", "sol"], env, metadata)
+    assert ("--plugin-dir" in args) is (events is True or metadata)
+    assert ("--remote-control" in args) is (events is True)
+    assert ("CC_PROXY_SESSION_EVENTS_URL" in env) is (events is True)
+    assert "CC_PROXY_SESSION_EVENTS_KEY_FILE" not in env
+
+
+@pytest.mark.parametrize("args", [["-p"], ["--bare"], ["--safe-mode"], ["--no-remote-control"]])
+def test_metadata_only_keeps_headless_and_disabled_launches_unmodified(args):
+    env = {"CC_PROXY_SESSION_EVENTS_URL": "https://old.example.com"}
+    assert mod(False, args, env, True) is args
+    assert not env
+
+
+def test_metadata_opt_in_requires_boolean():
+    with pytest.raises(ValueError, match="model_metadata must be a boolean"):
+        mod(False, [], {}, "yes")
+
+
 def test_all_proxy_modes_intercept_reserved_host_once(tmp_path):
     import re
     from types import SimpleNamespace
