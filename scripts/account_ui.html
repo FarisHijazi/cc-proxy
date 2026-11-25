@@ -1028,13 +1028,13 @@ function insightTiles(d) {
   const liveNote = `<span class="muted" title="the recorder has not reported open connections in the last 30 seconds">unknown</span>`;
   const tokens = t.tokens;
   return [
-    tile("Active sessions <span class=\"muted\">15 min</span>", t.active_sessions, "",
+    tile(`Active sessions <span class="muted">${Math.min(15, d.hours * 60)} min</span>`, t.active_sessions, "",
       `${t.sessions} in the ${w} · ${t.active_machines} of ${t.machines} machines active`),
-    tile("Open connections", live ? live.connections : liveNote, "",
+    tile("Open connections (all accounts)", live ? live.connections : liveNote, "",
       live ? `${live.inflight} model calls in flight · ${live.client_ips} client IPs` : "recorder not reporting live counts"),
-    tile("Observed output TPS <span class=\"muted\">5 min</span>", known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
+    tile(`Observed output TPS <span class="muted">${Math.min(5, d.hours * 60)} min</span>`, known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
       `per request · ${w}: p50 ${known(t.speed.p50, rate)} · slowest 5% ${known(t.speed.p5, rate)} · all calls ${known(t.throughput_now, rate)} tok/s now`),
-    tile("Time to first token <span class=\"muted\">5 min</span>", known(t.ttft.now, secs), "",
+    tile(`Time to first token <span class="muted">${Math.min(5, d.hours * 60)} min</span>`, known(t.ttft.now, secs), "",
       `${w}: p50 ${known(t.ttft.p50, secs)} · p95 ${known(t.ttft.p95, secs)} · ${t.ttft.samples} streams`),
     tile("Requests", t.per_minute.toFixed(t.per_minute < 10 ? 1 : 0), "/min",
       `${t.requests.toLocaleString()} calls · <span class="${t.errors ? "status-bad" : ""}">${known(t.error_rate, pct)} errors</span> · <span title="answered by a different model than requested">${known(t.fallback_rate, pct)} fallback</span>`),
@@ -1078,7 +1078,7 @@ function renderInsights() {
   }
   $("now").innerHTML = $("insights-total").innerHTML = insightTiles(d);
   $("insights-note").textContent = (d.timings_recorded ? "" : "This database has no first-token times yet, so TTFT and tokens/s stay unknown until the recorder is updated. ")
-    + "Active = a model call in the last 15 minutes; tokens/s and TTFT “now” = the last 5 minutes.";
+    + `Active = calls in the last ${Math.min(15, d.hours * 60)} minutes; TPS and TTFT “now” = the last ${Math.min(5, d.hours * 60)} minutes. Connections are global.`;
   for (const [id, values, label] of [["insights-account", d.filters?.accounts, "All accounts"], ["insights-model", d.filters?.models, "All models"]]) {
     const select = $(id), chosen = select.value;
     const options = [...new Set([...(values || []), ...(chosen ? [chosen] : [])])];

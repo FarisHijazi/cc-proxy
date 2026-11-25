@@ -113,7 +113,7 @@ def summary(group, minutes):
         "speed": {"now": percentile(group["speed_now"], 0.5), "p50": percentile(group["speed"], 0.5),
                   "p5": percentile(group["speed"], 0.05), "samples": len(group["speed"])},
         "latency": {"p50": percentile(group["latency"], 0.5), "p95": percentile(group["latency"], 0.95)},
-        "throughput_now": group["output_now"] / CURRENT_S if reported else None,
+        "throughput_now": group["output_now"] / min(CURRENT_S, minutes * 60) if reported else None,
         "tokens": tokens if reported else None,
         "tokens_reported": reported,
         "cache_hit": tokens["cache_read"] / prompt if reported and prompt else None,

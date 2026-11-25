@@ -121,6 +121,7 @@ def test_short_windows_and_bucket_medians(db, minutes):
     assert history["points"][0]["ttft"] == pytest.approx(0.1)
     assert history["points"][-1]["speed"] is None
     assert history["points"][-1]["speed_samples"] == 0
+    assert result["total"]["throughput_now"] == pytest.approx(20 / (minutes * 60) if minutes <= 5 else 0)
 
 
 @pytest.mark.parametrize("recent_speed, expected", [(50, "healthy"), (30, "degraded"), (10, "slow")])
