@@ -862,7 +862,7 @@ def session_mod(config, forwarded, env, model_metadata=False):
     env.pop("CC_PROXY_SESSION_EVENTS_URL", None)
     env.pop("CC_PROXY_SESSION_EVENTS_KEY_FILE", None)
     if not isinstance(model_metadata, bool):
-        raise ValueError("model_metadata must be a boolean")
+        raise TypeError("model_metadata must be a boolean")
     if config in (None, False) and not model_metadata:
         return forwarded
     options = forwarded[:forwarded.index("--")] if "--" in forwarded else forwarded

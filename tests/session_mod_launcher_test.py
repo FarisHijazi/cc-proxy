@@ -120,7 +120,7 @@ def test_metadata_only_keeps_headless_and_disabled_launches_unmodified(args):
 
 
 def test_metadata_opt_in_requires_boolean():
-    with pytest.raises(ValueError, match="model_metadata must be a boolean"):
+    with pytest.raises(TypeError, match="model_metadata must be a boolean"):
         mod(False, [], {}, "yes")
 
 
