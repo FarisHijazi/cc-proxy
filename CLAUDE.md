@@ -378,7 +378,7 @@ stalled Remote Control for every machine once the DB reached 18 GB
 (`docs/devlog/claude_20261112-traffic-writer-off-event-loop.md`, plain path).
 Each model-call row also stores `input_tokens` (cache writes included)/`cache_read_tokens`/`output_tokens`/`cache_write_tokens`/`cache_write_1h_tokens` from the reply (parser:
 `account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
-fills older rows. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's
+fills older rows. Rows also keep `first_byte` (reply headers) and `first_token` (first streamed `content_block_delta`); open client connections and in-flight model calls stay in memory and the writer thread copies them into the one-row `live` table every 5 s. `scripts/account_insights.py` derives the dashboard's Insights view (`/api/insights?hours=`, at most 24: a week was measured at 48 s cold) from those, overall and per account and per model: active sessions, connections, machines, TTFT, tokens/s, requests/min, error, fallback and cache-hit rates. No samples or a stale `live` row is unknown, never zero. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's
 `served_models()` adds the same non-Claude ids to the `/model` picker at launch (rows from `served_rows()`).
 **The `/model` menu is per host**: `modelPicker.options` in that host's `~/.claude/settings.json`, which the proxy cannot
 change; the launcher also snapshots it into `--settings` at launch, so start a new session to see changes. After adding or removing a backend or model, run

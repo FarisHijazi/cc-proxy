@@ -335,3 +335,85 @@ def test_cache_writes_and_their_one_hour_part_are_stored_for_pricing(tmp_path):
         "output_tokens": 3}}).encode()))
     assert tokens == {"input": 710, "cache_read": 5, "output": 3, "cache_write": 700, "cache_write_1h": 400}
     assert {"cache_write_tokens", "cache_write_1h_tokens"} <= set(module.TOKEN_COLUMNS)
+
+
+def test_first_byte_and_first_token_are_recorded_for_streams(tmp_path):
+    import time
+
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {"content-type": "text/event-stream"})
+    flow.response.stream = True
+    time.sleep(0.02)
+    traffic.responseheaders(flow)
+    flow.response.stream(b"event: message_start\n")
+    time.sleep(0.02)
+    before_delta = time.time()
+    flow.response.stream(b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n')
+    time.sleep(0.02)
+    flow.response.stream(b"event: content_block_delta\n")
+    traffic.response(flow)
+    traffic.flush()
+    [row] = rows(tmp_path)
+    assert row["started"] < row["first_byte"] < before_delta <= row["first_token"] < row["finished"]
+    assert row["first_token"] - before_delta < 0.015, "the first delta, not a later one"
+
+
+def test_a_reply_that_never_streamed_content_has_no_first_token(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(529, b'{"type":"error"}')
+    traffic.responseheaders(flow)
+    traffic.response(flow)
+    traffic.flush()
+    [row] = rows(tmp_path)
+    assert row["first_byte"] is not None and row["first_token"] is None
+
+
+def test_open_connections_and_in_flight_calls_reach_the_live_table(tmp_path):
+
+    traffic = recorder(tmp_path)
+    client = tflow.tclient_conn()
+    traffic.client_connected(client)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {"x-claude-codex-served-by": "codex/sol"})
+    traffic.responseheaders(flow)
+    traffic.connection()
+    traffic.write_live()
+    [live] = rows(tmp_path, "live")
+    body = json.loads(live["body"])
+    assert body["connections"] == [client.peername[0]]
+    [call] = body["inflight"]
+    assert (call["served_by"], call["session_id"], call["host"]) == ("codex/sol", "s-1", "laptop")
+    assert call["account"] == "proxy-account-user@example.com+rc=other"
+    traffic.response(flow)
+    traffic.client_disconnected(client)
+    traffic.flush()
+    traffic.write_live()
+    body = json.loads(rows(tmp_path, "live")[0]["body"])
+    assert body["connections"] == [] and body["inflight"] == []
+
+
+def test_count_tokens_and_other_requests_are_not_in_flight_model_calls(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    flow.request.path = "/v1/messages/count_tokens?beta=true"
+    traffic.requestheaders(flow)
+    assert traffic.inflight == {}
+
+
+def test_older_databases_gain_the_timing_columns_and_live_table(tmp_path):
+    db = sqlite3.connect(tmp_path / "traffic.sqlite3")
+    old = module.SCHEMA.replace(", first_byte REAL, first_token REAL", "").split("CREATE TABLE IF NOT EXISTS live")[0]
+    db.executescript(old)
+    db.execute("INSERT INTO flows (id, started, model) VALUES ('old', 1, 'm')")
+    db.commit()
+    db.close()
+    recorder(tmp_path).connection()
+    db = sqlite3.connect(tmp_path / "traffic.sqlite3")
+    assert {"first_byte", "first_token"} <= {row[1] for row in db.execute("PRAGMA table_info(flows)")}
+    assert db.execute("SELECT first_token FROM flows WHERE id = 'old'").fetchone() == (None,)
+    assert db.execute("SELECT count(*) FROM live").fetchone() == (0,)

@@ -1,0 +1,78 @@
+// Real-DOM check of the dashboard's Insights view and Overview "Right now" tiles, /api mocked, light and dark.
+// Run: node tests/account_ui_insights_test.mjs
+// Env: PLAYWRIGHT_DIR (dir containing node_modules/playwright; default ~/Projects/gittok),
+//      CHROMIUM (browser binary; default: Playwright's own).
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = process.env.PLAYWRIGHT_DIR || join(homedir(), "Projects/gittok");
+const { chromium } = createRequire(join(root, "x.js"))("playwright");
+const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../scripts/account_ui.html"), "utf8");
+
+const group = (extra) => ({
+  requests: 120, per_minute: 2, errors: 3, error_rate: 0.025, fallbacks: 6, fallback_rate: 0.05, statuses: { 200: 117, 429: 3 },
+  sessions: 9, active_sessions: 4, machines: 3, active_machines: 2, inflight: 0,
+  ttft: { now: 1.25, p50: 1.5, p95: 4.2, samples: 100 }, speed: { now: 61.2, p50: 55, p95: 120, samples: 100 },
+  latency: { p50: 8.5, p95: 40 }, throughput_now: 12.5, tokens: { input: 50000, cache_read: 2000000, output: 90000 },
+  tokens_reported: 117, cache_hit: 0.975, ...extra,
+});
+const INSIGHTS = {
+  hours: 1, traffic_db: true, timings_recorded: true,
+  live: { at: Date.now() / 1000, connections: 7, client_ips: 3, inflight: 2, dropped: 0 },
+  total: group({ inflight: 2 }),
+  by_account: [group({ account: "a@example.com", inflight: 2, requests: 100 }),
+               group({ account: "codex", requests: 20, ttft: { now: null, p50: null, p95: null, samples: 0 }, tokens: null, cache_hit: null })],
+  by_model: [group({ model: "claude-opus-5-5", inflight: 1, requests: 70 }), group({ model: "sol", requests: 50, inflight: 1 })],
+};
+
+const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM || undefined });
+try {
+  for (const colorScheme of ["light", "dark"]) {
+    const page = await (await browser.newContext({ viewport: { width: 1280, height: 1600 }, colorScheme })).newPage();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    await page.route("http://dash.test/**", async (route) => {
+      const url = new URL(route.request().url());
+      const json = (body) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
+      if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: html });
+      if (url.pathname === "/api/insights") { await gate; return json(INSIGHTS); }
+      if (url.pathname === "/api/stats") return json({ total: 0, errors: 0, series: {}, by_account: {}, by_host: {}, by_model: {} });
+      if (url.pathname === "/api/state") return route.fulfill({ status: 500, body: "{}" });
+      return json({ rows: [], sessions: [] });
+    });
+    await page.goto("http://dash.test/#overview");
+    assert.equal(await page.locator("#now").innerText(), "Loading live insights…", "no numbers before the first answer");
+    await page.goto("http://dash.test/#insights");
+    assert.equal(await page.locator("#insights-total").innerText(), "Loading insights…");
+    assert.equal(await page.locator("#insights-accounts").innerText(), "Loading accounts…");
+    release();
+    await page.locator("#insights-accounts tr[data-name]").first().waitFor();
+    const tiles = await page.locator("#insights-total").innerText();
+    for (const want of [/Active sessions[\s\S]*4/, /Open connections[\s\S]*7/, /2 model calls in flight · 3 client IPs/,
+                        /61\s*tok\/s/, /1\.25 s/, /p95 4\.20 s/, /2\.0\s*\/min/, /2\.5% errors/, /5\.0% fallback/, /98% cache hit/])
+      assert.match(tiles, want);
+    assert.equal(await page.locator("#now").textContent(), await page.locator("#insights-total").textContent(), "Overview shows the same tiles");
+    const codex = await page.locator('#insights-accounts tr[data-name="codex"]').innerText();
+    assert.match(codex, /unknown/, "a group with no samples says unknown, never 0");
+    assert.deepEqual(await page.locator("#insights-models tr[data-name]").evaluateAll((rows) => rows.map((r) => r.dataset.name)),
+                     ["claude-opus-5-5", "sol"]);
+    await page.locator('#insights-models th[data-sort="requests"]').click();
+    assert.deepEqual(await page.locator("#insights-models tr[data-name]").evaluateAll((rows) => rows.map((r) => r.dataset.name)),
+                     ["claude-opus-5-5", "sol"], "most calls first");
+    await page.locator('#insights-models th[data-sort="requests"]').click();
+    assert.deepEqual(await page.locator("#insights-models tr[data-name]").evaluateAll((rows) => rows.map((r) => r.dataset.name)),
+                     ["sol", "claude-opus-5-5"], "a second click reverses");
+    assert.match(await page.locator("#insights-status").innerText(), /429[\s\S]*3/);
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    assert.equal(bg, colorScheme === "dark" ? "rgb(12, 12, 14)" : "rgb(246, 246, 244)");
+    await page.setViewportSize({ width: 390, height: 1600 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "no sideways page scroll on a phone");
+  }
+  console.log("insights view ok");
+} finally {
+  await browser.close();
+}
