@@ -76,3 +76,9 @@ def test_only_the_whitelisted_stylesheet_is_served(app):
     assert status == 200 and headers["content-type"].startswith("text/css") and b"MIT" in body[:200]
     assert call(base, "/pico.conditional.min.css")[0] == 404
     assert call(base, "/../account_ui.py")[0] == 404
+
+
+def test_insights_without_a_traffic_database_say_so_instead_of_zeros(app):
+    base, _ = app
+    status, _, raw = call(base, "/api/insights?hours=24")
+    assert status == 200 and json.loads(raw) == {"hours": 24, "traffic_db": False}

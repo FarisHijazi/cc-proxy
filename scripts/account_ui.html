@@ -159,6 +159,14 @@
   .tiles { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr); gap: 8px; }
   .tiles div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .tiles strong { font-size: 15px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .insight-tiles { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .insight-tiles .big { font-size: 24px; font-variant-numeric: tabular-nums; }
+  .insight-tiles .unit { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .insights td, .insights th { text-align: right; font-variant-numeric: tabular-nums; }
+  .insights td:first-child, .insights th:first-child { text-align: left; }
+  .insights th[data-sort] { cursor: pointer; user-select: none; } .insights th[data-sort]:hover { color: var(--text); }
+  .insights th.sorted { color: var(--accent); }
+  .insights tbody tr { cursor: default; }
 </style>
 </head>
 <body>
@@ -168,6 +176,7 @@
   <button id="menu-toggle" class="secondary" aria-expanded="false" aria-controls="nav-list">Menu</button>
   <ul id="nav-list">
     <li><a href="#overview">Overview</a></li>
+    <li><a href="#insights">Insights</a></li>
     <li><a href="#accounts">Accounts</a></li>
     <li><a href="#routing">Routing</a></li>
     <li><a href="#models">Models</a></li>
@@ -189,6 +198,8 @@
   <div id="error"></div>
 
   <section data-view="overview">
+  <h2>Right now <a href="#insights" style="text-transform:none;letter-spacing:0">per account and model</a></h2>
+  <div class="stats insight-tiles" id="now"><div class="panel skeleton">Loading live insights…</div></div>
   <h2>Providers</h2>
   <div class="providers" id="providers"><div class="skeleton">Asking the router which backends are signed in…</div></div>
 
@@ -197,6 +208,20 @@
     <div class="seg" id="range"><button data-h="1">1h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button></div>
   </div>
   <div class="stats" id="stats"><div class="panel skeleton">Loading activity…</div></div>
+  </section>
+
+  <section data-view="insights" hidden>
+  <div class="row" style="margin-bottom:10px">
+    <div class="seg" id="insights-range"><button data-h="1" class="on">1h</button><button data-h="6">6h</button><button data-h="24">24h</button></div>
+    <span class="small muted" id="insights-note"></span>
+  </div>
+  <div class="stats insight-tiles" id="insights-total"><div class="panel skeleton">Loading insights…</div></div>
+  <h2>By account <span class="muted" style="text-transform:none;letter-spacing:0">who answered; click a column to sort</span></h2>
+  <div class="panel scroll insights" style="padding:0" id="insights-accounts"><div class="skeleton">Loading accounts…</div></div>
+  <h2>By model <span class="muted" style="text-transform:none;letter-spacing:0">the model that answered</span></h2>
+  <div class="panel scroll insights" style="padding:0" id="insights-models"><div class="skeleton">Loading models…</div></div>
+  <h2>Replies by status</h2>
+  <div class="stats" id="insights-status"><div class="panel skeleton">Loading statuses…</div></div>
   </section>
 
   <section data-view="accounts" hidden>
@@ -956,7 +981,91 @@ $("key-form").onsubmit = async (event) => {
   $("key-name").value = "";
 };
 
-const VIEWS = {overview: "Overview", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", keys: "API keys", sessions: "Sessions", requests: "Requests"};
+let insightsData = null, insightsHours = 1;
+const insightSort = {"insights-accounts": ["inflight", -1], "insights-models": ["inflight", -1]};
+const UNKNOWN = `<span class="muted" title="no samples in this window">unknown</span>`;
+const known = (v, f) => v === null || v === undefined ? UNKNOWN : f(v);
+const secs = (v) => v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(v < 10 ? 2 : 1)} s`;
+const pct = (v) => `${(v * 100).toFixed(v && v < 0.1 ? 1 : 0)}%`;
+const rate = (v) => v.toFixed(v < 10 ? 1 : 0);
+const windowName = (h) => h === 1 ? "last hour" : `last ${h}h`;
+function tile(label, value, unit, detail) {
+  return `<div class="panel"><div class="small muted">${label}</div><div class="big">${value}${unit ? `<span class="unit">${unit}</span>` : ""}</div><div class="small muted">${detail}</div></div>`;
+}
+function insightTiles(d) {
+  const t = d.total, live = d.live, w = windowName(d.hours);
+  const liveNote = `<span class="muted" title="the recorder has not reported open connections in the last 30 seconds">unknown</span>`;
+  const tokens = t.tokens;
+  return [
+    tile("Active sessions <span class=\"muted\">15 min</span>", t.active_sessions, "",
+      `${t.sessions} in the ${w} · ${t.active_machines} of ${t.machines} machines active`),
+    tile("Open connections", live ? live.connections : liveNote, "",
+      live ? `${live.inflight} model calls in flight · ${live.client_ips} client IPs` : "recorder not reporting live counts"),
+    tile("Tokens / second <span class=\"muted\">5 min</span>", known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
+      `per request · ${w}: p50 ${known(t.speed.p50, rate)} · slowest 5% ${known(t.speed.p5, rate)} · all calls ${known(t.throughput_now, rate)} tok/s now`),
+    tile("Time to first token <span class=\"muted\">5 min</span>", known(t.ttft.now, secs), "",
+      `${w}: p50 ${known(t.ttft.p50, secs)} · p95 ${known(t.ttft.p95, secs)} · ${t.ttft.samples} streams`),
+    tile("Requests", t.per_minute.toFixed(t.per_minute < 10 ? 1 : 0), "/min",
+      `${t.requests.toLocaleString()} calls · <span class="${t.errors ? "status-bad" : ""}">${known(t.error_rate, pct)} errors</span> · <span title="answered by a different model than requested">${known(t.fallback_rate, pct)} fallback</span>`),
+    tile("Tokens", tokens ? big(tokens.input + tokens.cache_read + tokens.output) : UNKNOWN, "",
+      tokens ? `${big(tokens.input)} in · ${big(tokens.cache_read)} cache read · ${big(tokens.output)} out · ${known(t.cache_hit, pct)} cache hit` : "no reply reported tokens"),
+  ].join("");
+}
+const INSIGHT_COLUMNS = [
+  ["In flight", "inflight", (e) => e.inflight], ["Active sessions", "active_sessions", (e) => e.active_sessions],
+  ["Sessions", "sessions", (e) => e.sessions], ["Machines", "machines", (e) => e.machines],
+  ["Calls", "requests", (e) => e.requests.toLocaleString()], ["/min", "per_minute", (e) => e.per_minute.toFixed(1)],
+  ["Errors", "error_rate", (e) => `<span class="${e.errors ? "status-bad" : ""}">${known(e.error_rate, pct)}</span>`],
+  ["Fallback", "fallback_rate", (e) => known(e.fallback_rate, pct)],
+  ["TTFT p50", "ttft.p50", (e) => known(e.ttft.p50, secs)], ["TTFT p95", "ttft.p95", (e) => known(e.ttft.p95, secs)],
+  ["tok/s p50", "speed.p50", (e) => known(e.speed.p50, rate)], ["Latency p50", "latency.p50", (e) => known(e.latency.p50, secs)],
+  ["Cache hit", "cache_hit", (e) => known(e.cache_hit, pct)],
+  ["Input", "tokens.input", (e) => known(e.tokens && e.tokens.input, big)],
+  ["Cache read", "tokens.cache_read", (e) => known(e.tokens && e.tokens.cache_read, big)],
+  ["Output", "tokens.output", (e) => known(e.tokens && e.tokens.output, big)],
+];
+const pick = (e, key) => key.split(".").reduce((v, k) => v === null || v === undefined ? v : v[k], e);
+function insightTable(id, rows, nameKey, nameLabel) {
+  const [key, dir] = insightSort[id];
+  const value = (e) => key === nameKey ? e[nameKey] : pick(e, key) ?? -Infinity;
+  const sorted = [...rows].sort((a, b) => (value(a) > value(b) ? 1 : value(a) < value(b) ? -1 : 0) * dir);
+  const head = [[nameLabel, nameKey], ...INSIGHT_COLUMNS].map(([label, k]) => `<th data-sort="${k}" class="${k === key ? "sorted" : ""}">${label}${k === key ? (dir < 0 ? " ↓" : " ↑") : ""}</th>`).join("");
+  $(id).innerHTML = rows.length ? `<table><thead><tr>${head}</tr></thead><tbody>${sorted.map((e) => `<tr data-name="${esc(e[nameKey])}"><td title="${esc(e[nameKey])}"><strong>${esc(e[nameKey])}</strong></td>${INSIGHT_COLUMNS.map(([, , f]) => `<td>${f(e)}</td>`).join("")}</tr>`).join("")}</tbody></table>`
+    : `<div class="skeleton">No model calls in this window.</div>`;
+  $(id).querySelectorAll("th[data-sort]").forEach((th) => th.onclick = () => {
+    const k = th.dataset.sort;
+    insightSort[id] = [k, insightSort[id][0] === k ? -insightSort[id][1] : k === nameKey ? 1 : -1];
+    renderInsights();
+  });
+}
+function renderInsights() {
+  const d = insightsData;
+  if (!d) return;
+  if (!d.traffic_db) {
+    for (const id of ["now", "insights-total", "insights-accounts", "insights-models", "insights-status"]) $(id).innerHTML = `<div class="panel skeleton">Traffic recording is off, so nothing is known.</div>`;
+    return;
+  }
+  $("now").innerHTML = $("insights-total").innerHTML = insightTiles(d);
+  $("insights-note").textContent = (d.timings_recorded ? "" : "This database has no first-token times yet, so TTFT and tokens/s stay unknown until the recorder is updated. ")
+    + "Active = a model call in the last 15 minutes; tokens/s and TTFT “now” = the last 5 minutes.";
+  insightTable("insights-accounts", d.by_account, "account", "Account");
+  insightTable("insights-models", d.by_model, "model", "Model");
+  $("insights-status").innerHTML = bars(`Replies, ${windowName(d.hours)}`, d.total.statuses);
+}
+async function loadInsights() {
+  const asked = insightsHours;
+  try {
+    const d = await api(`/api/insights?hours=${asked}`);
+    if (asked === insightsHours) { insightsData = d; renderInsights(); }  // a slower, older answer must not replace the chosen window
+  }
+  catch (e) { showError(e); }
+}
+$("insights-range").querySelectorAll("button").forEach((b) => b.onclick = () => {
+  $("insights-range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+  insightsHours = +b.dataset.h; loadInsights();
+});
+
+const VIEWS = {overview: "Overview", insights: "Insights", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", keys: "API keys", sessions: "Sessions", requests: "Requests"};
 function showView() {
   const view = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : "overview";
   document.querySelectorAll("[data-view]").forEach((x) => { x.hidden = x.dataset.view !== view; });
@@ -981,7 +1090,7 @@ async function loadState() {
   catch (e) { showError(e); if (!hasLoaded) modelsFailed(e); }
 }
 
-$("refresh").onclick = () => { loadState(); loadStats(); loadTraffic(); loadSessions(); loadUsage(); };
+$("refresh").onclick = () => { loadState(); loadInsights(); loadStats(); loadTraffic(); loadSessions(); loadUsage(); };
 $("usage-range").querySelectorAll("button").forEach((b) => b.onclick = () => {
   $("usage-range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
   usageHours = +b.dataset.h; loadUsage();
@@ -993,7 +1102,8 @@ $("range").querySelectorAll("button").forEach((b) => b.onclick = () => {
 let typing;
 $("q").oninput = () => { clearTimeout(typing); typing = setTimeout(loadTraffic, 250); };
 $("inference").onchange = loadTraffic;
-loadState(); loadStats(); loadTraffic(); loadSessions(); loadUsage();
+loadState(); loadInsights(); loadStats(); loadTraffic(); loadSessions(); loadUsage();
+setInterval(loadInsights, 10000);
 setInterval(loadState, 60000);
 setInterval(loadUsage, 60000);
 setInterval(() => { loadStats(); loadTraffic(); loadSessions(); }, 15000);

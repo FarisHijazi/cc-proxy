@@ -12,6 +12,10 @@ mitmproxy runs every hook on ONE event loop shared by every connection of every
 account, so the hooks only copy plain data into a bounded queue. One writer thread
 owns the database and does all decoding, redaction, deduplication, pruning and
 inserts. When it falls behind, rows are dropped: telemetry never delays traffic.
+
+Each row also keeps `first_byte` (reply headers) and `first_token` (first streamed content delta),
+so the dashboard derives TTFT and tokens/s. Open client connections and in-flight model calls live
+only in memory; the writer thread copies them into the one-row `live` table every LIVE_EVERY_S.
 """
 
 import hashlib
@@ -31,11 +35,15 @@ from mitmproxy.net import encoding
 
 reply_tokens = runpy.run_path(str(Path(__file__).with_name("account_providers.py")))["reply_tokens"]
 TOKEN_COLUMNS = ("input_tokens", "cache_read_tokens", "output_tokens", "cache_write_tokens", "cache_write_1h_tokens")
+TIMING_COLUMNS = ("first_byte", "first_token")
 FLOW_COLUMNS = (
     "id, started, finished, client_ip, client_host, client_user, launch_cwd, cwd, session_id, account, "
     "served_by, model, method, url, status, error, request_headers, request_body, response_headers, "
-    "response_body, api_key, " + ", ".join(TOKEN_COLUMNS)
+    "response_body, api_key, " + ", ".join(TOKEN_COLUMNS + TIMING_COLUMNS)
 )
+# Anthropic SSE as every backend's translation emits it: the first chunk carrying one is the first token.
+CONTENT_DELTA = b"content_block_delta"
+MODEL_CALL = re.compile(r"/v1/messages(?:\?|$)")
 
 # Set by `claude-account-router --via` clients; stripped here so they go no further.
 CLIENT_HEADERS = {
@@ -62,7 +70,7 @@ CREATE TABLE IF NOT EXISTS flows (
     method TEXT, url TEXT, status INTEGER, error TEXT,
     request_headers TEXT, request_body BLOB, response_headers TEXT, response_body BLOB, api_key TEXT,
     input_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
-    cache_write_tokens INTEGER, cache_write_1h_tokens INTEGER
+    cache_write_tokens INTEGER, cache_write_1h_tokens INTEGER, first_byte REAL, first_token REAL
 );
 CREATE INDEX IF NOT EXISTS flows_started ON flows(started);
 CREATE INDEX IF NOT EXISTS flows_session ON flows(session_id);
@@ -71,6 +79,7 @@ CREATE TABLE IF NOT EXISTS websocket_messages (
     flow_id TEXT, at REAL, from_client INTEGER, body BLOB
 );
 CREATE INDEX IF NOT EXISTS websocket_flow ON websocket_messages(flow_id);
+CREATE TABLE IF NOT EXISTS live (name TEXT PRIMARY KEY, at REAL, body TEXT);
 """
 
 
@@ -159,6 +168,8 @@ def clean_headers(items):
 
 PRUNE_EVERY_S = 3600
 QUEUE_MAX = 5000
+LIVE_EVERY_S = 5
+INFLIGHT_MAX_S = 3600
 
 
 class TrafficDB:
@@ -169,6 +180,9 @@ class TrafficDB:
         self.pruned = 0.0
         self.dropped = 0
         self.jobs = queue.Queue(QUEUE_MAX)
+        self.live_lock = threading.Lock()
+        self.clients, self.inflight = {}, {}  # connection id -> ip; flow id -> who and since when
+        self.live_at = 0.0
         threading.Thread(target=self.writer, name="traffic-db", daemon=True).start()
 
     def enqueue(self, path, job, *args):
@@ -183,14 +197,37 @@ class TrafficDB:
 
     def writer(self):
         while True:
-            path, job, args = self.jobs.get()
             try:
-                if self.connection(path) is not None:
+                path, job, args = self.jobs.get(timeout=LIVE_EVERY_S)
+            except queue.Empty:
+                path = job = None
+            try:
+                if job is not None and self.connection(path) is not None:
                     job(*args)
+                if time.time() - self.live_at >= LIVE_EVERY_S and self.connection() is not None:
+                    self.write_live()
             except Exception as error:  # noqa: BLE001 - a bad row must not stop the recorder
                 print(f"traffic-db: {type(error).__name__}: {error}", flush=True)
             finally:
-                self.jobs.task_done()
+                if job is not None:
+                    self.jobs.task_done()
+
+    def write_live(self):
+        self.live_at = time.time()
+        with self.live_lock:
+            for flow_id in [k for k, v in self.inflight.items() if self.live_at - v["started"] > INFLIGHT_MAX_S]:
+                del self.inflight[flow_id]  # a flow mitmproxy never finished must not count forever
+            body = {"connections": list(self.clients.values()), "inflight": [dict(v) for v in self.inflight.values()]}
+        body.update(dropped=self.dropped, queued=self.jobs.qsize())
+        self.db.execute("INSERT OR REPLACE INTO live VALUES ('now', ?, ?)", (self.live_at, json.dumps(body)))
+
+    def client_connected(self, client):
+        with self.live_lock:
+            self.clients[client.id] = client.peername[0] if client.peername else None
+
+    def client_disconnected(self, client):
+        with self.live_lock:
+            self.clients.pop(client.id, None)
 
     def connection(self, path=None):
         path = self.path_of() if path is None else path
@@ -209,9 +246,10 @@ class TrafficDB:
                 except sqlite3.OperationalError:
                     pass
                 present = {row[1] for row in self.db.execute("PRAGMA table_info(flows)")}
-                for column in TOKEN_COLUMNS:
+                for column in TOKEN_COLUMNS + TIMING_COLUMNS:
                     if column not in present:
-                        self.db.execute(f"ALTER TABLE flows ADD COLUMN {column} INTEGER")
+                        kind = "REAL" if column in TIMING_COLUMNS else "INTEGER"
+                        self.db.execute(f"ALTER TABLE flows ADD COLUMN {column} {kind}")
                 if "api_key" not in present:
                     self.db.execute("ALTER TABLE flows ADD COLUMN api_key TEXT")
         return self.db
@@ -248,13 +286,27 @@ class TrafficDB:
             if header in headers:
                 meta[column] = unquote(headers.pop(header))
         flow.metadata["traffic"] = meta
+        if flow.request.method == "POST" and MODEL_CALL.search(flow.request.path):
+            with self.live_lock:
+                self.inflight[flow.id] = {"started": meta["started"], "client": meta["client_ip"],
+                                          "host": meta.get("client_host"), "account": meta["account"],
+                                          "session_id": meta["session_id"], "served_by": None}
 
     def responseheaders(self, flow):
-        if "traffic" in flow.metadata and flow.response.stream:
-            chunks = flow.metadata["traffic"]["chunks"] = []
+        meta = flow.metadata.get("traffic")
+        if meta is None:
+            return
+        meta["first_byte"] = time.time()
+        with self.live_lock:
+            if flow.id in self.inflight:
+                self.inflight[flow.id]["served_by"] = flow.response.headers.get(SERVED_BY_HEADER)
+        if flow.response.stream:
+            chunks = meta["chunks"] = []
 
             def tee(data):
                 chunks.append(data)
+                if "first_token" not in meta and CONTENT_DELTA in data:
+                    meta["first_token"] = time.time()
                 return data
 
             flow.response.stream = tee
@@ -287,6 +339,8 @@ class TrafficDB:
     def record(self, flow):
         """On the event loop: copy what the row needs, nothing else."""
         meta = flow.metadata.pop("traffic", None)
+        with self.live_lock:
+            self.inflight.pop(flow.id, None)
         if meta is None:
             return
         request, response = flow.request, flow.response
@@ -331,7 +385,7 @@ class TrafficDB:
             response_headers, served_by = clean_headers(items), lower.get(SERVED_BY_HEADER)
             tokens = reply_tokens(response_body) if model else None
         self.db.execute(
-            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 26)})",
+            f"INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES ({','.join('?' * 28)})",
             (
                 meta["id"], meta["started"], meta["finished"],
                 meta["client_ip"], meta.get("client_host") or tailnet_name(meta["client_ip"]),
@@ -342,6 +396,7 @@ class TrafficDB:
                 response_body, meta["api_key"],
                 *((tokens["input"], tokens["cache_read"], tokens["output"], tokens["cache_write"], tokens["cache_write_1h"])
                   if tokens else (None,) * 5),
+                meta.get("first_byte"), meta.get("first_token"),
             ),
         )
 
