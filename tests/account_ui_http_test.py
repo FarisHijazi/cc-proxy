@@ -70,6 +70,44 @@ def test_tiers_save_to_the_file_and_reload_through_state(app):
     assert "tiers" not in json.loads(accounts.read_text()).get("fallback", {})
 
 
+def test_console_priority_roundtrips_without_secrets_or_policy_changes(app, capsys):
+    base, accounts = app
+    cfg = json.loads(accounts.read_text())
+    member = {"key": "sk-ant-api03-fake-test-key", "preferred": False, "monthly_budget_usd": 180}
+    cfg.update(api_key_accounts={"console": member}, disabled=["console"],
+               fallback={"chains": {"claude-fable*": ["accounts"], "fable": ["accounts"]}})
+    accounts.write_text(json.dumps(cfg))
+    for preferred in (True, False):
+        status, _, raw = call(base, "/api/config", {"api_key_accounts": {"console": {"preferred": preferred}}})
+        assert status == 200
+        for response in (raw, call(base, "/api/state")[2]):
+            card = next(a for a in json.loads(response)["accounts"] if a["alias"] == "console")
+            assert card["preferred"] is preferred and card["disabled"] is True
+            assert card["budget_usd"] == 180
+            assert member["key"] not in response.decode()
+        expected = {**cfg, "api_key_accounts": {"console": {**member, "preferred": preferred}}}
+        assert json.loads(accounts.read_text()) == expected
+    assert member["key"] not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("patch", [None, [], {"unknown": {"preferred": True}},
+    {"console": True}, {"console": {"preferred": "true"}}, {"console": {"preferred": 1}},
+    {"console": {"preferred": None}}, {"console": {}},
+    {"console": {"preferred": True, "monthly_budget_usd": 999}},
+    {"console": {"key": "secret"}},
+    {"console": {"preferred": True}, "unknown": {"preferred": False}}])
+def test_console_priority_rejects_invalid_patches_atomically(app, patch):
+    base, accounts = app
+    cfg = json.loads(accounts.read_text())
+    cfg["api_key_accounts"] = {"console": {"key": "sk-ant-api03-fake-test-key", "monthly_budget_usd": 180}}
+    accounts.write_text(json.dumps(cfg))
+    before = accounts.read_bytes()
+    status, _, raw = call(base, "/api/config", {"api_key_accounts": patch})
+    assert status == 400
+    assert b"fake-test-key" not in raw
+    assert accounts.read_bytes() == before
+
+
 def test_only_the_whitelisted_stylesheet_is_served(app):
     base, _ = app
     status, headers, body = call(base, "/pico.css")

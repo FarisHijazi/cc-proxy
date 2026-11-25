@@ -401,7 +401,7 @@ const isRun = (t) => t === "accounts" || /^accounts:\d+$/.test(t);
 const subscriptions = () => state.accounts.filter((a) => a.kind !== "api_key");
 // Spend is only what this proxy sent through the key since the 1st (UTC); null means unknown, never zero.
 function keySpend(a) {
-  if (a.spend_usd == null) return `<div class="small muted">spend unknown: no traffic database to read it from</div>`;
+  if (a.spend_usd == null) return `<div class="small muted">spend unknown: no traffic database to read it from${a.budget_usd == null ? "" : ` · $${a.budget_usd.toFixed(2)} monthly budget still applies`}</div>`;
   const spent = `$${a.spend_usd.toFixed(2)}`;
   if (a.budget_usd == null) return `<div class="small muted">${spent} this month through the proxy · no budget set</div>`;
   const pct = Math.min(100, a.spend_usd / a.budget_usd * 100), level = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
@@ -414,12 +414,18 @@ function keyCard(a) {
   return `<div class="card ${a.disabled ? "off" : ""} ${a.preferred && !a.disabled ? "pref" : ""}">
       <div class="card-head">
         <span class="name">${esc(a.alias)}</span><span class="spacer"></span>
-        ${a.preferred ? `<span class="badge accent" title="Every session tries this key first, then the order below">tried first</span>` : `<span class="badge" title="Tried after every Claude account">after the accounts</span>`}
+        <label class="small">Console API key priority
+          <select data-key-preference="${esc(a.alias)}" aria-label="Console API key priority for ${esc(a.alias)}">
+            <option value="true" ${a.preferred ? "selected" : ""}>Preferred</option>
+            <option value="false" ${a.preferred ? "" : "selected"}>Last resort</option>
+          </select>
+        </label>
         <span class="badge" title="Console API key: billed per token; falls back when its credit or spend limit runs out">api key</span>
       </div>
+      <div class="small muted">${a.preferred ? "Before subscription accounts in unpinned pools." : "After subscription accounts in the Claude pool; other providers follow Routing."} Priority only changes order, not availability. Pinned sessions and existing fallback affinity still apply. Budget and upstream credit limits always apply; billing failures fall back.</div>
       ${keySpend(a)}
       <div class="card-foot">
-        <span class="small muted">${a.disabled ? "off: never tried" : "in the pool"}</span><span class="spacer"></span>
+        <span class="small muted">${a.disabled ? "Disabled: never tried" : a.budget_usd != null && a.spend_usd == null ? "Budget unknown: not usable" : a.budget_usd != null && a.spend_usd >= a.budget_usd ? "Budget reached: not usable" : "Enabled; upstream credit not verified"}</span><span class="spacer"></span>
         <label class="switch" title="${a.disabled ? "Off: never tried" : "In rotation"}"><input type="checkbox" data-alias="${esc(a.alias)}" ${a.disabled ? "" : "checked"}><span></span></label>
       </div></div>`;
 }
@@ -543,6 +549,8 @@ function renderAccounts() {
   $("accounts").querySelectorAll("[data-up]").forEach((x) => x.onclick = () => moveTo(+x.dataset.up, +x.dataset.up - 1));
   $("accounts").querySelectorAll("[data-down]").forEach((x) => x.onclick = () => moveTo(+x.dataset.down, +x.dataset.down + 1));
   $("accounts").querySelectorAll("[data-prefer]").forEach((x) => x.onclick = () => save({balance: {strategy: "prefer", prefer: x.dataset.prefer}}));
+  $("accounts").querySelectorAll("[data-key-preference]").forEach((x) => x.onchange = () =>
+    save({api_key_accounts: {[x.dataset.keyPreference]: {preferred: x.value === "true"}}}));
   $("accounts").querySelectorAll("[data-alias]").forEach((x) => x.onchange = () => {
     const off = new Set(state.accounts.filter((a) => a.disabled).map((a) => a.alias));
     x.checked ? off.delete(x.dataset.alias) : off.add(x.dataset.alias);

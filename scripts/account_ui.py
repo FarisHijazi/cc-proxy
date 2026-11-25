@@ -576,6 +576,15 @@ class Dashboard:
             if not set(change["disabled"]) <= {*aliases, *cfg.get("api_key_accounts", {})}:
                 raise ValueError("disabled must name accounts")
             cfg["disabled"] = sorted(change["disabled"])
+        if "api_key_accounts" in change:
+            preferences = change["api_key_accounts"]
+            if not isinstance(preferences, dict):
+                raise ValueError("api_key_accounts must map existing aliases to a preferred boolean")
+            for alias, patch in preferences.items():
+                if (alias not in cfg.get("api_key_accounts", {}) or not isinstance(patch, dict)
+                        or set(patch) != {"preferred"} or not isinstance(patch["preferred"], bool)):
+                    raise ValueError("api_key_accounts may only change an existing key's preferred boolean")
+                cfg["api_key_accounts"][alias]["preferred"] = patch["preferred"]
         if "traffic_days" in change:
             days = change["traffic_days"]
             if days is not None and (not isinstance(days, int) or days < 1):
