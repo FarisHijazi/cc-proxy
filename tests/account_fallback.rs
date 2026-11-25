@@ -525,6 +525,74 @@ async fn a_configured_chain_replaces_the_default_order() {
     );
 }
 
+/// The owner's rule: a Fable request is answered by that Fable model or not at all.
+fn fable_only() -> Value {
+    json!({"chains": {"codex": ["codex", "accounts"], "claude-fable*": ["accounts"], "fable": ["accounts"]}})
+}
+
+#[tokio::test]
+async fn a_model_chain_never_substitutes_another_model() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6-astra", StatusCode::OK);
+    let kimi = stub("kimi", "kimi-k3.1-pro", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone(), kimi.clone()]);
+    let (status, body) = send_with(
+        router,
+        "claude-fable-5-1",
+        Some(pool(&[("f1", "dead-f1"), ("f2", "retry429-f2")])),
+        false,
+        Some(fable_only()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["message"], "exhausted");
+    assert!(codex.seen.lock().unwrap().is_empty());
+    assert!(kimi.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(auth, _)| auth.as_str())
+            .collect::<Vec<_>>(),
+        ["Bearer dead-f1", "Bearer retry429-f2"]
+    );
+}
+
+#[tokio::test]
+async fn a_model_chain_still_tries_the_same_model_on_other_accounts() {
+    let upstream = anthropic_upstream().await;
+    let codex = stub("codex", "gpt-6-astra", StatusCode::OK);
+    let router = gateway(&upstream.base, vec![codex.clone()]);
+    let (status, body) = send_with(
+        router.clone(),
+        "claude-fable-5-2",
+        Some(pool(&[("g1", "dead-g1"), ("g2", "live-g2")])),
+        false,
+        Some(fable_only()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["servedBy"], "Bearer live-g2");
+    assert_eq!(body["model"], "claude-fable-5-2");
+    let (status, body) = send_with(
+        router,
+        "claude-opus-5-5",
+        Some(pool(&[("g1", "dead-g1")])),
+        false,
+        Some(fable_only()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "other Claude models still fall back"
+    );
+    assert_eq!(body["servedBy"], "codex");
+    assert_eq!(*codex.seen.lock().unwrap(), ["gpt-6.1-sol"]);
+}
+
 /// The shape the dashboard saves under `fallback.tiers` (tests/account_ui_http_test.py writes the same).
 #[tokio::test]
 async fn configured_tiers_choose_the_destination_model() {

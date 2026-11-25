@@ -287,7 +287,10 @@ model: it only leads the fallbacks, so a recovered Kimi answers the next turn. C
 clears the route; count, title, compaction and auto-review requests do not change it.
 Claude model: accounts, then Codex. Codex model: Codex, then Claude accounts.
 Cursor is never a default target; it requires an explicitly configured chain. The accounts file's
-`fallback` section overrides these defaults (`chains` per family `claude`/`codex`/provider name;
+`fallback` section overrides these defaults (`chains` per family `claude`/`codex`/provider name,
+or per model: an exact id or a `prefix*` glob, normalized like tiers, beats the family key; the owner's live
+`"claude-fable*"`/`"fable": ["accounts"]` keeps Fable on the same Fable model across accounts and the Console key,
+never another model, so an all-accounts 429 reaches the client;
 `chains["*"]` = the global order the dashboard's flat Accounts list writes, inherited by every family
 without its own chain, with the request's own provider (Claude: its first run of accounts) moved or
 added to the front; a provider-name target is that tier's cell on the provider, skipped when the tier

@@ -3,7 +3,7 @@
 //! The account proxy (`scripts/account_inject.py`) owns every Claude credential and
 //! attaches the ordered account pool to inference requests in [`POOL_HEADER`], plus
 //! the accounts file's `fallback` section in [`POLICY_HEADER`]. A request walks one
-//! chain for its model family. Without a configured chain, a Claude model tries each
+//! chain for its model (a configured model key) or else its family. Without a configured chain, a Claude model tries each
 //! account in order, then the Codex equivalent, and a Codex model tries Codex, then
 //! the Claude equivalent on each account. Cursor is never a default step; it runs
 //! only when a configured chain names it. A 429 or
@@ -118,6 +118,9 @@ impl Default for Triggers {
 /// backend, skipped when the tier has no model there), the family's own name (the
 /// requested model untouched), or an exact model id (a `claude-*` id runs on each
 /// account). [`GLOBAL`] is the order every family without its own chain inherits.
+/// A key may instead name a model: an exact id, or a prefix ending in `*` such as
+/// `claude-fable*`. It beats the family key, so `["accounts"]` there keeps that model
+/// on the Claude accounts and never substitutes another one.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Policy {
@@ -230,6 +233,26 @@ impl Policy {
         }
     }
 
+    /// The chain configured for `model` itself: an exact id beats the longest `prefix*`.
+    fn model_chain(&self, model: &str) -> Option<&Vec<String>> {
+        let model = normalize(model);
+        self.chains
+            .get(&model)
+            .filter(|_| model != GLOBAL)
+            .or_else(|| {
+                self.chains
+                    .iter()
+                    .filter_map(|(key, targets)| {
+                        let prefix = key.strip_suffix('*').filter(|p| !p.is_empty())?;
+                        model
+                            .starts_with(&prefix.to_ascii_lowercase())
+                            .then_some((prefix.len(), targets))
+                    })
+                    .max_by_key(|(len, _)| *len)
+                    .map(|(_, targets)| targets)
+            })
+    }
+
     /// The group serving `model`: an exact id or key match anywhere beats a family
     /// key contained in the name. Exact means a match key equal to the whole model id.
     fn tier(&self, model: &str) -> Option<&Tier> {
@@ -310,7 +333,10 @@ fn chain(
     } else {
         provider
     };
-    let targets: Vec<&str> = match (policy.chains.get(family), policy.chains.get(GLOBAL)) {
+    let own = policy
+        .model_chain(model)
+        .or_else(|| policy.chains.get(family));
+    let targets: Vec<&str> = match (own, policy.chains.get(GLOBAL)) {
         (Some(targets), _) => targets.iter().map(String::as_str).collect(),
         (None, Some(global)) => own_first(family, global, accounts),
         (None, None) if family == "claude" => DEFAULT_CLAUDE.to_vec(),
@@ -1180,6 +1206,38 @@ mod tests {
         assert_eq!(
             chain("anthropic", "claude-opus-5-5", 1, &configured),
             [opus(0), sub("kimi-k3.1-pro-highspeed"), sub("gpt-6.1-sol")]
+        );
+    }
+
+    #[test]
+    fn a_model_chain_overrides_the_family_and_global_chains() {
+        let configured = policy(json!({"chains": {
+            "*": ["accounts", "kimi", "codex"],
+            "claude": ["accounts", "codex"],
+            "claude-fable*": ["accounts"],
+            "claude-fable-5-2": ["accounts", "codex"],
+            "fable": ["accounts"],
+        }}));
+        let fable = |model: &str| {
+            (0..2)
+                .map(|index| Step::Account(index, model.into()))
+                .collect::<Vec<_>>()
+        };
+        for model in [
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "claude-fable-9",
+            "fable",
+        ] {
+            assert_eq!(chain("anthropic", model, 2, &configured), fable(model));
+        }
+        assert_eq!(
+            chain("anthropic", "claude-fable-5-2", 2, &configured)[2],
+            sub("gpt-6-astra")
+        );
+        assert_eq!(
+            chain("anthropic", "claude-opus-5-5", 1, &configured),
+            [opus(0), sub("gpt-6.1-sol")]
         );
     }
 
