@@ -78,13 +78,16 @@ simultaneous same-model agents make attribution ambiguous. Title, count and
 tool-less requests do not establish identity. Public HTTP hooks expose no turn ID,
 and `turn.step.messageCount` is not the serialized wire message count: when
 correlation is absent or ambiguous the band honestly shows `Serving unknown`.
+A successful main response without the header (e.g. after `/login`, the proxy passes the
+session's own credential straight to Anthropic) shows `own login (not routed by cc-proxy)`;
+a present but unparseable header stays unknown.
 Pending requests, model changes and errors clear current attribution while retaining
 an explicitly labeled previous response. Reload/resume starts unknown. Metadata
 works independently of the HQ event connection and adds no poller or listener.
 
 The native inference hook and band were verified interactively on Claude Code
 2.1.331/2.1.332. Builds that do not expose inference HTTP hooks remain unknown;
-the selected/requested model is never substituted for the actual answering model.
+the requested model is shown as served only for that header-less own-login case.
 The normal launcher opt-in above installs the band only for new interactive
 sessions. Development `--plugin-dir` reloads are tested only in throwaway sessions.
 

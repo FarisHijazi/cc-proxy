@@ -1,5 +1,5 @@
 import type { HttpInit, HttpResponse, TurnStepInput } from 'claude-code'
-export type Serving = { model: string; account: string; provider: string; identity: string }
+export type Serving = { model: string; account: string; provider: string; identity: string; direct?: true }
 const backends = new Set(['codex', 'gemini', 'cursor', 'cursor-cli', 'kimi', 'grok', 'zai', 'local', 'agy'])
 export function parseServing(value: string | undefined): Serving | undefined {
   if (!value || value.length > 512 || /[\u0000- \u007f]/.test(value)) return
@@ -54,21 +54,28 @@ export function answered(state: Tracker, ticket: Ticket, response?: HttpResponse
   state.pending = false
   state.actual = undefined
   if (!response?.ok) { state.failure = response ? `HTTP ${response.status}` : 'request failed'; return }
-  state.actual = parseServing(response.headers['x-claude-codex-served-by'])
+  const header = response.headers['x-claude-codex-served-by']
+  state.actual = header === undefined ? direct(state) : parseServing(header)
   if (!state.actual) return
   const changed = state.last && state.last.identity !== state.actual.identity
   state.last = state.actual
   return changed ? `Serving changed: ${state.actual.provider} / ${state.actual.model} · ${state.actual.account}${fallback(state)}` : undefined
 }
+function direct(state: Tracker): Serving {
+  const model = state.requested.replace(/\[1m\]$/, '')
+  return { model, account: 'own login', provider: 'Anthropic', identity: `direct/${model}`, direct: true }
+}
 function fallback(state: Tracker) {
   const requested = state.requested.replace(/\[1m\]$/, '')
-  if (!state.actual || state.actual.model === requested) return ''
+  if (!state.actual || state.actual.direct || state.actual.model === requested) return ''
   if (!requested.includes('-') && !requested.includes(':')) return ' · routed'
   return ' · fallback'
 }
 export function display(state: Tracker) {
   const actual = state.actual
-  const served = actual ? `${actual.provider} / ${actual.model} · account ${actual.account}` : 'unknown'
+  const served = !actual ? 'unknown' : actual.direct
+    ? `${actual.provider} / ${actual.model} · own login (not routed by cc-proxy)`
+    : `${actual.provider} / ${actual.model} · account ${actual.account}`
   const phase = state.pending ? ' · pending' : state.failure ? ` · ${state.failure}` : ''
   const history = !actual && state.last ? ` · last: ${state.last.provider} / ${state.last.model} · ${state.last.account} (previous response)` : ''
   return `Requested ${state.requested} → Serving ${served}${fallback(state)}${phase}${history}`
