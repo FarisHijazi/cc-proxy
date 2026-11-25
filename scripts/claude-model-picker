@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Write the proxy's non-Claude models into Claude Code's /model menu.
+
+  claude-model-picker [--dry-run]
+  claude-model-picker --via http://HOST:PORT --via-ca CA.pem   (a --serve host, no accounts-file "via")
+
+The menu is `modelPicker.options` in $CLAUDE_CONFIG_DIR/settings.json (default ~/.claude).
+The proxy is reached the way claude-accounts reaches it: the accounts file's `via` and `via_ca`.
+Rows this script wrote before and rows for ids the proxy serves are replaced; every other row
+and settings key is kept. A failed fetch leaves settings.json untouched and exits 1.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+router = __import__("runpy").run_path(str(Path(__file__).resolve().with_name("claude-account-router")))
+MARK = " via cc-proxy"
+
+
+def synced(settings, rows):
+    served = {row["model"] for row in rows}
+    picker = settings.get("modelPicker", {})
+    kept = [
+        row for row in picker.get("options", [])
+        if row.get("model") not in served and not str(row.get("description", "")).endswith(MARK)
+    ]
+    return {**settings, "modelPicker": {**picker, "options": kept + rows}}
+
+
+def write(path, settings):
+    """Replace the real file (settings.json is often a symlink into ~/.claude) atomically, after a backup."""
+    path = path.resolve()
+    shutil.copy2(path, path.with_name(f"{path.name}.bak-model-picker-{time.strftime('%Y%m%d-%H%M%S')}"))
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", delete=False) as out:
+        json.dump(settings, out, indent=2, ensure_ascii=False)
+        out.write("\n")
+    shutil.copymode(path, out.name)
+    os.replace(out.name, path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--accounts-file", type=Path, default=Path(
+        os.environ.get("CC_PROXY_ACCOUNTS") or "~/.config/claude-codex/accounts.json").expanduser())
+    parser.add_argument("--via", help="proxy address; default: the accounts file's via list")
+    parser.add_argument("--via-ca", help="proxy CA; default: the accounts file's via_ca")
+    parser.add_argument("--settings-file", type=Path, default=Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser() / "settings.json")
+    parser.add_argument("--dry-run", action="store_true", help="print the change, write nothing")
+    args = parser.parse_args()
+
+    saved = json.loads(args.accounts_file.read_text()) if args.accounts_file.exists() else {}
+    candidates = [args.via] if args.via else saved.get("via") or []
+    candidates = candidates if isinstance(candidates, list) else [candidates]
+    ca = args.via_ca or saved.get("via_ca")
+    if not candidates or not ca:
+        raise ValueError(f"no proxy: pass --via and --via-ca, or set via and via_ca in {args.accounts_file}")
+    with open(os.devnull, "w") as quiet:
+        proxy, tunnel = router["reach"](candidates, quiet)
+    try:
+        rows = router["served_rows"](router["served_models"](proxy, str(Path(ca).expanduser())))
+    finally:
+        if tunnel:
+            tunnel.terminate()
+    if not rows:
+        raise RuntimeError(f"the proxy at {proxy} listed no models; {args.settings_file} left unchanged")
+
+    settings = json.loads(args.settings_file.read_text())
+    updated = synced(settings, rows)
+    before = {row.get("model") for row in settings.get("modelPicker", {}).get("options", [])}
+    after = {row["model"] for row in updated["modelPicker"]["options"]}
+    summary = f"{len(rows)} proxy models; +{len(after - before)} -{len(before - after)}"
+    if updated == settings:
+        print(f"{args.settings_file}: unchanged ({summary})")
+    elif args.dry_run:
+        print(f"{args.settings_file}: would write ({summary})")
+        for model in sorted(after - before):
+            print(f"  + {model}")
+        for model in sorted(before - after):
+            print(f"  - {model}")
+    else:
+        write(args.settings_file, updated)
+        print(f"{args.settings_file}: written ({summary})")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)

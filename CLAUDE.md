@@ -379,7 +379,13 @@ stalled Remote Control for every machine once the DB reached 18 GB
 Each model-call row also stores `input_tokens` (cache writes included)/`cache_read_tokens`/`output_tokens`/`cache_write_tokens`/`cache_write_1h_tokens` from the reply (parser:
 `account_providers.reply_tokens`; NULL = the reply reported none, never zero). `claude-traffic backfill-tokens`
 fills older rows. The dashboard's Models view lists every id the router serves (from `/api/state` providers). The launcher's
-`served_models()` adds the same non-Claude ids to the `/model` picker at launch. The router's Claude ids come from Anthropic's own `/v1/models`. A `/v1/models` call that
+`served_models()` adds the same non-Claude ids to the `/model` picker at launch (rows from `served_rows()`).
+**The `/model` menu is per host**: `modelPicker.options` in that host's `~/.claude/settings.json`, which the proxy cannot
+change; the launcher also snapshots it into `--settings` at launch, so start a new session to see changes. After adding or removing a backend or model, run
+`scripts/claude-model-picker` (`--dry-run` first) on every client host: it reads `via`/`via_ca` from the accounts file
+(the `--serve` host passes `--via http://<tailnet-ip>:<port> --via-ca <state>/ca/mitmproxy-ca-cert.pem`), replaces its own
+rows (description `<provider> via cc-proxy`), keeps every other row and key, writes through the settings symlink with a
+`.bak-model-picker-<time>` backup, and exits 1 leaving the file untouched when the proxy lists nothing. The router's Claude ids come from Anthropic's own `/v1/models`. A `/v1/models` call that
 carries a login refreshes them at most every 10 minutes (`providers::anthropic::live_models`). `account_inject.py` lends
 the first enabled account's login to a token-less one, such as a call from the dashboard or launcher. `ANTHROPIC_STYLE_ALIASES` is only the
 fallback list and the alias-routing set. Do not grow it to list models.

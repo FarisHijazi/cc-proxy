@@ -455,13 +455,19 @@ def model_picker(extra, served=()):
         model = family + "[1m]"
         if model not in existing:
             options.append({"model": model, "label": family.title() + " [1m]"})
-    # Claude Code lists Claude models itself; cursor-agent's per-effort variants would add hundreds of rows.
+    options += [row for row in served_rows(served) if row["model"] not in existing]
+    return {**picker, "options": options}
+
+
+def served_rows(served):
+    """Picker rows for the router's non-Claude ids; Claude Code lists Claude models itself."""
+    rows = {}
     for name in served:
         model, _, backend = name.rpartition(" (")
-        if model and backend != "anthropic)" and ":" not in model and model not in existing:
-            options.append({"model": model, "label": name})
-            existing.add(model)
-    return {**picker, "options": options}
+        backend = backend.removesuffix(")")
+        if model and backend != "anthropic":
+            rows.setdefault(model, {"model": model, "label": name, "description": f"{backend} via cc-proxy"})
+    return list(rows.values())
 
 
 def take_settings(forwarded):

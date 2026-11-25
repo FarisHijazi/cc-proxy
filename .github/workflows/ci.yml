@@ -45,6 +45,7 @@ jobs:
           uv run --no-project --with mitmproxy==12.2.1 --with pytest
           pytest -q tests/account_remote_links_test.py tests/account_remote_route_test.py
           tests/session_mod_launcher_test.py tests/account_traffic_test.py
+          tests/claude_model_picker_test.py
       - name: Lint fleet adapters
         run: >-
           uvx ruff check scripts/cc-proxy-acp scripts/account_mcp_relay.py
@@ -55,3 +56,4 @@ jobs:
           scripts/account_remote_route.py scripts/claude-account-router
           scripts/account_traffic.py tests/account_traffic_test.py
           tests/account_remote_route_test.py tests/session_mod_launcher_test.py
+          scripts/claude-model-picker tests/claude_model_picker_test.py
