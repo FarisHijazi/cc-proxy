@@ -59,24 +59,25 @@ export function answered(state: Tracker, ticket: Ticket, response?: HttpResponse
   if (!state.actual) return
   const changed = state.last && state.last.identity !== state.actual.identity
   state.last = state.actual
-  return changed ? `Serving changed: ${state.actual.provider} / ${state.actual.model} · ${state.actual.account}${fallback(state)}` : undefined
+  return changed ? `Serving changed: ${served(state, state.actual)}` : undefined
 }
 function direct(state: Tracker): Serving {
   const model = state.requested.replace(/\[1m\]$/, '')
   return { model, account: 'own login', provider: 'Anthropic', identity: `direct/${model}`, direct: true }
 }
-function fallback(state: Tracker) {
+function where(actual: Serving) {
+  if (actual.direct) return 'Anthropic · own login (not routed by cc-proxy)'
+  return actual.provider === 'Anthropic' ? `Anthropic · account ${actual.account}` : actual.provider
+}
+export function served(state: Tracker, actual: Serving) {
   const requested = state.requested.replace(/\[1m\]$/, '')
-  if (!state.actual || state.actual.direct || state.actual.model === requested) return ''
-  if (!requested.includes('-') && !requested.includes(':')) return ' · routed'
-  return ' · fallback'
+  if (actual.model === requested) return `${actual.model} · ${where(actual)}`
+  if (!requested.includes('-') && !requested.includes(':')) return `${actual.model} (${requested}) · ${where(actual)}`
+  return `⚠️ ${actual.model} · ${where(actual)} · requested ${requested}`
 }
 export function display(state: Tracker) {
-  const actual = state.actual
-  const served = !actual ? 'unknown' : actual.direct
-    ? `${actual.provider} / ${actual.model} · own login (not routed by cc-proxy)`
-    : `${actual.provider} / ${actual.model} · account ${actual.account}`
   const phase = state.pending ? ' · pending' : state.failure ? ` · ${state.failure}` : ''
-  const history = !actual && state.last ? ` · last: ${state.last.provider} / ${state.last.model} · ${state.last.account} (previous response)` : ''
-  return `Requested ${state.requested} → Serving ${served}${fallback(state)}${phase}${history}`
+  if (state.actual) return `Serving ${served(state, state.actual)}${phase}`
+  const history = state.last ? ` · last: ${served(state, state.last)} (previous response)` : ''
+  return `Requested ${state.requested} → Serving unknown${phase}${history}`
 }

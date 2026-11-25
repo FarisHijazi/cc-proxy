@@ -81,6 +81,8 @@ correlation is absent or ambiguous the band honestly shows `Serving unknown`.
 A successful main response without the header (e.g. after `/login`, the proxy passes the
 session's own credential straight to Anthropic) shows `own login (not routed by cc-proxy)`;
 a present but unparseable header stays unknown.
+When the served model equals the requested one the band names it once (`Serving <model> · <provider/account>`);
+a different model is prefixed with ⚠️ and names the requested model.
 Pending requests, model changes and errors clear current attribution while retaining
 an explicitly labeled previous response. Reload/resume starts unknown. Metadata
 works independently of the HQ event connection and adds no poller or listener.
