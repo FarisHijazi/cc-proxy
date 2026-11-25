@@ -16,7 +16,7 @@ const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../scri
 const group = (extra) => ({
   requests: 120, per_minute: 2, errors: 3, error_rate: 0.025, fallbacks: 6, fallback_rate: 0.05, statuses: { 200: 117, 429: 3 },
   sessions: 9, active_sessions: 4, machines: 3, active_machines: 2, inflight: 0,
-  ttft: { now: 1.25, p50: 1.5, p95: 4.2, samples: 100 }, speed: { now: 61.2, p50: 55, p95: 120, samples: 100 },
+  ttft: { now: 1.25, p50: 1.5, p95: 4.2, samples: 100 }, speed: { now: 61.2, p50: 55, p5: 12, samples: 100 },
   latency: { p50: 8.5, p95: 40 }, throughput_now: 12.5, tokens: { input: 50000, cache_read: 2000000, output: 90000 },
   tokens_reported: 117, cache_hit: 0.975, ...extra,
 });

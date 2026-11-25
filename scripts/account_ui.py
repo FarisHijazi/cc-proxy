@@ -217,6 +217,7 @@ class Dashboard:
             urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(ca))),
         )
         self.cache = {}
+        self.insights_lock = threading.Lock()
         self.restored = runpy.run_path(str(HERE / "claude-traffic"), run_name="claude_traffic")["restored"]
 
     def config(self):
@@ -456,18 +457,19 @@ class Dashboard:
 
     def insights(self, hours):
         """Live load, speed and health per account and model (account_insights.py), cached briefly."""
-        hit = self.cache.get(("insights", hours))
-        if hit and time.time() - hit[0] < INSIGHTS_CACHE_S:
-            return hit[1]
-        db = self.database(self.config())
-        if db is None:
-            return {"hours": hours, "traffic_db": False}
-        try:
-            result = insights(db, hours)
-        finally:
-            db.close()
-        self.cache[("insights", hours)] = (time.time(), result)
-        return result
+        with self.insights_lock:  # one scan at a time: polls queue behind it and reuse its answer
+            hit = self.cache.get(("insights", hours))
+            if hit and time.time() - hit[0] < INSIGHTS_CACHE_S:
+                return hit[1]
+            db = self.database(self.config())
+            if db is None:
+                return {"hours": hours, "traffic_db": False}
+            try:
+                result = insights(db, hours)
+            finally:
+                db.close()
+            self.cache[("insights", hours)] = (time.time(), result)
+            return result
 
     def usage(self, hours):
         """Model calls and reported tokens over `hours`, in total and per machine, session and

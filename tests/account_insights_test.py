@@ -42,7 +42,7 @@ def test_totals_speed_and_ttft_overall(db):
     assert (t["sessions"], t["active_sessions"], t["machines"], t["active_machines"]) == (3, 2, 2, 2)
     assert t["statuses"] == {"200": 2, "429": 1}
     assert t["ttft"] == {"now": 1.0, "p50": 1.0, "p95": 3.0, "samples": 2}
-    assert (t["speed"]["p50"], t["speed"]["p95"]) == (50.0, 100.0)  # 500 tok / 10 s and 1000 tok / 10 s
+    assert (t["speed"]["p50"], t["speed"]["p5"]) == (50.0, 50.0)  # 500 tok / 10 s and 1000 tok / 10 s
     assert t["throughput_now"] == pytest.approx(1500 / 300)
     assert t["tokens"] == {"input": 200, "cache_read": 900, "output": 1500}
     assert t["cache_hit"] == pytest.approx(900 / 1100)

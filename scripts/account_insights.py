@@ -39,11 +39,11 @@ def live_snapshot(db, now):
     """The recorder's latest connection and in-flight snapshot, or None when missing or stale."""
     try:
         row = db.execute("SELECT at, body FROM live WHERE name = 'now'").fetchone()
-    except Exception:  # noqa: BLE001 - a database from before `live` existed
+        body = json.loads(row[1]) if row else None
+    except Exception:  # noqa: BLE001 - a database from before `live` existed, or an unreadable row
         return None
     if not row or now - row[0] > LIVE_STALE_S:
         return None
-    body = json.loads(row[1])
     return {"at": row[0], "connections": body.get("connections", []), "inflight": body.get("inflight", []),
             "dropped": body.get("dropped")}
 
@@ -81,7 +81,7 @@ def add(group, row, now):
         group["tokens_reported"] += 1
         for name, value in zip(("input", "cache_read", "output"), tokens):
             group["tokens"][name] += value or 0
-        if current:
+        if finished and now - finished <= CURRENT_S:
             group["output_now"] += tokens[2] or 0
         if first_token and finished and tokens[2] and finished - first_token >= MIN_GENERATION_S:
             rate = tokens[2] / (finished - first_token)
@@ -109,8 +109,9 @@ def summary(group, minutes):
         "inflight": group["inflight"],
         "ttft": {"now": percentile(group["ttft_now"], 0.5), "p50": percentile(group["ttft"], 0.5),
                  "p95": percentile(group["ttft"], 0.95), "samples": len(group["ttft"])},
+        # The slow tail of a speed is its low end.
         "speed": {"now": percentile(group["speed_now"], 0.5), "p50": percentile(group["speed"], 0.5),
-                  "p95": percentile(group["speed"], 0.95), "samples": len(group["speed"])},
+                  "p5": percentile(group["speed"], 0.05), "samples": len(group["speed"])},
         "latency": {"p50": percentile(group["latency"], 0.5), "p95": percentile(group["latency"], 0.95)},
         "throughput_now": group["output_now"] / CURRENT_S if reported else None,
         "tokens": tokens if reported else None,

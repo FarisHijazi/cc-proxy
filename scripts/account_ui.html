@@ -1002,7 +1002,7 @@ function insightTiles(d) {
     tile("Open connections", live ? live.connections : liveNote, "",
       live ? `${live.inflight} model calls in flight · ${live.client_ips} client IPs` : "recorder not reporting live counts"),
     tile("Tokens / second <span class=\"muted\">5 min</span>", known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
-      `per request · ${w}: p50 ${known(t.speed.p50, rate)} · p95 ${known(t.speed.p95, rate)} · total ${known(t.throughput_now, rate)} tok/s now`),
+      `per request · ${w}: p50 ${known(t.speed.p50, rate)} · slowest 5% ${known(t.speed.p5, rate)} · all calls ${known(t.throughput_now, rate)} tok/s now`),
     tile("Time to first token <span class=\"muted\">5 min</span>", known(t.ttft.now, secs), "",
       `${w}: p50 ${known(t.ttft.p50, secs)} · p95 ${known(t.ttft.p95, secs)} · ${t.ttft.samples} streams`),
     tile("Requests", t.per_minute.toFixed(t.per_minute < 10 ? 1 : 0), "/min",
@@ -1053,7 +1053,11 @@ function renderInsights() {
   $("insights-status").innerHTML = bars(`Replies, ${windowName(d.hours)}`, d.total.statuses);
 }
 async function loadInsights() {
-  try { insightsData = await api(`/api/insights?hours=${insightsHours}`); renderInsights(); }
+  const asked = insightsHours;
+  try {
+    const d = await api(`/api/insights?hours=${asked}`);
+    if (asked === insightsHours) { insightsData = d; renderInsights(); }  // a slower, older answer must not replace the chosen window
+  }
   catch (e) { showError(e); }
 }
 $("insights-range").querySelectorAll("button").forEach((b) => b.onclick = () => {
