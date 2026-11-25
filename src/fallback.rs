@@ -1086,7 +1086,11 @@ pub async fn dispatch(
             crate::anthropic::json_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
-                "Every Claude account and fallback provider is rate limited",
+                if native_document {
+                    "Native document content requires a document-capable backend; all eligible routes are unavailable due to upstream quota/auth cooldowns or configured key budgets. Other fallback backends cannot preserve the document."
+                } else {
+                    "Every Claude account and fallback provider is rate limited"
+                },
             )
         })
 }
