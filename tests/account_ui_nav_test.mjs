@@ -18,19 +18,24 @@ const DEFAULTS = { chains: { claude: ["accounts", "codex"], codex: ["codex", "ac
   { name: "sonnet-luna", match: ["sonnet", "haiku", "luna"], models: { anthropic: "claude-sonnet-5-5", codex: "gpt-6-luna" } }] };
 const EVIL = `<img src=x onerror="window.pwned=1">`;
 
-async function open(browser, size, { defaults = DEFAULTS, failFirst = false, stall = false } = {}) {
+async function open(browser, size, { defaults = DEFAULTS, failFirst = false, stall = false, progressive = false } = {}) {
   const ctx = await browser.newContext({ viewport: size });
   const page = await ctx.newPage();
-  const posts = [];
+  const posts = [], seen = [];
+  const progressiveCase = progressive;
   let fallback = {}, failures = failFirst ? 1 : 0;
   const state = () => ({
-    accounts: [{ alias: "a@example.com", email: "a@example.com", slot: 1, usage: {} }], balance: { strategy: "session" },
+    accounts: [{ alias: "a@example.com", email: "a@example.com", slot: 1, usage: {}, loading: progressive },
+      ...(progressiveCase ? [{alias: "console", kind: "api_key", usage: {}, loading: progressive,
+        spend_usd: progressive ? null : 12.5, budget_usd: 180, preferred: false}] : [])], balance: { strategy: "session" },
+    pending: progressive ? ["providers", "quota", "provider_usage"] : [],
     strategies: ["session"], traffic_days: null, fallback, fallback_defaults: defaults,
-    providers: { reachable: true, models: { anthropic: ["claude-opus-5-5"], codex: ["gpt-6.1-sol"], cursor: [], "cursor-cli": [], gemini: [], kimi: [], grok: [] }, fallback_defaults: defaults },
+    providers: { loading: progressive, reachable: progressive ? null : true, models: { anthropic: ["claude-opus-5-5"], codex: ["gpt-6.1-sol"], cursor: [], "cursor-cli": [], gemini: [], kimi: [], grok: [] }, fallback_defaults: defaults },
     proxy: { address: "x:1", up: true }, db: { path: null, bytes: 0, disk_free: 1 },
   });
   await page.route("http://dash.test/**", (route) => {
     const req = route.request(), url = new URL(req.url());
+    seen.push(url.pathname);
     const json = (body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: html });
     if (url.pathname === "/pico.css") return route.fulfill({ contentType: "text/css", body: css });
@@ -49,12 +54,28 @@ async function open(browser, size, { defaults = DEFAULTS, failFirst = false, sta
     return json({ rows: [] });
   });
   await page.goto("http://dash.test/#models");
-  return { page, posts, close: () => ctx.close() };
+  return { page, posts, seen, settle: () => { progressive = false; }, close: () => ctx.close() };
 }
 const noPageScroll = (page) => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1);
 
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM || undefined });
 try {
+  {
+    const {page, seen, settle, close} = await open(browser, {width: 1280, height: 900}, {progressive: true});
+    await page.locator('#accounts .card').first().waitFor({state: "attached"});
+    assert.match(await page.locator('#models').innerText(), /Loading/);
+    assert.doesNotMatch(await page.locator('#accounts').innerText(), /no usage reported|\$0\.00|router unreachable/);
+    assert.match(await page.locator('#accounts').innerText(), /Loading month-to-date spend/);
+    assert.match(await page.locator('#accounts').innerText(), /180\.00 monthly budget/);
+    assert.equal(await page.locator('#accounts input[data-alias="console"]').isEnabled(), true);
+    assert(!seen.some(p => ["/api/usage", "/api/sessions", "/api/traffic", "/api/stats"].includes(p)), "hidden views must not scan on startup");
+    settle();
+    await page.locator('#refresh').click();
+    await page.locator('#models article').first().waitFor();
+    assert.match(await page.locator('#accounts').innerText(), /\$12\.50/);
+    assert(!seen.some(p => ["/api/usage", "/api/sessions", "/api/traffic", "/api/stats"].includes(p)), "refresh only loads the selected view");
+    await close(); console.log("ok progressive controls and lazy views");
+  }
   { // desktop: views, keyboard, editing
     const { page, posts, close } = await open(browser, { width: 1280, height: 900 });
     await page.locator("#models article").first().waitFor();

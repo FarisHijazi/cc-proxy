@@ -47,6 +47,52 @@ def inference_flow():
     return flow
 
 
+def test_account_index_does_not_wait_for_another_writer_and_restores_timeout(tmp_path):
+    path = tmp_path / "locked.sqlite3"
+    db = sqlite3.connect(path, isolation_level=None)
+    db.executescript(module.SCHEMA)
+    other = sqlite3.connect(path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    started = module.time.monotonic()
+    try:
+        assert not module.account_index(db)
+        assert module.time.monotonic() - started < 1
+        assert db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        other.rollback()
+        other.close()
+        db.close()
+
+
+def test_deferred_account_index_retries_on_a_later_idle_writer_tick(monkeypatch):
+    recorder = module.TrafficDB.__new__(module.TrafficDB)
+    recorder.db = sqlite3.connect(":memory:")
+    recorder.index_pending, recorder.index_retry_at = True, 0
+    attempts = []
+    monkeypatch.setattr(module, "account_index", lambda db: attempts.append(db) or len(attempts) > 1)
+    recorder.maintain_index()
+    assert recorder.index_pending
+    recorder.maintain_index()
+    assert len(attempts) == 1, "a failed build must not spin on each flow"
+    recorder.index_retry_at = 0
+    recorder.maintain_index()
+    assert not recorder.index_pending and len(attempts) == 2
+    recorder.db.close()
+
+
+def test_account_index_maintenance_is_bounded_and_an_abort_preserves_writes():
+    db = sqlite3.connect(":memory:", isolation_level=None)
+    db.executescript(module.SCHEMA)
+    db.executemany("INSERT INTO flows (id,status,served_by,started) VALUES (?,200,'a/model',?)",
+                   [(str(i), i) for i in range(20_000)])
+    assert not module.account_index(db, budget_s=-1)
+    assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='flows_answered_account'").fetchone()
+    db.execute("INSERT INTO flows (id) VALUES ('still-writable')")
+    assert module.account_index(db)
+    assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 20_001
+    db.close()
+
+
 def test_inference_is_recorded_with_its_sender_and_no_credential(tmp_path):
     traffic = recorder(tmp_path)
     flow = inference_flow()

@@ -1,5 +1,6 @@
 """A Console key's month-to-date spend: official prices times each reply's exact usage."""
 
+import ast
 import calendar
 import json
 import runpy
@@ -40,6 +41,26 @@ def flows(tmp_path):
                "cache_read_tokens INTEGER, output_tokens INTEGER, cache_write_tokens INTEGER, "
                "cache_write_1h_tokens INTEGER, response_body BLOB)")
     return db
+
+
+def test_month_spend_seeks_the_answered_account_index_instead_of_scanning_other_flows(tmp_path):
+    source = Path(__file__).parents[1] / "scripts/account_traffic.py"
+    constants = {t.id: ast.literal_eval(node.value) for node in ast.parse(source.read_text()).body
+                 if isinstance(node, ast.Assign) for t in node.targets
+                 if isinstance(t, ast.Name) and t.id in {"SCHEMA", "ACCOUNT_INDEX_SQL"}}
+    db = sqlite3.connect(tmp_path / "traffic.sqlite3")
+    db.executescript(constants["SCHEMA"])
+    db.execute(constants["ACCOUNT_INDEX_SQL"])
+    db.executemany("INSERT INTO flows (id, started, status, served_by) VALUES (?, ?, ?, ?)",
+                   [(str(i), NOW - i, 200, "other/claude-sonnet-5-5") for i in range(20_000)])
+    db.execute("INSERT INTO flows (id,started,status,served_by,input_tokens,output_tokens,cache_write_tokens) "
+               "VALUES ('key', ?, 200, 'key_a/claude-sonnet-5-5', 0, 1000000, 0)", (NOW,))
+    steps = []
+    db.set_progress_handler(lambda: steps.append(1) or 0, 100)
+    assert spend["month_spend"](db, "key_a", NOW) == pytest.approx(10.0)
+    assert len(steps) < 10, "the real monthly calculation must not visit 20,000 unrelated rows"
+    assert spend["month_spend"](db, "KEY_A", NOW) == pytest.approx(10.0), "retain LIKE's case-insensitive alias semantics"
+    db.close()
 
 
 def test_month_spend_counts_only_this_months_answered_messages_of_that_key(tmp_path):

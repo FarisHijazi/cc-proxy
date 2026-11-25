@@ -1,5 +1,6 @@
 """The dashboard served over real local HTTP against a temporary accounts file: save, reload, refuse."""
 
+import gzip
 import io
 import json
 import os
@@ -51,6 +52,25 @@ def call(base, path, body=None):
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.headers, error.read()
+
+
+@pytest.mark.parametrize("header, expected", [("gzip", True), ("br, gzip;q=0.5", True),
+                                              ("gzip;q=0", False), ("x-gzip", False), ("gzip;q=bad", False)])
+def test_gzip_negotiation_respects_coding_and_quality(header, expected):
+    assert ui["accepts_gzip"](header) is expected
+
+
+def test_document_compression_preserves_the_page_and_reports_server_time(app):
+    base, _ = app
+    _, _, plain = call(base, "/")
+    request = urllib.request.Request(base + "/", headers={"Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(request) as response:
+        compressed = response.read()
+        assert response.headers["Content-Encoding"] == "gzip"
+        assert response.headers["Vary"] == "Accept-Encoding"
+        assert response.headers["Server-Timing"].startswith("app;dur=")
+    assert gzip.decompress(compressed) == plain
+    assert len(compressed) < len(plain) / 2
 
 
 def test_tiers_save_to_the_file_and_reload_through_state(app):

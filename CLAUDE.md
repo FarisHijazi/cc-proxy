@@ -408,6 +408,12 @@ from the accounts file; profiles are cached a day in `<state>/profiles.json`. Ru
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
 `disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys`, and existing `api_key_accounts` members' `preferred` boolean in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. The Accounts view's Console API key priority selector changes ordering only; it never edits keys/budgets or implies upstream credit is available. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
+The browser uses `/api/state?progressive=1`: config and controls arrive first; account usage, key spend,
+model catalog and vendor quota settle independently through the existing dashboard cache with one
+in-flight refresh per part. Never put a monthly traffic scan back on the initial state response.
+Hidden views do not poll; identical in-flight GETs are coalesced. The recorder owns the partial
+`flows_answered_account` index used by monthly spend and last-reply reads. Its existing writer retries
+index maintenance only when idle, with no lock wait, a three-second work budget and five-minute backoff.
 The dashboard has hash-routed sidebar views and locally vendored Pico conditional CSS (no build step).
 `src/fallback.rs::defaults()` owns the only default chains and equivalence groups, exposed through
 `/v1/models` as `fallback_defaults`. The dashboard forwards that metadata without guessing when unavailable.

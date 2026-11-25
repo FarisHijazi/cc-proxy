@@ -3,6 +3,8 @@
 import io
 import json
 import runpy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,50 @@ def dashboard(tmp_path):
     board.accounts_file = accounts
     board.state = lambda: json.loads(accounts.read_text())
     return board, accounts
+
+
+def test_progressive_state_returns_controls_before_spend_finishes_and_coalesces_reads(tmp_path):
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"main": "a", "accounts": {}, "api_key_accounts": {
+        "console": {"key": "fake", "preferred": True, "monthly_budget_usd": 180}}, "disabled": []}))
+    board = ui["Dashboard"].__new__(ui["Dashboard"])
+    board.accounts_file, board.api_base = path, None
+    board.proxy = ui["urlsplit"]("http://127.0.0.1:9")
+    board.cache, board.state_jobs, board.state_lock = {}, {}, threading.Lock()
+    board.state_pool = ThreadPoolExecutor(4)
+    board.providers = lambda: {"reachable": True, "models": {}, "catalog": {}, "fallback_defaults": {"chains": {}}}
+    board.provider_quota, board.recorded_provider_usage = dict, lambda cfg: None
+    entered, release = threading.Event(), threading.Event()
+    reads = []
+
+    def slow_key(alias, cfg):
+        reads.append(alias)
+        entered.set()
+        assert release.wait(5)
+        return {"alias": alias, "kind": "api_key", "spend_usd": 12.5, "usage": {}}
+
+    board.key_account = slow_key
+    try:
+        first = board.state(progressive=True)
+        assert entered.wait(2)
+        for _ in range(20):
+            current = board.state(progressive=True)
+            assert current["accounts"][0]["spend_usd"] is None
+        card = first["accounts"][0]
+        assert card["loading"] and card["budget_usd"] == 180 and card["preferred"]
+        assert reads == ["console"], "polls must not queue duplicate monthly scans"
+        cfg = json.loads(path.read_text())
+        cfg["disabled"] = ["console"]
+        cfg["api_key_accounts"]["console"]["preferred"] = False
+        path.write_text(json.dumps(cfg))
+        current = board.state(progressive=True)["accounts"][0]
+        assert current["disabled"] and not current["preferred"], "config controls are never cached with usage"
+        release.set()
+        settled = board.state()["accounts"][0]
+        assert not settled["loading"] and settled["spend_usd"] == 12.5
+    finally:
+        release.set()
+        board.state_pool.shutdown()
 
 
 def test_settings_are_saved_with_a_backup_and_other_keys_kept(tmp_path):
