@@ -1103,7 +1103,7 @@ let typing;
 $("q").oninput = () => { clearTimeout(typing); typing = setTimeout(loadTraffic, 250); };
 $("inference").onchange = loadTraffic;
 loadState(); loadInsights(); loadStats(); loadTraffic(); loadSessions(); loadUsage();
-setInterval(loadInsights, 10000);
+setInterval(loadInsights, 5000);
 setInterval(loadState, 60000);
 setInterval(loadUsage, 60000);
 setInterval(() => { loadStats(); loadTraffic(); loadSessions(); }, 15000);
