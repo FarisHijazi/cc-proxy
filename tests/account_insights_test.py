@@ -184,3 +184,25 @@ def test_history_query_uses_started_index_and_never_reads_bodies(db):
     plan = db.execute("EXPLAIN QUERY PLAN " + query).fetchall()
     assert any("USING INDEX flows_started" in row[-1] for row in plan)
     assert "request_body" not in query and "response_body" not in query
+
+
+def test_zero_ttft_baseline_is_measured_not_missing(db):
+    for i in range(6):
+        flow(db, str(i), 60 if i == 5 else 600 + i * 20)
+    db.execute("UPDATE flows SET first_token = started")
+    h = insights(db, 1, NOW)["health"]["models"][0]["ttft"]
+    assert h["state"] == "healthy" and h["baseline"] == 0 and h["current"] == 0
+
+
+def test_live_only_filter_identities_are_available(db):
+    db.execute("INSERT INTO live VALUES ('now', ?, ?)", (NOW, json.dumps({"connections": [], "inflight": [
+        {"account": "proxy-account-live@example.com", "served_by": "codex/sol"}]})))
+    result = insights(db, 1, NOW)
+    assert result["filters"] == {"accounts": ["codex"], "models": ["sol"]}
+
+
+def test_future_started_rows_do_not_inflate_any_metrics(db):
+    flow(db, "future", -60)
+    result = insights(db, 1, NOW)
+    assert result["total"]["requests"] == 0
+    assert result["health"]["models"] == []

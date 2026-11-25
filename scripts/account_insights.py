@@ -139,8 +139,8 @@ def insights(db, hours, now=None, account=None, model=None):
               if {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns else "NULL, NULL, NULL")
     rows = db.execute(
         f"SELECT started, finished, {first_token}, session_id, coalesce(client_host, client_ip, 'unknown'), "
-        f"status, model, served_by, account, {tokens} FROM flows WHERE started > ? AND model IS NOT NULL "
-        "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'", (now - hours * 3600,)).fetchall()
+        f"status, model, served_by, account, {tokens} FROM flows WHERE started > ? AND started <= ? AND model IS NOT NULL "
+        "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'", (now - hours * 3600, now)).fetchall()
     total, accounts, models = empty(), {}, {}
     for started, finished, first, session, host, status, requested, served, placeholder, *counts in rows:
         who, actual = account_of(served, placeholder), model_of(served, requested)
@@ -167,6 +167,9 @@ def insights(db, hours, now=None, account=None, model=None):
     if live:
         for call in live["inflight"]:
             served = call.get("served_by")
+            available_accounts.add(account_of(served, call.get("account")))
+            if served:
+                available_models.add(model_of(served, None))
             if (account and account_of(served, call.get("account")) != account) or (
                     selected_model and model_of(served, None) != selected_model):
                 continue
@@ -200,8 +203,8 @@ def relative_health(samples, metric):
     recent, baseline = samples["recent"], samples["baseline"]
     current, normal = percentile(recent, 0.5), percentile(baseline, 0.5)
     ratio = None
-    if current is not None and normal and len(baseline) >= 5:
-        ratio = current / normal if metric == "speed" else normal / max(current, 0.001)
+    if current is not None and normal is not None and len(baseline) >= 5:
+        ratio = current / max(normal, 0.001) if metric == "speed" else max(normal, 0.001) / max(current, 0.001)
     return {"state": "unknown" if ratio is None else "healthy" if ratio >= 0.8 else "degraded" if ratio >= 0.5 else "slow",
             "ratio": ratio, "current": current, "baseline": normal,
             "samples": len(recent), "baseline_samples": len(baseline)}
