@@ -23,6 +23,7 @@ cc-proxy-traffic = "cc_proxy.cli:traffic"
 cc-proxy-ui = "cc_proxy.cli:ui"
 claude-account-router = "cc_proxy.cli:main"
 claude-accounts = "cc_proxy.cli:accounts"
+claude-model-picker = "cc_proxy.cli:model_picker"
 
 [build-system]
 requires = ["hatchling"]

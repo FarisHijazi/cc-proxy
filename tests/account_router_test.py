@@ -1154,9 +1154,13 @@ def test_picker_lists_every_router_model_after_saved_rows(tmp_path, monkeypatch)
     rows = json.loads(serialized)["modelPicker"]["options"]
     assert rows[0] == {"model": "gemini-3-pro", "label": "Saved"}
     added = [row for row in rows if not row["model"].endswith("[1m]")][1:]
-    assert added == [{"model": "qwen-local", "label": "qwen-local (local)"},
-                     {"model": "cursor-cli-plan", "label": "cursor-cli-plan (cursor-cli)"},
-                     {"model": "gpt-6.1-sol", "label": "gpt-6.1-sol (codex)"}]
+    assert added == [
+        {"model": "qwen-local", "label": "qwen-local (local)", "description": "local via cc-proxy"},
+        {"model": "cursor-cli-plan", "label": "cursor-cli-plan (cursor-cli)", "description": "cursor-cli via cc-proxy"},
+        {"model": "cursor-cli:grok-high", "label": "cursor-cli:grok-high (cursor-cli)",
+         "description": "cursor-cli via cc-proxy"},
+        {"model": "gpt-6.1-sol", "label": "gpt-6.1-sol (codex)", "description": "codex via cc-proxy"},
+    ]
 
 
 def test_served_models_is_empty_when_the_router_cannot_be_asked(tmp_path):
