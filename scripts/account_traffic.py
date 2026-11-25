@@ -302,11 +302,21 @@ class TrafficDB:
                 self.inflight[flow.id]["served_by"] = flow.response.headers.get(SERVED_BY_HEADER)
         if flow.response.stream:
             chunks = meta["chunks"] = []
+            # The Anthropic passthrough relays Anthropic's gzip as is; inflate only until the first delta.
+            gzip = zlib.decompressobj(16 + zlib.MAX_WBITS) if flow.response.headers.get("content-encoding") == "gzip" else None
 
             def tee(data):
+                nonlocal gzip
                 chunks.append(data)
-                if "first_token" not in meta and CONTENT_DELTA in data:
-                    meta["first_token"] = time.time()
+                if "first_token" not in meta:
+                    try:
+                        found = CONTENT_DELTA in (gzip.decompress(data) if gzip else data)
+                    except zlib.error:
+                        found, gzip = False, None
+                        meta["first_token"] = None  # undecodable: unknown, and stop looking
+                    if found:
+                        meta["first_token"] = time.time()
+                        gzip = None
                 return data
 
             flow.response.stream = tee

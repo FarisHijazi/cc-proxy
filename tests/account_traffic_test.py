@@ -427,3 +427,39 @@ def test_a_call_that_never_finished_drops_out_of_the_live_table_after_an_hour(tm
     traffic.connection()
     traffic.write_live()
     assert json.loads(rows(tmp_path, "live")[0]["body"])["inflight"] == [] and traffic.inflight == {}
+
+
+def test_first_token_is_found_inside_a_gzip_stream(tmp_path):
+    import gzip
+    import time
+
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {"content-type": "text/event-stream", "content-encoding": "gzip"})
+    flow.response.stream = True
+    traffic.responseheaders(flow)
+    raw = gzip.compress(b"event: message_start\ndata: {}\n\n" + b"event: content_block_delta\ndata: {}\n\n" * 50)
+    flow.response.stream(raw[:20])
+    time.sleep(0.02)
+    before = time.time()
+    flow.response.stream(raw[20:])
+    traffic.response(flow)
+    traffic.flush()
+    [row] = rows(tmp_path)
+    assert row["first_token"] >= before
+    assert zlib.decompress(row["response_body"]).startswith(b"event: message_start")
+
+
+def test_an_undecodable_gzip_stream_has_unknown_first_token_and_still_passes_through(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {"content-type": "text/event-stream", "content-encoding": "gzip"})
+    flow.response.stream = True
+    traffic.responseheaders(flow)
+    assert flow.response.stream(b"not gzip at all") == b"not gzip at all"
+    assert flow.response.stream(b"content_block_delta") == b"content_block_delta"
+    traffic.response(flow)
+    traffic.flush()
+    assert rows(tmp_path)[0]["first_token"] is None
