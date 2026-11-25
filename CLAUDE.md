@@ -406,7 +406,7 @@ The Nix-pinned compiler still needs atomic `fetch_update`; keep its deprecation 
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys` in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys`, and existing `api_key_accounts` members' `preferred` boolean in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. The Accounts view's Console API key priority selector changes ordering only; it never edits keys/budgets or implies upstream credit is available. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 The dashboard has hash-routed sidebar views and locally vendored Pico conditional CSS (no build step).
 `src/fallback.rs::defaults()` owns the only default chains and equivalence groups, exposed through
