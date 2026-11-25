@@ -135,9 +135,9 @@ def render(m, live, now, has_db):
     for account, _ in m.sessions:
         active[(account,)] = active.get((account,), 0) + 1
     family(lines, "cc_proxy_active_sessions", "gauge", f"Sessions with a model call in the last {ACTIVE_S // 60} "
-           "minutes, by answering account.", active, ("account",))
+           "minutes, by answering account.", active if has_db else {}, ("account",))
     family(lines, "cc_proxy_active_machines", "gauge", f"Client machines with a model call in the last "
-           f"{ACTIVE_S // 60} minutes.", {(): len(m.machines)})
+           f"{ACTIVE_S // 60} minutes.", {(): len(m.machines)} if has_db else {})
     family(lines, "cc_proxy_recorder_up", "gauge", "1 when the traffic recorder's live snapshot is fresh.",
            {(): int(live is not None)})
     family(lines, "cc_proxy_traffic_db_up", "gauge", "1 when the traffic database is configured and readable.",

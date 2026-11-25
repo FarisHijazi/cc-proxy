@@ -141,6 +141,7 @@ def test_label_values_are_escaped(db):
 def test_no_database_still_answers(db):
     m = samples(Metrics().scrape(None, NOW))
     assert value(m, "cc_proxy_traffic_db_up") == 0 and value(m, "cc_proxy_recorder_up") == 0
+    assert value(m, "cc_proxy_active_machines") is None
 
 
 def test_served_over_http_by_the_dashboard(tmp_path):
