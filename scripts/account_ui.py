@@ -56,6 +56,7 @@ codex_quota = runpy.run_path(str(HERE / "account_codex_quota.py"), run_name="acc
 agy_quota = runpy.run_path(str(HERE / "account_agy_quota.py"), run_name="account_agy_quota")["agy_quota"]
 RemoteLinks = runpy.run_path(str(HERE / "account_remote_links.py"), run_name="account_remote_links")["RemoteLinks"]
 insights = runpy.run_path(str(HERE / "account_insights.py"), run_name="account_insights")["insights"]
+Metrics = runpy.run_path(str(HERE / "account_metrics.py"), run_name="account_metrics")["Metrics"]
 INSIGHTS_CACHE_S = 10
 INSIGHTS_MAX_HOURS = 24  # a week of rows was measured at 48 s cold on the live 18 GB database
 MCPRelay = runpy.run_path(str(HERE / "account_mcp_relay.py"), run_name="account_mcp_relay")["MCPRelay"]
@@ -218,6 +219,7 @@ class Dashboard:
         )
         self.cache = {}
         self.insights_lock = threading.Lock()
+        self.metrics = Metrics()
         self.restored = runpy.run_path(str(HERE / "claude-traffic"), run_name="claude_traffic")["restored"]
 
     def config(self):
@@ -471,6 +473,15 @@ class Dashboard:
             self.cache[("insights", hours)] = (time.time(), result)
             return result
 
+    def prometheus(self):
+        """Prometheus text exposition of the same traffic (account_metrics.py)."""
+        db = self.database(self.config())
+        try:
+            return self.metrics.scrape(db).encode()
+        finally:
+            if db is not None:
+                db.close()
+
     def usage(self, hours):
         """Model calls and reported tokens over `hours`, in total and per machine, session and
         answering account. Tokens are only what replies reported; `tokens_reported` says how many did."""
@@ -624,6 +635,8 @@ def handler(dashboard, mcp_relay=None):
                     return self.reply(200, dashboard.usage(min(max(int(query.get("hours", 24)), 1), USAGE_MAX_HOURS)))
                 if url.path == "/api/insights":
                     return self.reply(200, dashboard.insights(min(max(int(query.get("hours", 1)), 1), INSIGHTS_MAX_HOURS)))
+                if url.path == "/metrics":
+                    return self.reply(200, dashboard.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
                 if url.path == "/api/stats":
                     return self.reply(200, dashboard.stats(int(query.get("hours", 24))))
                 if url.path.startswith("/api/flow/"):
