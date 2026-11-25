@@ -22,6 +22,15 @@ const group = (extra) => ({
 });
 const INSIGHTS = {
   hours: 1, traffic_db: true, timings_recorded: true,
+  filters: {accounts: ["a@example.com", "codex"], models: ["claude-opus-5-5", "sol"]},
+  health: {current_seconds: 300, baseline_seconds: 3300, models: ["healthy", "degraded", "slow", "unknown"].map((state) => ({
+    model: state, ...Object.fromEntries(["speed", "ttft"].map((k) => [k, {state, ratio: state === "unknown" ? null : 0.6,
+      current: 42, baseline: 70, samples: 3, baseline_samples: 10}]))
+  }))},
+  history: {bucket_seconds: 120, points: [20, 60, null, 35].map((speed, i) => ({
+    at: Date.now() / 1000 - (4-i) * 120, speed, ttft: speed === null ? null : 1.2,
+    speed_samples: speed === null ? 0 : 3, ttft_samples: speed === null ? 0 : 3
+  }))},
   live: { at: Date.now() / 1000, connections: 7, client_ips: 3, inflight: 2, dropped: 0 },
   total: group({ inflight: 2 }),
   by_account: [group({ account: "a@example.com", inflight: 2, requests: 100 }),
@@ -34,12 +43,13 @@ try {
   for (const colorScheme of ["light", "dark"]) {
     const page = await (await browser.newContext({ viewport: { width: 1280, height: 1600 }, colorScheme })).newPage();
     let release;
+    const queries = [];
     const gate = new Promise((resolve) => { release = resolve; });
     await page.route("http://dash.test/**", async (route) => {
       const url = new URL(route.request().url());
       const json = (body) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
       if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: html });
-      if (url.pathname === "/api/insights") { await gate; return json(INSIGHTS); }
+      if (url.pathname === "/api/insights") { queries.push(url); await gate; return json({...INSIGHTS, hours: +url.searchParams.get("hours")}); }
       if (url.pathname === "/api/stats") return json({ total: 0, errors: 0, series: {}, by_account: {}, by_host: {}, by_model: {} });
       if (url.pathname === "/api/state") return route.fulfill({ status: 500, body: "{}" });
       return json({ rows: [], sessions: [] });
@@ -67,6 +77,31 @@ try {
     assert.deepEqual(await page.locator("#insights-models tr[data-name]").evaluateAll((rows) => rows.map((r) => r.dataset.name)),
                      ["sol", "claude-opus-5-5"], "a second click reverses");
     assert.match(await page.locator("#insights-status").innerText(), /429[\s\S]*3/);
+    for (const state of ["healthy", "degraded", "slow", "unknown"])
+      assert.equal(await page.locator(`#insights-health .health-state.${state}`).count(), 2);
+    assert.match(await page.locator("#insights-health").innerText(), /10 earlier \/ 3 recent samples/);
+    assert.equal(await page.locator("#insights-history svg").count(), 2);
+    assert.equal(await page.locator("#insights-history .mark").count(), 6, "missing buckets have no zero mark");
+    assert.equal(await page.locator("#insights-history .series").first().getAttribute("d").then((d) => (d.match(/M/g) || []).length), 2, "gaps break the line");
+    await page.locator("#insights-history .hit").first().focus();
+    assert.match(await page.locator(".history-tooltip").first().innerText(), /20 tok\/s, 3 samples/);
+    await page.locator("#insights-history summary").first().click();
+    assert.match(await page.locator("#insights-history table").first().innerText(), /unknown/);
+    for (const [minutes, hours] of [[1, 1/60], [5, 5/60], [15, .25]]) {
+      await page.getByRole("button", {name: `${minutes}m`, exact: true}).click();
+      await page.waitForFunction(() => document.querySelector("#insights-loading").textContent === "");
+      assert.equal(+queries.at(-1).searchParams.get("hours"), hours);
+      assert.match(await page.locator("#insights-history").innerText(), new RegExp(`last ${minutes} min`));
+    }
+    await page.locator("#insights-account").selectOption("codex");
+    await page.waitForFunction(() => document.querySelector("#insights-loading").textContent === "");
+    assert.equal(queries.at(-1).searchParams.get("account"), "codex");
+    await page.locator("#insights-model").selectOption("sol");
+    await page.waitForFunction(() => document.querySelector("#insights-loading").textContent === "");
+    assert.equal(queries.at(-1).searchParams.get("model"), "sol");
+    await page.evaluate(() => renderSpeedHistory({bucket_seconds: 2, points: [{at: 1, speed: null, ttft: null, speed_samples: 0, ttft_samples: 0}]}, 1/60));
+    assert.equal(await page.locator("#insights-history svg").count(), 0, "an empty selection never draws zero-valued charts");
+    assert.match(await page.locator("#insights-history").innerText(), /Unknown · no timing samples/);
     const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     assert.equal(bg, colorScheme === "dark" ? "rgb(12, 12, 14)" : "rgb(246, 246, 244)");
     await page.setViewportSize({ width: 390, height: 1600 });

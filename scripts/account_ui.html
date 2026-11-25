@@ -167,6 +167,31 @@
   .insights th[data-sort] { cursor: pointer; user-select: none; } .insights th[data-sort]:hover { color: var(--text); }
   .insights th.sorted { color: var(--accent); }
   .insights tbody tr { cursor: default; }
+  .insight-filters { margin: 16px 0; } .insight-filters label { max-width: 100%; }
+  .insight-filters select { max-width: 100%; margin: 4px 0; }
+  .history-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
+  .history-chart { --series: #2a78d6; min-width: 0; }
+  @media (prefers-color-scheme: dark) { .history-chart { --series: #3987e5; } }
+  .history-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .history-chart .series { stroke: var(--series); fill: none; stroke-width: 2; }
+  .history-chart .mark { fill: var(--series); stroke: var(--panel); stroke-width: 2; }
+  .history-chart .crosshair { stroke: var(--muted); stroke-dasharray: 3 3; pointer-events: none; }
+  .history-chart .hit { fill: transparent; cursor: crosshair; }
+  .history-chart text { fill: var(--muted); font: 12px system-ui; }
+  .history-chart .gridline { stroke: var(--line); stroke-width: 1; }
+  .history-tooltip { min-height: 42px; color: var(--text); }
+  #insights-health { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); }
+  .health-state { display: flex; align-items: center; gap: 8px; font-weight: 650; }
+  .health-state::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .health-state.healthy::before { background: var(--ok); } .health-state.degraded::before { background: var(--warn); }
+  .health-state.slow::before { background: var(--bad); }
+  .health-meter { height: 8px; background: var(--track); margin: 10px 0; border-radius: 4px; overflow: hidden; }
+  .health-meter span { display: block; height: 100%; background: var(--muted); }
+  .health-meter.healthy span { background: var(--ok); } .health-meter.degraded span { background: var(--warn); }
+  .health-meter.slow span { background: var(--bad); }
+  @media (forced-colors: active) { .history-chart .series, .history-chart .mark { stroke: CanvasText; } }
+  @media (max-width: 450px) { #insights-range { flex-wrap: wrap; } }
+
 </style>
 </head>
 <body>
@@ -212,9 +237,15 @@
 
   <section data-view="insights" hidden>
   <div class="row" style="margin-bottom:10px">
-    <div class="seg" id="insights-range"><button data-h="1" class="on">1h</button><button data-h="6">6h</button><button data-h="24">24h</button></div>
+    <div class="seg" id="insights-range"><button data-h="0.016666666666666666">1m</button><button data-h="0.08333333333333333">5m</button><button data-h="0.25">15m</button><button data-h="1" class="on">1h</button><button data-h="6">6h</button><button data-h="24">24h</button></div>
     <span class="small muted" id="insights-note"></span>
   </div>
+  <div class="row insight-filters"><label>Account <select id="insights-account"><option value="">All accounts</option></select></label><label>Model <select id="insights-model"><option value="">All models</option></select></label><span class="small muted" id="insights-loading" role="status"></span></div>
+  <h2>Speed health · relative to each model's own history</h2>
+  <div id="insights-health" class="stats insight-tiles"><div class="panel skeleton">Loading speed health…</div></div>
+  <p class="small muted">Healthy ≥80% of baseline; degraded 50–80%; slow &lt;50%. TTFT is inverted (lower is better). Baseline = earlier part of the selected window, at least 5 samples; recent = last quarter, capped at 5 minutes. A relative comparison, not a universal speed target.</p>
+  <div class="stats history-grid" id="insights-history"><div class="panel skeleton">Loading speed history…</div></div>
+  <p class="small muted">Output TPS = reported output tokens ÷ observed time from first token to completion. Delivery may be buffered or bursty; this is not verified backend generation speed. TTFT uses the first streamed content delta. Gaps mean no samples; charts show medians by request start time.</p>
   <div class="stats insight-tiles" id="insights-total"><div class="panel skeleton">Loading insights…</div></div>
   <h2>By account <span class="muted" style="text-transform:none;letter-spacing:0">who answered; click a column to sort</span></h2>
   <div class="panel scroll insights" style="padding:0" id="insights-accounts"><div class="skeleton">Loading accounts…</div></div>
@@ -981,14 +1012,14 @@ $("key-form").onsubmit = async (event) => {
   $("key-name").value = "";
 };
 
-let insightsData = null, insightsHours = 1;
+let insightsData = null, insightsHours = 1, insightsRequest = 0;
 const insightSort = {"insights-accounts": ["inflight", -1], "insights-models": ["inflight", -1]};
 const UNKNOWN = `<span class="muted" title="no samples in this window">unknown</span>`;
 const known = (v, f) => v === null || v === undefined ? UNKNOWN : f(v);
 const secs = (v) => v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(v < 10 ? 2 : 1)} s`;
 const pct = (v) => `${(v * 100).toFixed(v && v < 0.1 ? 1 : 0)}%`;
 const rate = (v) => v.toFixed(v < 10 ? 1 : 0);
-const windowName = (h) => h === 1 ? "last hour" : `last ${h}h`;
+const windowName = (h) => h < 1 ? `last ${Math.round(h * 60)} min` : h === 1 ? "last hour" : `last ${h}h`;
 function tile(label, value, unit, detail) {
   return `<div class="panel"><div class="small muted">${label}</div><div class="big">${value}${unit ? `<span class="unit">${unit}</span>` : ""}</div><div class="small muted">${detail}</div></div>`;
 }
@@ -997,13 +1028,13 @@ function insightTiles(d) {
   const liveNote = `<span class="muted" title="the recorder has not reported open connections in the last 30 seconds">unknown</span>`;
   const tokens = t.tokens;
   return [
-    tile("Active sessions <span class=\"muted\">15 min</span>", t.active_sessions, "",
+    tile(`Active sessions <span class="muted">${Math.min(15, d.hours * 60)} min</span>`, t.active_sessions, "",
       `${t.sessions} in the ${w} · ${t.active_machines} of ${t.machines} machines active`),
-    tile("Open connections", live ? live.connections : liveNote, "",
+    tile("Open connections (all accounts)", live ? live.connections : liveNote, "",
       live ? `${live.inflight} model calls in flight · ${live.client_ips} client IPs` : "recorder not reporting live counts"),
-    tile("Tokens / second <span class=\"muted\">5 min</span>", known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
+    tile(`Observed output TPS <span class="muted">${Math.min(5, d.hours * 60)} min</span>`, known(t.speed.now, rate), t.speed.now === null ? "" : "tok/s",
       `per request · ${w}: p50 ${known(t.speed.p50, rate)} · slowest 5% ${known(t.speed.p5, rate)} · all calls ${known(t.throughput_now, rate)} tok/s now`),
-    tile("Time to first token <span class=\"muted\">5 min</span>", known(t.ttft.now, secs), "",
+    tile(`Time to first token <span class="muted">${Math.min(5, d.hours * 60)} min</span>`, known(t.ttft.now, secs), "",
       `${w}: p50 ${known(t.ttft.p50, secs)} · p95 ${known(t.ttft.p95, secs)} · ${t.ttft.samples} streams`),
     tile("Requests", t.per_minute.toFixed(t.per_minute < 10 ? 1 : 0), "/min",
       `${t.requests.toLocaleString()} calls · <span class="${t.errors ? "status-bad" : ""}">${known(t.error_rate, pct)} errors</span> · <span title="answered by a different model than requested">${known(t.fallback_rate, pct)} fallback</span>`),
@@ -1042,28 +1073,79 @@ function renderInsights() {
   const d = insightsData;
   if (!d) return;
   if (!d.traffic_db) {
-    for (const id of ["now", "insights-total", "insights-accounts", "insights-models", "insights-status"]) $(id).innerHTML = `<div class="panel skeleton">Traffic recording is off, so nothing is known.</div>`;
+    for (const id of ["now", "insights-total", "insights-accounts", "insights-models", "insights-status", "insights-health", "insights-history"]) $(id).innerHTML = `<div class="panel skeleton">Traffic recording is off, so nothing is known.</div>`;
     return;
   }
   $("now").innerHTML = $("insights-total").innerHTML = insightTiles(d);
   $("insights-note").textContent = (d.timings_recorded ? "" : "This database has no first-token times yet, so TTFT and tokens/s stay unknown until the recorder is updated. ")
-    + "Active = a model call in the last 15 minutes; tokens/s and TTFT “now” = the last 5 minutes.";
+    + `Active = calls in the last ${Math.min(15, d.hours * 60)} minutes; TPS and TTFT “now” = the last ${Math.min(5, d.hours * 60)} minutes. Connections are global.`;
+  for (const [id, values, label] of [["insights-account", d.filters?.accounts, "All accounts"], ["insights-model", d.filters?.models, "All models"]]) {
+    const select = $(id), chosen = select.value;
+    const options = [...new Set([...(values || []), ...(chosen ? [chosen] : [])])];
+    select.innerHTML = `<option value="">${label}</option>` + options.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+    select.value = chosen;
+  }
+  renderSpeedHealth(d.health);
+  renderSpeedHistory(d.history, d.hours);
   insightTable("insights-accounts", d.by_account, "account", "Account");
   insightTable("insights-models", d.by_model, "model", "Model");
   $("insights-status").innerHTML = bars(`Replies, ${windowName(d.hours)}`, d.total.statuses);
 }
 async function loadInsights() {
-  const asked = insightsHours;
+  const request = ++insightsRequest;
+  const query = new URLSearchParams({hours: insightsHours});
+  for (const key of ["account", "model"]) if ($(`insights-${key}`).value) query.set(key, $(`insights-${key}`).value);
+  $("insights-loading").textContent = insightsData ? "Updating… previous selection shown" : "Loading…";
   try {
-    const d = await api(`/api/insights?hours=${asked}`);
-    if (asked === insightsHours) { insightsData = d; renderInsights(); }  // a slower, older answer must not replace the chosen window
+    const d = await api(`/api/insights?${query}`);
+    if (request === insightsRequest) { insightsData = d; renderInsights(); $("insights-loading").textContent = ""; }
   }
-  catch (e) { showError(e); }
+  catch (e) { if (request === insightsRequest) { showError(e); $("insights-loading").textContent = "Update failed · previous data retained"; } }
 }
 $("insights-range").querySelectorAll("button").forEach((b) => b.onclick = () => {
   $("insights-range").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
   insightsHours = +b.dataset.h; loadInsights();
 });
+for (const key of ["account", "model"]) $(`insights-${key}`).onchange = loadInsights;
+
+function renderSpeedHealth(health) {
+  const models = [...(health?.models || [])].sort((a, b) => Math.max(b.speed.samples, b.ttft.samples) - Math.max(a.speed.samples, a.ttft.samples));
+  $("insights-health").innerHTML = models.length ? models.map((m) => `<div class="panel"><strong>${esc(m.model)}</strong>${["speed", "ttft"].map((key) => {
+    const h = m[key], fmt = key === "speed" ? (v) => `${rate(v)} tok/s` : secs;
+    return `<div class="small muted" style="margin-top:12px">${key === "speed" ? "Output delivery" : "TTFT"}</div><div class="health-state ${h.state}">${h.state === "unknown" ? "Unknown · insufficient samples" : h.state[0].toUpperCase() + h.state.slice(1)} · ${known(h.current, fmt)}</div>
+    <div class="health-meter ${h.state}" role="meter" aria-label="${esc(m.model)} ${key}: ${h.state}" aria-valuemin="0" aria-valuemax="100" ${h.ratio === null ? 'aria-valuetext="Unknown"' : `aria-valuenow="${Math.round(Math.min(1, h.ratio) * 100)}"`}><span style="width:${h.ratio === null ? 0 : Math.min(1, h.ratio) * 100}%"></span></div>
+    <div class="small muted">Baseline ${known(h.baseline, fmt)} · ${h.baseline_samples} earlier / ${h.samples} recent samples${h.ratio === null ? "" : ` · ${Math.round(h.ratio * 100)}% of baseline`}</div>`;
+  }).join("")}</div>`).join("") : `<div class="panel muted">Unknown · no completed streams with timing samples in this selection.</div>`;
+}
+function renderSpeedHistory(history, hours) {
+  if (!history) { $("insights-history").innerHTML = `<div class="panel muted">History unavailable.</div>`; return; }
+  const points = history.points;
+  $("insights-history").innerHTML = ["speed", "ttft"].map((key) => {
+    const fmt = key === "speed" ? (v) => `${rate(v)} tok/s` : secs;
+    const title = key === "speed" ? "Observed output TPS" : "Time to first token";
+    if (!points.some((p) => p[key] !== null)) return `<div class="panel history-chart"><strong>${title} · p50</strong><p class="muted">Unknown · no timing samples in this selection.</p></div>`;
+    const max = Math.max(...points.map((p) => p[key] ?? 0), 0.001) * 1.12;
+    const x = (i) => 52 + i * 480 / Math.max(1, points.length - 1), y = (v) => 174 - v / max * 150;
+    let path = "", connected = false;
+    points.forEach((p, i) => { if (p[key] === null) { connected = false; return; } path += `${connected ? "L" : "M"}${x(i)},${y(p[key])} `; connected = true; });
+    const time = (p) => new Date(p.at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: hours < 1 ? "2-digit" : undefined});
+    return `<div class="panel history-chart" data-metric="${key}"><strong>${title} · p50</strong><div class="small muted">${secs(history.bucket_seconds)} buckets · ${windowName(hours)}</div>
+    <svg viewBox="0 0 550 205" role="img" aria-label="${title} median history"><line class="gridline" x1="52" x2="532" y1="174" y2="174"/><line class="gridline" x1="52" x2="532" y1="24" y2="24"/>
+    <text x="48" y="28" text-anchor="end">${rate(max)}</text><text x="48" y="178" text-anchor="end">0</text><path class="series" d="${path}"/>
+    ${points.map((p, i) => p[key] === null ? "" : `<circle class="mark" cx="${x(i)}" cy="${y(p[key])}" r="4"/>`).join("")}
+    <line class="crosshair" y1="24" y2="174" visibility="hidden"/>
+    ${points.map((p, i) => `<rect class="hit" tabindex="0" role="button" aria-label="${esc(time(p))}: ${p[key] === null ? "no samples" : esc(fmt(p[key]))}, ${p[`${key}_samples`]} samples" data-index="${i}" x="${x(i) - 8}" y="20" width="16" height="160"/>`).join("")}
+    <text x="52" y="200">${time(points[0])}</text><text x="532" y="200" text-anchor="end">${time(points.at(-1))}</text></svg>
+    <div class="history-tooltip small" aria-live="polite">Hover, tap or focus a bucket for values and sample counts.</div>
+    <details><summary class="small">View data table</summary><div class="scroll"><table><thead><tr><th>Time</th><th>${title}</th><th>Samples</th></tr></thead><tbody>${points.map((p) => `<tr><td>${time(p)}</td><td>${known(p[key], fmt)}</td><td>${p[`${key}_samples`]}</td></tr>`).join("")}</tbody></table></div></details></div>`;
+  }).join("");
+  $("insights-history").querySelectorAll(".history-chart").forEach((chart) => {
+    chart.querySelectorAll(".hit").forEach((hit) => {
+      const show = () => { chart.querySelector(".history-tooltip").textContent = hit.getAttribute("aria-label"); const line = chart.querySelector(".crosshair"); line.setAttribute("x1", +hit.getAttribute("x") + 8); line.setAttribute("x2", +hit.getAttribute("x") + 8); line.setAttribute("visibility", "visible"); };
+      hit.onpointerenter = hit.onfocus = hit.onclick = show;
+    });
+  });
+}
 
 const VIEWS = {overview: "Overview", insights: "Insights", accounts: "Accounts", routing: "Routing", models: "Models", usage: "Usage", keys: "API keys", sessions: "Sessions", requests: "Requests"};
 function showView() {

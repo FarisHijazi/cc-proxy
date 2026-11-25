@@ -105,3 +105,105 @@ def test_a_stale_or_missing_live_snapshot_is_unknown(db):
     result = insights(old, 1, NOW)
     assert result["live"] is None and result["timings_recorded"] is False
     assert result["total"]["requests"] == 1 and result["total"]["ttft"]["p50"] is None and result["total"]["tokens"] is None
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 15])
+def test_short_windows_and_bucket_medians(db, minutes):
+    flow(db, "in", minutes * 60 - 1, duration=0.5, ttft=0.1, tokens=(10, 0, 20))
+    flow(db, "out", minutes * 60 + 1)
+    result = insights(db, minutes / 60, NOW)
+    assert result["total"]["requests"] == 1
+    assert result["total"]["per_minute"] == pytest.approx(1 / minutes)
+    history = result["history"]
+    assert len(history["points"]) == 30
+    assert history["bucket_seconds"] == pytest.approx(minutes * 2)
+    assert history["points"][0]["speed"] == pytest.approx(50)
+    assert history["points"][0]["ttft"] == pytest.approx(0.1)
+    assert history["points"][-1]["speed"] is None
+    assert history["points"][-1]["speed_samples"] == 0
+    assert result["total"]["throughput_now"] == pytest.approx(20 / (minutes * 60) if minutes <= 5 else 0)
+
+
+@pytest.mark.parametrize("recent_speed, expected", [(50, "healthy"), (30, "degraded"), (10, "slow")])
+def test_model_relative_health_excludes_recent_from_baseline(db, recent_speed, expected):
+    for i in range(5):
+        flow(db, str(i), 600 + i * 20)
+    flow(db, "recent", 60, tokens=(100, 0, recent_speed * 10))
+    result = insights(db, 1, NOW)
+    health = result["health"]["models"][0]
+    assert health["speed"]["state"] == expected
+    assert health["speed"]["baseline"] == 50
+    assert health["speed"]["baseline_samples"] == 5
+    assert health["speed"]["samples"] == 1
+    assert health["ttft"]["state"] == "healthy"
+    assert health["speed"]["ratio"] == pytest.approx(recent_speed / 50)
+
+
+def test_health_unknown_without_recent_or_sufficient_baseline(db):
+    flow(db, "old", 600)
+    result = insights(db, 1, NOW)
+    h = result["health"]["models"][0]["speed"]
+    assert h["state"] == "unknown" and h["ratio"] is None and h["current"] is None
+    flow(db, "new", 60)
+    assert insights(db, 1, NOW)["health"]["models"][0]["speed"]["state"] == "unknown"
+
+
+def test_filters_use_answering_account_and_model_for_every_metric(db):
+    flow(db, "a", 60)
+    flow(db, "b", 60, served="codex/sol")
+    result = insights(db, 1, NOW, account="codex", model="sol")
+    assert result["total"]["requests"] == 1
+    assert [g["account"] for g in result["by_account"]] == ["codex"]
+    assert [g["model"] for g in result["by_model"]] == ["sol"]
+    assert [g["model"] for g in result["health"]["models"]] == ["sol"]
+    assert result["filters"]["accounts"] == ["a@example.com", "codex"]
+    assert sum(p["speed_samples"] for p in result["history"]["points"]) == 1
+    assert insights(db, 1, NOW, account="missing")["health"]["models"] == []
+
+
+def test_failed_nonstream_short_and_future_timings_are_not_history_samples(db):
+    flow(db, "failed", 60, status=500)
+    flow(db, "nonstream", 60, ttft=None)
+    flow(db, "burst", 60, ttft=1, duration=1.01)
+    flow(db, "pending", 1)
+    result = insights(db, 1, NOW)
+    assert sum(p["speed_samples"] for p in result["history"]["points"]) == 0
+    assert sum(p["ttft_samples"] for p in result["history"]["points"]) == 1
+
+
+@pytest.mark.parametrize("hours", [0, -1, 25, float("nan"), float("inf")])
+def test_invalid_ranges_are_rejected(db, hours):
+    with pytest.raises(ValueError):
+        insights(db, hours, NOW)
+
+
+def test_history_query_uses_started_index_and_never_reads_bodies(db):
+    queries = []
+    db.set_trace_callback(queries.append)
+    insights(db, 1 / 60, NOW)
+    query = next(q for q in queries if "FROM flows WHERE" in q)
+    plan = db.execute("EXPLAIN QUERY PLAN " + query).fetchall()
+    assert any("USING INDEX flows_started" in row[-1] for row in plan)
+    assert "request_body" not in query and "response_body" not in query
+
+
+def test_zero_ttft_baseline_is_measured_not_missing(db):
+    for i in range(6):
+        flow(db, str(i), 60 if i == 5 else 600 + i * 20)
+    db.execute("UPDATE flows SET first_token = started")
+    h = insights(db, 1, NOW)["health"]["models"][0]["ttft"]
+    assert h["state"] == "healthy" and h["baseline"] == 0 and h["current"] == 0
+
+
+def test_live_only_filter_identities_are_available(db):
+    db.execute("INSERT INTO live VALUES ('now', ?, ?)", (NOW, json.dumps({"connections": [], "inflight": [
+        {"account": "proxy-account-live@example.com", "served_by": "codex/sol"}]})))
+    result = insights(db, 1, NOW)
+    assert result["filters"] == {"accounts": ["codex"], "models": ["sol"]}
+
+
+def test_future_started_rows_do_not_inflate_any_metrics(db):
+    flow(db, "future", -60)
+    result = insights(db, 1, NOW)
+    assert result["total"]["requests"] == 0
+    assert result["health"]["models"] == []

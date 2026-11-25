@@ -113,34 +113,66 @@ def summary(group, minutes):
         "speed": {"now": percentile(group["speed_now"], 0.5), "p50": percentile(group["speed"], 0.5),
                   "p5": percentile(group["speed"], 0.05), "samples": len(group["speed"])},
         "latency": {"p50": percentile(group["latency"], 0.5), "p95": percentile(group["latency"], 0.95)},
-        "throughput_now": group["output_now"] / CURRENT_S if reported else None,
+        "throughput_now": group["output_now"] / min(CURRENT_S, minutes * 60) if reported else None,
         "tokens": tokens if reported else None,
         "tokens_reported": reported,
         "cache_hit": tokens["cache_read"] / prompt if reported and prompt else None,
     }
 
 
-def insights(db, hours, now=None):
+def insights(db, hours, now=None, account=None, model=None):
     """Totals and per-account / per-model breakdowns of model calls over the last `hours`."""
     now = time.time() if now is None else now
+    if not math.isfinite(hours) or not 1 / 60 <= hours <= 24:
+        raise ValueError("hours must be between 1/60 and 24")
+    selected_model = model
+    window = hours * 3600
+    current_s = min(CURRENT_S, window / 4)
+    since = now - window
+    bucket_s = window / 30
+    buckets = [{"at": since + i * bucket_s, "speed": [], "ttft": []} for i in range(30)]
+    health = {}
+    available_accounts, available_models = set(), set()
     columns = {row[1] for row in db.execute("PRAGMA table_info(flows)")}
     first_token = "first_token" if "first_token" in columns else "NULL"
     tokens = ("input_tokens, cache_read_tokens, output_tokens"
               if {"input_tokens", "cache_read_tokens", "output_tokens"} <= columns else "NULL, NULL, NULL")
     rows = db.execute(
         f"SELECT started, finished, {first_token}, session_id, coalesce(client_host, client_ip, 'unknown'), "
-        f"status, model, served_by, account, {tokens} FROM flows WHERE started > ? AND model IS NOT NULL "
-        "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'", (now - hours * 3600,)).fetchall()
+        f"status, model, served_by, account, {tokens} FROM flows WHERE started > ? AND started <= ? AND model IS NOT NULL "
+        "AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'", (now - hours * 3600, now)).fetchall()
     total, accounts, models = empty(), {}, {}
-    for started, finished, first, session, host, status, model, served, placeholder, *counts in rows:
-        row = (started, finished, first, session, host, status, model, served, counts)
+    for started, finished, first, session, host, status, requested, served, placeholder, *counts in rows:
+        who, actual = account_of(served, placeholder), model_of(served, requested)
+        available_accounts.add(who)
+        available_models.add(actual)
+        if (account and who != account) or (selected_model and actual != selected_model):
+            continue
+        row = (started, finished, first, session, host, status, requested, served, counts)
         for group in (total, accounts.setdefault(account_of(served, placeholder), empty()),
-                      models.setdefault(model_of(served, model), empty())):
+                      models.setdefault(model_of(served, requested), empty())):
             add(group, row, now)
+        if not (status is not None and 200 <= status < 300 and finished and first and started <= first <= finished <= now):
+            continue
+        # These are observed delivery rates, not a claim about backend generation or burst delivery.
+        metrics = {"ttft": first - started, "speed": counts[2] / (finished - first)
+                   if counts[2] and finished - first >= MIN_GENERATION_S else None}
+        bucket = buckets[min(29, max(0, int((started - since) / bucket_s)))]
+        entry = health.setdefault(actual, {key: {"recent": [], "baseline": []} for key in metrics})
+        for key, value in metrics.items():
+            if value is not None:
+                bucket[key].append(value)
+                entry[key]["recent" if started >= now - current_s else "baseline"].append(value)
     live = live_snapshot(db, now)
     if live:
         for call in live["inflight"]:
             served = call.get("served_by")
+            available_accounts.add(account_of(served, call.get("account")))
+            if served:
+                available_models.add(model_of(served, None))
+            if (account and account_of(served, call.get("account")) != account) or (
+                    selected_model and model_of(served, None) != selected_model):
+                continue
             total["inflight"] += 1
             accounts.setdefault(account_of(served, call.get("account")), empty())["inflight"] += 1
             if served:
@@ -149,7 +181,14 @@ def insights(db, hours, now=None):
     named = lambda groups, key: sorted(({key: name, **summary(g, minutes)} for name, g in groups.items()),
                                        key=lambda e: (e["inflight"], e["requests"]), reverse=True)
     return {
-        "hours": hours, "traffic_db": True, "timings_recorded": "first_token" in columns,
+        "hours": hours, "traffic_db": True,
+        "filters": {"accounts": sorted(available_accounts), "models": sorted(available_models)},
+        "history": {"bucket_seconds": bucket_s, "points": [
+            {"at": b["at"], **{key: percentile(b[key], 0.5) for key in ("speed", "ttft")},
+             "speed_samples": len(b["speed"]), "ttft_samples": len(b["ttft"])} for b in buckets]},
+        "health": {"current_seconds": current_s, "baseline_seconds": window - current_s,
+                   "models": [{"model": name, **{key: relative_health(value, key) for key, value in metrics.items()}}
+                              for name, metrics in sorted(health.items())]}, "timings_recorded": "first_token" in columns,
         "live": None if live is None else {
             "at": live["at"], "connections": len(live["connections"]),
             "client_ips": len({ip for ip in live["connections"] if ip}),
@@ -158,3 +197,14 @@ def insights(db, hours, now=None):
         "by_account": named(accounts, "account"),
         "by_model": named(models, "model"),
     }
+
+
+def relative_health(samples, metric):
+    recent, baseline = samples["recent"], samples["baseline"]
+    current, normal = percentile(recent, 0.5), percentile(baseline, 0.5)
+    ratio = None
+    if current is not None and normal is not None and len(baseline) >= 5:
+        ratio = current / max(normal, 0.001) if metric == "speed" else max(normal, 0.001) / max(current, 0.001)
+    return {"state": "unknown" if ratio is None else "healthy" if ratio >= 0.8 else "degraded" if ratio >= 0.5 else "slow",
+            "ratio": ratio, "current": current, "baseline": normal,
+            "samples": len(recent), "baseline_samples": len(baseline)}

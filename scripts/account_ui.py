@@ -457,20 +457,23 @@ class Dashboard:
             series[min(int((started - since) // bucket), 23)] += 1
         return result
 
-    def insights(self, hours):
+    def insights(self, hours, account=None, model=None):
         """Live load, speed and health per account and model (account_insights.py), cached briefly."""
         with self.insights_lock:  # one scan at a time: polls queue behind it and reuse its answer
-            hit = self.cache.get(("insights", hours))
+            hit = self.cache.get(("insights", hours, account, model))
             if hit and time.time() - hit[0] < INSIGHTS_CACHE_S:
                 return hit[1]
             db = self.database(self.config())
             if db is None:
                 return {"hours": hours, "traffic_db": False}
             try:
-                result = insights(db, hours)
+                result = insights(db, hours, account=account, model=model)
             finally:
                 db.close()
-            self.cache[("insights", hours)] = (time.time(), result)
+            for key in list(self.cache):
+                if key[0] == "insights" and time.time() - self.cache[key][0] >= INSIGHTS_CACHE_S:
+                    del self.cache[key]
+            self.cache[("insights", hours, account, model)] = (time.time(), result)
             return result
 
     def prometheus(self):
@@ -634,7 +637,13 @@ def handler(dashboard, mcp_relay=None):
                 if url.path == "/api/usage":
                     return self.reply(200, dashboard.usage(min(max(int(query.get("hours", 24)), 1), USAGE_MAX_HOURS)))
                 if url.path == "/api/insights":
-                    return self.reply(200, dashboard.insights(min(max(int(query.get("hours", 1)), 1), INSIGHTS_MAX_HOURS)))
+                    try:
+                        hours = float(query.get("hours", 1))
+                    except ValueError:
+                        return self.reply(400, {"error": "hours must be a number between 1/60 and 24"})
+                    if not 1 / 60 <= hours <= INSIGHTS_MAX_HOURS:
+                        return self.reply(400, {"error": "hours must be between 1/60 and 24"})
+                    return self.reply(200, dashboard.insights(hours, query.get("account"), query.get("model")))
                 if url.path == "/metrics":
                     return self.reply(200, dashboard.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
                 if url.path == "/api/stats":

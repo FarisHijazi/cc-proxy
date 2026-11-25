@@ -305,3 +305,31 @@ def test_a_console_key_account_is_shown_and_toggled_but_its_key_never_leaves_the
     assert "sk-ant" not in json.dumps(card)
     with pytest.raises(ValueError):
         board.update({"balance": {"strategy": "prefer", "prefer": "console"}})
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 15])
+def test_insights_handler_accepts_minute_ranges_and_filters(minutes):
+    from types import SimpleNamespace
+
+    received, replies = [], []
+    board = SimpleNamespace(insights=lambda *args: received.append(args) or {"traffic_db": True})
+    handler_type = ui["handler"](board)
+    request = handler_type.__new__(handler_type)
+    request.path = f"/api/insights?hours={minutes / 60}&account=acme&model=sol"
+    request.reply = lambda status, body: replies.append((status, body))
+    request.do_GET()
+    assert received == [(minutes / 60, "acme", "sol")]
+    assert replies == [(200, {"traffic_db": True})]
+
+
+@pytest.mark.parametrize("hours", ["0", "-1", "25", "nan", "inf", "oops"])
+def test_insights_handler_rejects_invalid_range_without_reading_database(hours):
+    from types import SimpleNamespace
+
+    replies = []
+    handler_type = ui["handler"](SimpleNamespace())
+    request = handler_type.__new__(handler_type)
+    request.path = f"/api/insights?hours={hours}"
+    request.reply = lambda status, body: replies.append((status, body))
+    request.do_GET()
+    assert replies[0][0] == 400
