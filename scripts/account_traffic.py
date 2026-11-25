@@ -83,6 +83,28 @@ CREATE TABLE IF NOT EXISTS live (name TEXT PRIMARY KEY, at REAL, body TEXT);
 """
 
 
+ACCOUNT_INDEX_SQL = """CREATE INDEX IF NOT EXISTS flows_answered_account
+ON flows(served_by COLLATE NOCASE, started) WHERE status = 200 AND served_by IS NOT NULL"""
+
+
+def account_index(db, budget_s=3):
+    """Bound schema maintenance below the live writer's five-second busy timeout."""
+    deadline = time.monotonic() + budget_s
+    busy_ms = db.execute("PRAGMA busy_timeout").fetchone()[0]
+    db.execute("PRAGMA busy_timeout=0")
+    db.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+    try:
+        db.execute(ACCOUNT_INDEX_SQL)
+        return True
+    except sqlite3.OperationalError as error:
+        if str(error) != "interrupted" and error.sqlite_errorcode not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise
+        return False
+    finally:
+        db.set_progress_handler(None, 0)
+        db.execute(f"PRAGMA busy_timeout={busy_ms}")
+
+
 NAMES_TTL_S = 300
 _names = (0.0, {})
 
@@ -178,6 +200,7 @@ class TrafficDB:
         self.days_of = days_of  # its "traffic_days": keep this many days, unset keeps all
         self.path = self.db = None
         self.pruned = 0.0
+        self.index_pending, self.index_retry_at = False, 0.0
         self.dropped = 0
         self.jobs = queue.Queue(QUEUE_MAX)
         self.live_lock = threading.Lock()
@@ -204,6 +227,8 @@ class TrafficDB:
             try:
                 if job is not None and self.connection(path) is not None:
                     job(*args)
+                if self.db is not None and self.jobs.empty():
+                    self.maintain_index()
                 if time.time() - self.live_at >= LIVE_EVERY_S and self.connection() is not None:
                     self.write_live()
             except Exception as error:  # noqa: BLE001 - a bad row must not stop the recorder
@@ -252,7 +277,15 @@ class TrafficDB:
                         self.db.execute(f"ALTER TABLE flows ADD COLUMN {column} {kind}")
                 if "api_key" not in present:
                     self.db.execute("ALTER TABLE flows ADD COLUMN api_key TEXT")
+                self.index_pending, self.index_retry_at = True, 0.0
         return self.db
+
+    def maintain_index(self):
+        if self.index_pending and time.time() >= self.index_retry_at:
+            self.index_pending = not account_index(self.db)
+            self.index_retry_at = time.time() + 300
+            if self.index_pending:
+                print("traffic-db: account index deferred: maintenance exceeded three seconds", flush=True)
 
     def prune(self):
         """Drop what is older than traffic_days. A blob a kept flow uses was seen after that cutoff."""

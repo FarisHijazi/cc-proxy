@@ -8,6 +8,7 @@ bind it to the same private address as the proxy.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -22,8 +23,8 @@ import threading
 import time
 import urllib.request
 import zlib
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -220,6 +221,9 @@ class Dashboard:
         self.cache = {}
         self.insights_lock = threading.Lock()
         self.metrics = Metrics()
+        self.state_lock = threading.Lock()
+        self.state_jobs = {}
+        self.state_pool = ThreadPoolExecutor(4, thread_name_prefix="dashboard-state")
         self.restored = runpy.run_path(str(HERE / "claude-traffic"), run_name="claude_traffic")["restored"]
 
     def config(self):
@@ -263,12 +267,16 @@ class Dashboard:
 
     def last_reply(self, alias, cfg):
         db = self.database(cfg)
-        row = db.execute(
-            "SELECT started, response_headers FROM flows WHERE served_by LIKE ? AND status = 200 "
-            "AND response_headers LIKE '%ratelimit-unified%' ORDER BY started DESC LIMIT 1",
-            (alias + "/%",),
-        ).fetchone() if db else None
-        return (reply_usage(json.loads(row[1])), row[0]) if row else ({}, None)
+        try:
+            row = db.execute(
+                "SELECT started, response_headers FROM flows WHERE served_by IS NOT NULL AND served_by LIKE ? AND status = 200 "
+                "AND response_headers LIKE '%ratelimit-unified%' ORDER BY started DESC LIMIT 1",
+                (alias + "/%",),
+            ).fetchone() if db else None
+            return (reply_usage(json.loads(row[1])), row[0]) if row else ({}, None)
+        finally:
+            if db:
+                db.close()
 
     def account(self, alias, slot, cfg):
         usage = self.fetch(alias, "/api/oauth/usage")
@@ -301,12 +309,17 @@ class Dashboard:
         `spend_usd` is what the proxy spent through it this month; None (unknown) without a traffic database."""
         member = cfg["api_key_accounts"][alias]
         db = self.database(cfg)
+        try:
+            spent = round(month_spend(db, alias), 4) if db else None
+        finally:
+            if db:
+                db.close()
         return {
             "alias": alias, "kind": "api_key", "slot": None, "email": None, "plan": "api key",
             "preferred": member.get("preferred") is True,
             "usage": {}, "usage_at": None, "token_only": False, "error": None,
             "disabled": alias in cfg.get("disabled", []),
-            "spend_usd": round(month_spend(db, alias), 4) if db else None,
+            "spend_usd": spent,
             "budget_usd": member.get("monthly_budget_usd"),
         }
 
@@ -314,7 +327,13 @@ class Dashboard:
         """Each non-Claude backend's last 24 h from the traffic database; None (unknown) without one."""
         hit = self.cache.get("provider_usage")
         if not hit or time.time() - hit[0] >= CACHE_S:
-            hit = self.cache["provider_usage"] = (time.time(), provider_usage(self.database(cfg), catalog=self.providers().get("catalog")))
+            db = self.database(cfg)
+            try:
+                value = provider_usage(db, catalog=self.providers().get("catalog"))
+            finally:
+                if db:
+                    db.close()
+            hit = self.cache["provider_usage"] = (time.time(), value)
         return hit[1]
 
     def provider_quota(self):
@@ -343,14 +362,55 @@ class Dashboard:
             return None
         return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
-    def state(self):
+    def state_part(self, key, read, progressive, ttl=CACHE_S):
+        """One request-driven refresh per part; stale values stay usable while it runs."""
+        with self.state_lock:
+            hit = self.cache.get(("state", key))
+            job = self.state_jobs.get(key)
+            if job is None and (hit is None or time.time() - hit[0] >= ttl):
+                job = self.state_jobs[key] = self.state_pool.submit(read)
+        if job is not None and (not progressive or job.done()):
+            try:
+                value = job.result()
+            except Exception as error:  # noqa: BLE001 - isolate optional account/vendor failures
+                value = {"error": type(error).__name__}
+            with self.state_lock:
+                if self.state_jobs.get(key) is job:
+                    hit = self.cache[("state", key)] = (time.time(), value)
+                    del self.state_jobs[key]
+                else:
+                    hit = self.cache.get(("state", key))
+        return (hit[1] if hit else None), hit is None
+
+    def state(self, progressive=False):
         cfg = self.config()
-        providers = self.providers()
-        with ThreadPoolExecutor(8) as pool:
-            quota = pool.submit(self.provider_quota)
-            accounts = list(pool.map(lambda item: self.account(*item, cfg), cfg["accounts"].items()))
-            accounts += [self.key_account(alias, cfg) for alias in cfg.get("api_key_accounts", {})]
-            quota = quota.result()
+        pending = []
+
+        def part(key, read, ttl=CACHE_S):
+            value, loading = self.state_part(key, read, progressive, ttl)
+            if loading:
+                pending.append(str(key))
+            return value
+
+        listed = part("providers", self.providers)
+        providers = {"reachable": None if listed is None else False, "models": {}, "catalog": {},
+                     "fallback_defaults": None, **(listed or {}), "loading": listed is None}
+        accounts = []
+        for alias, slot in cfg["accounts"].items():
+            value = part(("account", alias), lambda a=alias, s=slot: self.account(a, s, cfg))
+            accounts.append({"alias": alias, "slot": slot, "usage": {}, "loading": value is None,
+                             **(value or {}), "disabled": alias in cfg.get("disabled", [])})
+        for alias, member in cfg.get("api_key_accounts", {}).items():
+            value = part(("key", alias), lambda a=alias: self.key_account(a, cfg))
+            accounts.append({"alias": alias, "kind": "api_key", "usage": {}, "spend_usd": None,
+                             "loading": value is None, **(value or {}), "budget_usd": member.get("monthly_budget_usd"),
+                             "preferred": member.get("preferred") is True, "disabled": alias in cfg.get("disabled", [])})
+        if providers.get("loading"):
+            quota = recorded = None
+            pending += ["quota", "provider_usage"]
+        else:
+            quota = part("quota", self.provider_quota, QUOTA_CACHE_S)
+            recorded = part("provider_usage", lambda: self.recorded_provider_usage(cfg))
         db_path = Path(cfg["traffic_db"]).expanduser() if cfg.get("traffic_db") else None
         try:
             socket.create_connection((self.proxy.hostname, self.proxy.port), 1).close()
@@ -370,8 +430,9 @@ class Dashboard:
             "api_keys": [{k: v for k, v in key.items() if k != "sha256"} for key in cfg.get("api_keys", [])],
             "providers": providers,
             "fallback_defaults": providers["fallback_defaults"],
-            "provider_usage": self.recorded_provider_usage(cfg),
+            "provider_usage": recorded,
             "provider_quota": quota,
+            "pending": pending,
             "proxy": {"address": f"{self.proxy.hostname}:{self.proxy.port}", "up": proxy_up},
             "db": {
                 "path": str(db_path) if db_path else None,
@@ -616,18 +677,40 @@ class Dashboard:
         return {**state, "created_key": created} if created else state
 
 
+def accepts_gzip(header):
+    for item in header.lower().split(","):
+        coding, *params = item.strip().split(";")
+        if coding.strip() != "gzip":
+            continue
+        try:
+            quality = next((float(p.split("=", 1)[1]) for p in params if p.strip().startswith("q=")), 1)
+        except ValueError:
+            return False
+        return quality > 0
+    return False
+
+
 def handler(dashboard, mcp_relay=None):
     class Handler(BaseHTTPRequestHandler):
         def reply(self, status, body, kind="application/json"):
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            compressed = len(data) > 1024 and accepts_gzip(self.headers.get("Accept-Encoding", ""))
+            if compressed:
+                data = gzip.compress(data, compresslevel=1)
             self.send_response(status)
             self.send_header("content-type", kind)
             self.send_header("cache-control", "no-store")
+            self.send_header("vary", "Accept-Encoding")
+            if compressed:
+                self.send_header("content-encoding", "gzip")
+            if hasattr(self, "started_at"):
+                self.send_header("server-timing", f"app;dur={(time.perf_counter() - self.started_at) * 1000:.1f}")
             self.send_header("content-length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
+            self.started_at = time.perf_counter()
             if mcp_relay and mcp_relay.handle(self):
                 return
             url = urlsplit(self.path)
@@ -638,7 +721,7 @@ def handler(dashboard, mcp_relay=None):
                 if url.path == "/pico.css":
                     return self.reply(200, (HERE / "pico.conditional.min.css").read_bytes(), "text/css; charset=utf-8")
                 if url.path == "/api/state":
-                    return self.reply(200, dashboard.state())
+                    return self.reply(200, dashboard.state(progressive=True) if query.get("progressive") == "1" else dashboard.state())
                 if url.path == "/api/traffic":
                     return self.reply(200, dashboard.traffic(query))
                 if url.path == "/api/sessions":

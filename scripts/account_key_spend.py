@@ -52,7 +52,7 @@ def month_spend(db, alias, now=None):
     rows = db.execute(
         f"SELECT served_by, input_tokens, cache_read_tokens, output_tokens, {write}, {write_1h}, "
         f"CASE WHEN {write} IS NULL THEN response_body END FROM flows WHERE started >= ? AND status = 200 "
-        "AND served_by LIKE ? ESCAPE '\\' AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'",
+        "AND served_by IS NOT NULL AND served_by LIKE ? ESCAPE '\\' AND coalesce(url, '') NOT LIKE '%/v1/messages/count_tokens%'",
         (month_start(now), alias.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"),
     ).fetchall()
     total = 0.0
