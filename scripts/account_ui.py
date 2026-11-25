@@ -36,7 +36,7 @@ CACHE_S = 60
 TIER_PROVIDERS = ["anthropic", "codex", "cursor", "kimi"]
 MAX_TIERS, MAX_TIER_KEYS, MAX_TIER_BYTES = 24, 16, 8192
 TRIGGERS = ["rate_limit", "auth", "server_error", "model_unavailable"]
-CHAIN_KEY = re.compile(r"\*|[a-z][a-z0-9-]{0,31}")
+CHAIN_KEY = re.compile(r"\*|[a-z][a-z0-9._-]{0,63}\*?")
 MAX_CHAIN = 64
 # Same patterns account_inject.py accepts for "session_models" (they become a request header).
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -105,7 +105,7 @@ def checked_fallback(fallback, current=None):
     if not isinstance(chains, dict) or not all(
             isinstance(f, str) and CHAIN_KEY.fullmatch(f) and isinstance(t, list) and len(t) <= MAX_CHAIN
             and all(isinstance(x, str) and MODEL_ID.fullmatch(x.strip()) for x in t) for f, t in chains.items()):
-        raise ValueError(f"fallback.chains maps \"*\" or a model family to at most {MAX_CHAIN} targets: "
+        raise ValueError(f"fallback.chains maps \"*\", a model family or a model id (`prefix*` glob) to at most {MAX_CHAIN} targets: "
                          "accounts, accounts:N, a provider name or a model id")
     if not set(on) <= set(TRIGGERS) or not all(isinstance(v, bool) for v in on.values()):
         raise ValueError(f"fallback.on takes true/false for {', '.join(TRIGGERS)}")

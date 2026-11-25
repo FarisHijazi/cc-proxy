@@ -63,6 +63,9 @@ def test_failover_settings_are_saved_and_cleared(tmp_path):
                 "on": {"rate_limit": True, "auth": True, "server_error": True, "model_unavailable": True}, "threshold": 90}
     saved = board.update({"fallback": fallback})
     assert saved["fallback"]["chains"]["claude"] == ["accounts", "gemini-3-pro"]
+    model_keys = {"claude-fable*": ["accounts"], "claude-fable-5-1": ["accounts"]}
+    assert board.update({"fallback": {"chains": model_keys}})["fallback"]["chains"] == model_keys
+    saved = board.update({"fallback": fallback})
     assert saved["fallback"]["threshold"] == 90 and saved["fallback"]["on"]["server_error"] is True
     assert saved["fallback"]["on"]["model_unavailable"] is True
     assert board.update({"fallback": {"on": {"model_unavailable": False}}})["fallback"]["on"]["model_unavailable"] is False
