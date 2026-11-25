@@ -39,6 +39,9 @@ pub const POLICY_HEADER: &str = "x-claude-codex-fallback";
 /// Response header naming the account or backend that served the request.
 pub const SERVED_BY_HEADER: &str = "x-claude-codex-served-by";
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
+/// A reset epoch can be hours away while the account recovers sooner (a transient rejection),
+/// so one request re-probes a rejected account after this long instead of waiting for the reset.
+const MAX_REJECTED_COOLDOWN: Duration = Duration::from_secs(300);
 const ROUTE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROUTES: usize = 10_000;
 
@@ -702,11 +705,13 @@ impl Cooldowns {
             .insert((owner.to_string(), EVERY_MODEL.to_string()), until);
     }
 
-    fn record_rejection(&self, owner: &str, model: &str, headers: &HeaderMap) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            (owner.to_string(), model.to_string()),
-            cooldown_until(headers),
-        );
+    fn record_rejection(&self, owner: &str, model: &str, headers: &HeaderMap) -> u64 {
+        let until = cooldown_until(headers);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((owner.to_string(), model.to_string()), until);
+        until
     }
 }
 
@@ -722,10 +727,14 @@ fn cooldown_until(headers: &HeaderMap) -> u64 {
         .get("anthropic-ratelimit-unified-status")
         .and_then(|v| v.to_str().ok())
         == Some("rejected");
-    if rejected && let Some(reset) = header("anthropic-ratelimit-unified-reset") {
-        return reset;
+    let until = header("anthropic-ratelimit-unified-reset")
+        .filter(|_| rejected)
+        .unwrap_or_else(|| now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs()));
+    if rejected {
+        until.min(now() + MAX_REJECTED_COOLDOWN.as_secs())
+    } else {
+        until
     }
-    now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs())
 }
 
 /// How a Console key refused a request.
@@ -1053,9 +1062,35 @@ pub async fn dispatch(
             && !unavailable
             && refused == Refusal::Other
         {
-            registry
+            let until = registry
                 .cooldowns
                 .record_rejection(&owner, &model, response.headers());
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            log.warn(
+                "cooling down",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(ctx.req_id)),
+                    ("account".to_string(), json!(owner)),
+                    ("model".to_string(), json!(model)),
+                    ("status".to_string(), json!(status.as_u16())),
+                    ("until".to_string(), json!(until)),
+                    (
+                        "unifiedStatus".to_string(),
+                        json!(header("anthropic-ratelimit-unified-status")),
+                    ),
+                    (
+                        "claim".to_string(),
+                        json!(header("anthropic-ratelimit-unified-representative-claim")),
+                    ),
+                    ("retryAfter".to_string(), json!(header("retry-after"))),
+                ])),
+            );
         }
         // Lack of model access or credit must not hide a usable account's quota/auth failure:
         // Claude Code retries a 429 but stops at a 400.
@@ -1786,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_account_cools_until_reset_and_transient_uses_retry_after() {
+    fn rejected_account_cools_until_reset_capped_and_transient_uses_retry_after() {
         let cooldowns = Cooldowns::default();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1798,7 +1833,22 @@ mod tests {
             "anthropic-ratelimit-unified-reset",
             HeaderValue::from_str(&reset.to_string()).unwrap(),
         );
-        assert_eq!(cooldown_until(&headers), reset);
+        let until = cooldown_until(&headers);
+        assert!(until <= now() + MAX_REJECTED_COOLDOWN.as_secs());
+        assert!(until >= now() + MAX_REJECTED_COOLDOWN.as_secs() - 1);
+        let soon = now() + 30;
+        headers.insert(
+            "anthropic-ratelimit-unified-reset",
+            HeaderValue::from_str(&soon.to_string()).unwrap(),
+        );
+        assert_eq!(cooldown_until(&headers), soon);
+        let mut long_retry = HeaderMap::new();
+        long_retry.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("rejected"),
+        );
+        long_retry.insert("retry-after", HeaderValue::from_static("86400"));
+        assert!(cooldown_until(&long_retry) <= now() + MAX_REJECTED_COOLDOWN.as_secs());
         cooldowns.record_rejection("acct", "claude-opus-5-5", &headers);
         assert!(cooldowns.cooling("acct", "claude-opus-5-5"));
         assert!(!cooldowns.cooling("acct", "claude-sonnet-5-5"));

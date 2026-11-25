@@ -286,6 +286,7 @@ session alias first, as `x-claude-codex-account-pool` on `POST /v1/messages` and
 plus Claude-account 401 with a bounded credential quarantine. An empty Claude pool
 still reaches other vendors. The explicit primary-account marker prevents a filtered
 pool from handing thread ownership to a backup; cooldowns belong to each Registry.
+Rejected-account cooldowns are capped at 5 minutes (not the hours-away unified reset) so one request re-probes, and every cooldown is logged as "cooling down" in serve.log.
 Completed fallback routes are keyed only by conversation identity (session plus optional agent),
 not by the temporarily usable pool or its primary alias. A remembered account is tried only
 if it remains in the current authorized pool and policy chain. A remembered target serving a
