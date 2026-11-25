@@ -66,7 +66,7 @@ class Metrics:
     def count_new(self, db, now):
         newest = db.execute("SELECT max(rowid) FROM flows").fetchone()[0] or 0
         if self.cursor is None:  # first scrape only; retention must never rewind counters
-            first = db.execute("SELECT min(rowid) FROM flows WHERE started > ?", (now - ACTIVE_S,)).fetchone()[0]
+            first = db.execute("SELECT min(rowid) FROM flows INDEXED BY flows_started WHERE started > ?", (now - ACTIVE_S,)).fetchone()[0]
             self.cursor = newest if first is None else first - 1
         columns = {row[1] for row in db.execute("PRAGMA table_info(flows)")}
         first_token = "first_token" if "first_token" in columns else "NULL"
