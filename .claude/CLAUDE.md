@@ -65,7 +65,8 @@ changes made on top of it.
   skip never cools a target. In a session with a native document in its history, a bare
   429 does not cool the account either (it was measured to be about the request); a 401,
   a `retry-after`, or an `anthropic-ratelimit-unified-status: rejected` reply still does. Exhausted capable
-  targets return 429.
+  targets return 429; synthetic exhaustion names the document capability constraint, not
+  global provider exhaustion. Real upstream errors and retry headers remain unchanged.
   Gemini/local
   move tool-result images into the following user image parts; Cursor API takes
   base64 selected images, while Cursor CLI and agy take text only. Grok retains its

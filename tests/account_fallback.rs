@@ -150,9 +150,22 @@ async fn pdf_tool_results_fall_back_intact_before_codex_for_json_and_streaming()
     assert_eq!(status, StatusCode::OK);
     assert_eq!(exhausted.seen.lock().unwrap().len(), 3);
     // An authoritative exhaustion still cools the account, document or not.
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let response = send_document("dead").await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let output = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(error["error"]["type"], "rate_limit_error");
+        if attempt == 0 {
+            assert_eq!(error["error"]["message"], "exhausted");
+        } else {
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains("document-capable backend"));
+            assert!(message.contains("quota/auth cooldowns or configured key budgets"));
+            assert!(!message.contains("Every Claude account"));
+        }
     }
     assert_eq!(exhausted.seen.lock().unwrap().len(), 4);
     // So does an explicit retry-after.
