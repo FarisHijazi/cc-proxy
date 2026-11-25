@@ -370,7 +370,7 @@ const isRun = (t) => t === "accounts" || /^accounts:\d+$/.test(t);
 const subscriptions = () => state.accounts.filter((a) => a.kind !== "api_key");
 // Spend is only what this proxy sent through the key since the 1st (UTC); null means unknown, never zero.
 function keySpend(a) {
-  if (a.spend_usd == null) return `<div class="small muted">spend unknown: no traffic database to read it from</div>`;
+  if (a.spend_usd == null) return `<div class="small muted">spend unknown: no traffic database to read it from${a.budget_usd == null ? "" : ` · $${a.budget_usd.toFixed(2)} monthly budget still applies`}</div>`;
   const spent = `$${a.spend_usd.toFixed(2)}`;
   if (a.budget_usd == null) return `<div class="small muted">${spent} this month through the proxy · no budget set</div>`;
   const pct = Math.min(100, a.spend_usd / a.budget_usd * 100), level = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";

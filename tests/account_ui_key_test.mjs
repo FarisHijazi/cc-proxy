@@ -86,6 +86,7 @@ try {
     await page.reload();
     await page.locator("[data-key-preference]").waitFor();
     assert.match(await first.innerText(), spend == null ? /Budget unknown: not usable/ : /Budget reached: not usable/);
+    assert.match(await first.innerText(), /\$180\.00/, "the cap stays visible even when spend is unknown");
     assert.equal(await first.locator("[data-key-preference]").inputValue(), "true", "preferred is independent of availability");
   }
   await page.setViewportSize({width: 390, height: 844});
