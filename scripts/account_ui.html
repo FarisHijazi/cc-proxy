@@ -180,6 +180,7 @@
   .history-chart text { fill: var(--muted); font: 12px system-ui; }
   .history-chart .gridline { stroke: var(--line); stroke-width: 1; }
   .history-tooltip { min-height: 42px; color: var(--text); }
+  #insights-health { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); }
   .health-state { display: flex; align-items: center; gap: 8px; font-weight: 650; }
   .health-state::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
   .health-state.healthy::before { background: var(--ok); } .health-state.degraded::before { background: var(--warn); }
@@ -1108,7 +1109,7 @@ $("insights-range").querySelectorAll("button").forEach((b) => b.onclick = () => 
 for (const key of ["account", "model"]) $(`insights-${key}`).onchange = loadInsights;
 
 function renderSpeedHealth(health) {
-  const models = health?.models || [];
+  const models = [...(health?.models || [])].sort((a, b) => Math.max(b.speed.samples, b.ttft.samples) - Math.max(a.speed.samples, a.ttft.samples));
   $("insights-health").innerHTML = models.length ? models.map((m) => `<div class="panel"><strong>${esc(m.model)}</strong>${["speed", "ttft"].map((key) => {
     const h = m[key], fmt = key === "speed" ? (v) => `${rate(v)} tok/s` : secs;
     return `<div class="small muted" style="margin-top:12px">${key === "speed" ? "Output delivery" : "TTFT"}</div><div class="health-state ${h.state}">${h.state === "unknown" ? "Unknown · insufficient samples" : h.state[0].toUpperCase() + h.state.slice(1)} · ${known(h.current, fmt)}</div>
@@ -1122,6 +1123,7 @@ function renderSpeedHistory(history, hours) {
   $("insights-history").innerHTML = ["speed", "ttft"].map((key) => {
     const fmt = key === "speed" ? (v) => `${rate(v)} tok/s` : secs;
     const title = key === "speed" ? "Observed output TPS" : "Time to first token";
+    if (!points.some((p) => p[key] !== null)) return `<div class="panel history-chart"><strong>${title} · p50</strong><p class="muted">Unknown · no timing samples in this selection.</p></div>`;
     const max = Math.max(...points.map((p) => p[key] ?? 0), 0.001) * 1.12;
     const x = (i) => 52 + i * 480 / Math.max(1, points.length - 1), y = (v) => 174 - v / max * 150;
     let path = "", connected = false;

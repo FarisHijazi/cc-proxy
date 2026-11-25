@@ -99,6 +99,9 @@ try {
     await page.locator("#insights-model").selectOption("sol");
     await page.waitForFunction(() => document.querySelector("#insights-loading").textContent === "");
     assert.equal(queries.at(-1).searchParams.get("model"), "sol");
+    await page.evaluate(() => renderSpeedHistory({bucket_seconds: 2, points: [{at: 1, speed: null, ttft: null, speed_samples: 0, ttft_samples: 0}]}, 1/60));
+    assert.equal(await page.locator("#insights-history svg").count(), 0, "an empty selection never draws zero-valued charts");
+    assert.match(await page.locator("#insights-history").innerText(), /Unknown · no timing samples/);
     const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     assert.equal(bg, colorScheme === "dark" ? "rgb(12, 12, 14)" : "rgb(246, 246, 244)");
     await page.setViewportSize({ width: 390, height: 1600 });
