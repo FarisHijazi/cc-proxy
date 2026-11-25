@@ -94,7 +94,7 @@ class Metrics:
             if session:
                 self.sessions[(key[0], session)] = max(started, self.sessions.get((key[0], session), 0))
             self.machines[host] = max(started, self.machines.get(host, 0))
-        self.cursor = newest
+        self.cursor = max(self.cursor, newest)
         for seen in (self.sessions, self.machines):
             for name in [name for name, started in seen.items() if now - started > ACTIVE_S]:
                 del seen[name]

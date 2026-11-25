@@ -192,5 +192,6 @@ def test_pruning_does_not_replay_retained_rows(db):
     metrics = Metrics()
     metrics.scrape(db, NOW)
     db.execute("DELETE FROM flows WHERE id = 'late'")
+    metrics.scrape(db, NOW)
     m = samples(metrics.scrape(db, NOW))
     assert value(m, "cc_proxy_requests_total", account="a@example.com", model="claude-opus-5-5", status="200") == 2
