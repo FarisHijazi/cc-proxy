@@ -27,6 +27,7 @@ function setup(on: On, response?: (body: Body, count: number) => number | Promis
   })
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.id', () => ({ value: identity() }))
   on('process.hookEnv', () => ({ value: { CLAUDE_PID: '1234' } }))
   on('fs.read', (_$, e) => {

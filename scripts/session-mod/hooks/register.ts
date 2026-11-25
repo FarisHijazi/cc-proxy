@@ -1,4 +1,5 @@
 import type { Hook, Register, Timer } from 'claude-code'
+import { registerMetadata, startMetadata, endMetadata, beginMetadata, finishMetadata } from './metadata'
 
 type API = Parameters<Hook<'session.start'>>[0]
 type Event = { kind: string; data: unknown }
@@ -179,7 +180,9 @@ async function flush($: API) {
 }
 
 export const register: Register = on => {
+  registerMetadata(on)
   on('session.start', async ($, e, next) => {
+    await startMetadata($, e.isInteractive)
     timer?.cancel()
     endpoint = ''
     publisherFile = ''
@@ -233,6 +236,7 @@ export const register: Register = on => {
     return next(e)
   })
   on('turn.step', async function* ($, e, next) {
+    beginMetadata($, e)
     let p: Publisher | undefined
     try { if (endpoint) p = await owner($) } catch { status = 'event observation unavailable' }
     const stream = next(e)
@@ -246,6 +250,7 @@ export const register: Register = on => {
         yield part.value
       }
     } finally {
+      finishMetadata($, e)
       // Returning closes the engine iterator on cancellation; never replay a model request.
       await stream.return(undefined as never)
     }
@@ -269,6 +274,7 @@ export const register: Register = on => {
     return next(e)
   })
   on('session.end', async ($, e, next) => {
+    endMetadata($)
     await observe($, 'session.end', e)
     if (e.reason !== 'clear' && e.reason !== 'resume') timer?.cancel()
     void flush($)
