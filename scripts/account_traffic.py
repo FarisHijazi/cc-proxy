@@ -169,6 +169,7 @@ def clean_headers(items):
 PRUNE_EVERY_S = 3600
 QUEUE_MAX = 5000
 LIVE_EVERY_S = 5
+INFLIGHT_MAX_S = 3600
 
 
 class TrafficDB:
@@ -214,6 +215,8 @@ class TrafficDB:
     def write_live(self):
         self.live_at = time.time()
         with self.live_lock:
+            for flow_id in [k for k, v in self.inflight.items() if self.live_at - v["started"] > INFLIGHT_MAX_S]:
+                del self.inflight[flow_id]  # a flow mitmproxy never finished must not count forever
             body = {"connections": list(self.clients.values()), "inflight": [dict(v) for v in self.inflight.values()]}
         body.update(dropped=self.dropped, queued=self.jobs.qsize())
         self.db.execute("INSERT OR REPLACE INTO live VALUES ('now', ?, ?)", (self.live_at, json.dumps(body)))

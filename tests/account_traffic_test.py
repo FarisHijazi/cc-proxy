@@ -417,3 +417,13 @@ def test_older_databases_gain_the_timing_columns_and_live_table(tmp_path):
     assert {"first_byte", "first_token"} <= {row[1] for row in db.execute("PRAGMA table_info(flows)")}
     assert db.execute("SELECT first_token FROM flows WHERE id = 'old'").fetchone() == (None,)
     assert db.execute("SELECT count(*) FROM live").fetchone() == (0,)
+
+
+def test_a_call_that_never_finished_drops_out_of_the_live_table_after_an_hour(tmp_path):
+    traffic = recorder(tmp_path)
+    flow = inference_flow()
+    traffic.requestheaders(flow)
+    traffic.inflight[flow.id]["started"] -= module.INFLIGHT_MAX_S + 1
+    traffic.connection()
+    traffic.write_live()
+    assert json.loads(rows(tmp_path, "live")[0]["body"])["inflight"] == [] and traffic.inflight == {}
