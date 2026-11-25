@@ -727,10 +727,14 @@ fn cooldown_until(headers: &HeaderMap) -> u64 {
         .get("anthropic-ratelimit-unified-status")
         .and_then(|v| v.to_str().ok())
         == Some("rejected");
-    if rejected && let Some(reset) = header("anthropic-ratelimit-unified-reset") {
-        return reset.min(now() + MAX_REJECTED_COOLDOWN.as_secs());
+    let until = header("anthropic-ratelimit-unified-reset")
+        .filter(|_| rejected)
+        .unwrap_or_else(|| now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs()));
+    if rejected {
+        until.min(now() + MAX_REJECTED_COOLDOWN.as_secs())
+    } else {
+        until
     }
-    now() + header("retry-after").unwrap_or(DEFAULT_COOLDOWN.as_secs())
 }
 
 /// How a Console key refused a request.
@@ -1838,6 +1842,13 @@ mod tests {
             HeaderValue::from_str(&soon.to_string()).unwrap(),
         );
         assert_eq!(cooldown_until(&headers), soon);
+        let mut long_retry = HeaderMap::new();
+        long_retry.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("rejected"),
+        );
+        long_retry.insert("retry-after", HeaderValue::from_static("86400"));
+        assert!(cooldown_until(&long_retry) <= now() + MAX_REJECTED_COOLDOWN.as_secs());
         cooldowns.record_rejection("acct", "claude-opus-5-5", &headers);
         assert!(cooldowns.cooling("acct", "claude-opus-5-5"));
         assert!(!cooldowns.cooling("acct", "claude-sonnet-5-5"));
