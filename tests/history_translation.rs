@@ -328,3 +328,52 @@ fn complete_emitted_search_histories_preserve_public_records_and_interleaved_too
         }
     }
 }
+
+#[test]
+fn anthropic_advisor_is_never_offered_and_its_history_stays_public() {
+    let req: MessagesRequest = serde_json::from_value(json!({
+        "model":"kimi-k3.1-pro", "max_tokens":1024,
+        "tools":[
+            {"name":"lookup","input_schema":{"type":"object"}},
+            {"type":"advisor_20260301","name":"advisor","model":"claude-opus-5-5","defer_loading":true}
+        ],
+        "messages":[
+            {"role":"user","content":"question"},
+            {"role":"assistant","content":[
+                {"type":"server_tool_use","id":"srvtoolu_adv","name":"advisor","input":{}},
+                {"type":"advisor_tool_result","tool_use_id":"srvtoolu_adv",
+                 "content":{"type":"advisor_result","text":"ADVICE_SENTINEL","stop_reason":"end_turn"}},
+                {"type":"server_tool_use","id":"srvtoolu_enc","name":"advisor","input":{}},
+                {"type":"advisor_tool_result","tool_use_id":"srvtoolu_enc",
+                 "content":{"type":"advisor_redacted_result","encrypted_content":"CIPHERTEXT_SENTINEL","stop_reason":"end_turn"}},
+                {"type":"text","text":VISIBLE},
+                {"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"x"}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":RESULT}]}
+        ]
+    }))
+    .unwrap();
+    for destination in DESTINATIONS {
+        let payload =
+            translate(destination, &req).unwrap_or_else(|error| panic!("{destination}: {error}"));
+        let text = payload.to_string();
+        for public in ["ADVICE_SENTINEL", "srvtoolu_adv", "srvtoolu_enc", RESULT] {
+            assert!(
+                text.contains(public),
+                "{destination} lost {public}: {payload}"
+            );
+        }
+        assert!(
+            !text.contains("CIPHERTEXT_SENTINEL"),
+            "{destination}: {payload}"
+        );
+        assert!(
+            !text.contains("advisor_20260301"),
+            "{destination}: {payload}"
+        );
+        assert!(
+            !text.contains("claude-opus-5-5"),
+            "{destination}: {payload}"
+        );
+    }
+}

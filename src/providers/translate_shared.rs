@@ -103,7 +103,7 @@ impl InputSupport {
                     "text" | "tool_use" | "thinking" | "redacted_thinking" => {}
                     "server_tool_use"
                         if role == "assistant" && public_history_text(block).is_some() => {}
-                    "web_search_tool_result" | "x_search_tool_result" => {}
+                    "web_search_tool_result" | "x_search_tool_result" | "advisor_tool_result" => {}
                     "image" if role != "assistant" => {
                         ensure_image(self.images, block, backend, "")?
                     }
@@ -226,20 +226,35 @@ pub fn decode_image_data(data: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Hosted searches have already run: replay their public record, not a function
-/// call that the next backend might execute again. Citations are public too.
+/// Anthropic runs the advisor itself, consulting a second Claude model mid-generation.
+/// No other backend can, and Anthropic accepts the same conversation without the tool
+/// (the model just cannot consult), so translators leave it out rather than refuse.
+pub fn is_anthropic_advisor_tool(tool: &Value) -> bool {
+    block_kind(tool).starts_with("advisor_")
+}
+
+/// Hosted searches and advisor consultations have already run: replay their public
+/// record, not a function call that the next backend might execute again. Citations
+/// are public too. An encrypted advisor reply is opaque, so only its envelope is kept.
 /// Ordinary text remains unchanged.
 pub fn public_history_text(block: &Value) -> Option<String> {
     match block_kind(block) {
         "server_tool_use"
             if matches!(
                 block.get("name").and_then(Value::as_str),
-                Some("web_search" | "x_search")
+                Some("web_search" | "x_search" | "advisor")
             ) =>
         {
             Some(block.to_string())
         }
         "web_search_tool_result" | "x_search_tool_result" => Some(block.to_string()),
+        "advisor_tool_result" => {
+            let mut public = block.clone();
+            if let Some(content) = public.get_mut("content").and_then(Value::as_object_mut) {
+                content.remove("encrypted_content");
+            }
+            Some(public.to_string())
+        }
         "text"
             if block
                 .get("citations")
@@ -602,6 +617,33 @@ mod tests {
         tool_result_images: ImageInput::Unsupported,
         tool_result_documents_as_text: false,
     };
+
+    #[test]
+    fn advisor_history_is_public_text_without_the_encrypted_reply() {
+        let call = json!({"type": "server_tool_use", "id": "adv", "name": "advisor", "input": {}});
+        let plain = json!({"type": "advisor_tool_result", "tool_use_id": "adv",
+            "content": {"type": "advisor_result", "text": "ADVICE", "stop_reason": "end_turn"}});
+        let redacted = json!({"type": "advisor_tool_result", "tool_use_id": "adv",
+            "content": {"type": "advisor_redacted_result", "encrypted_content": "CIPHERTEXT",
+                "stop_reason": "end_turn"}});
+        assert_eq!(public_history_text(&call), Some(call.to_string()));
+        assert!(public_history_text(&plain).unwrap().contains("ADVICE"));
+        let redacted = public_history_text(&redacted).unwrap();
+        assert!(redacted.contains("advisor_redacted_result"), "{redacted}");
+        assert!(!redacted.contains("CIPHERTEXT"), "{redacted}");
+        TEXT_ONLY
+            .ensure(&request(json!([
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [call, plain]}
+            ])))
+            .unwrap();
+        assert!(is_anthropic_advisor_tool(
+            &json!({"type": "advisor_20260301", "name": "advisor", "model": "m"})
+        ));
+        assert!(!is_anthropic_advisor_tool(
+            &json!({"name": "advisor", "input_schema": {}})
+        ));
+    }
 
     #[test]
     fn history_metadata_and_tool_flow_pass() {

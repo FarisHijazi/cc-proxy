@@ -57,6 +57,10 @@ changes made on top of it.
   records and text citations as deterministic text through `public_history_text`.
   They must not become client-executed function calls. Anthropic-native web search
   stays untouched; foreign X-search blocks are downgraded to public text there too.
+  Anthropic's hosted `advisor_*` tool (Claude Code attaches it to Opus) consults a second
+  Claude model server-side; `is_anthropic_advisor_tool` leaves it out of every non-Anthropic
+  tool list (Anthropic accepts a conversation without it), and its call/result history is
+  public text, minus an opaque `encrypted_content` reply.
 - Unsupported documents, audio, video, unknown content, and unsupported images
   must fail explicitly at translation, before calling upstream. Codex tool-result
   documents use `translate_shared::document_to_text` only when lossless text is

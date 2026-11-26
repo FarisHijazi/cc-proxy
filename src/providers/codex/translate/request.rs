@@ -8,7 +8,8 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, ImageInput, InputSupport, document_to_text, flatten_system_text,
-    image_source_to_url, normalize_content, parallel_tool_calls, read_effort, tool_reference_text,
+    image_source_to_url, is_anthropic_advisor_tool, normalize_content, parallel_tool_calls,
+    read_effort, tool_reference_text,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -634,6 +635,9 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     };
     let mut out = Vec::new();
     for tool in tools_arr {
+        if is_anthropic_advisor_tool(tool) {
+            continue;
+        }
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
@@ -1399,6 +1403,32 @@ mod tests {
 
         assert_eq!(wire["tool_choice"], json!("required"));
         assert_eq!(wire["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn anthropic_advisor_tool_is_not_a_codex_function() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [
+                {"name":"Bash","input_schema":{"type":"object"}},
+                {"type":"advisor_20260301","name":"advisor","model":"claude-opus-5-5"}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.5".to_string(),
+                use_responses_lite: false,
+            },
+        )
+        .unwrap();
+        let tools = serde_json::to_value(out.tools.unwrap()).unwrap();
+        assert_eq!(tools.as_array().unwrap().len(), 1, "{tools}");
+        assert_eq!(tools[0]["name"], "Bash");
     }
 
     #[test]

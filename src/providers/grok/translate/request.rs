@@ -6,7 +6,8 @@ use serde_json::Value;
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config::GrokToolImageMode;
 use crate::providers::translate_shared::{
-    ImageSource, image_source_to_url, parallel_tool_calls, public_history_text,
+    ImageSource, image_source_to_url, is_anthropic_advisor_tool, parallel_tool_calls,
+    public_history_text,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,6 +416,9 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
     let mut names = HashSet::new();
     let mut out = Vec::new();
     for tool in tools {
+        if is_anthropic_advisor_tool(tool) {
+            continue;
+        }
         let obj = tool
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;

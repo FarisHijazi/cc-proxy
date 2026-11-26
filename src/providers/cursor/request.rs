@@ -1,6 +1,6 @@
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
-    ImageInput, InputSupport, public_history_text, tool_reference_text,
+    ImageInput, InputSupport, is_anthropic_advisor_tool, public_history_text, tool_reference_text,
 };
 
 /// Cursor receives base64 images as selected images; it cannot fetch a URL.
@@ -50,6 +50,7 @@ pub fn render_cursor_prompt(req: &MessagesRequest) -> anyhow::Result<String> {
     {
         let tool_lines: Vec<String> = tools
             .iter()
+            .filter(|t| !is_anthropic_advisor_tool(t))
             .map(|t| {
                 let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
