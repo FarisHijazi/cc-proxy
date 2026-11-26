@@ -2,7 +2,7 @@ import type { TurnStepChunk } from 'claude-code'
 export const WINDOW_MS = 10_000
 type Step = { start: number; first?: number; end?: number; estimated: number }
 export function speed() {
-  return { steps: [] as Step[], tokens: [] as { at: number; n: number }[], active: undefined as Step | undefined }
+  return { steps: [] as Step[], tokens: [] as { at: number; n: number; step: Step }[], active: undefined as Step | undefined }
 }
 export type Speed = ReturnType<typeof speed>
 export function stepStarted(s: Speed, now: number) {
@@ -14,15 +14,18 @@ export function streamed(s: Speed, chunk: TurnStepChunk, now: number) {
   if (!step || chunk.kind === 'engine') return
   if (chunk.kind === 'stop') {
     const exact = chunk.usage?.output_tokens
-    // Visible text is estimated live at four characters a token; the API's count replaces it.
-    if (typeof exact === 'number' && step.first !== undefined) s.tokens.push({ at: now, n: exact - step.estimated })
+    // Visible text is estimated live at four characters a token; the API's count rescales it.
+    if (typeof exact === 'number' && step.estimated > 0) {
+      const scale = exact / step.estimated
+      for (const t of s.tokens) if (t.step === step) t.n *= scale
+    }
     stepEnded(s, now)
     return
   }
   step.first ??= now
   const n = (chunk.kind === 'input' ? chunk.json : chunk.kind === 'tool' ? '' : chunk.text).length / 4
   step.estimated += n
-  s.tokens.push({ at: now, n })
+  s.tokens.push({ at: now, n, step })
 }
 export function stepEnded(s: Speed, now: number) {
   if (s.active) s.active.end ??= now

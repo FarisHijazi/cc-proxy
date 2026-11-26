@@ -32,3 +32,10 @@ test('a cancelled step stops counting generation time', () => {
   stepEnded(s, 2000)
   expect(summary(s, 8000)).toBe('last 10s: 40 tok/s · TTFT 1.0s')
 })
+
+test('the exact token count rescales the live estimate instead of piling onto the end', () => {
+  const s = speed()
+  stepStarted(s, 0); streamed(s, text(50), 1000); streamed(s, text(50), 9000); streamed(s, stop(200), 9000)
+  expect(summary(s, 9000)).toBe('last 10s: 25 tok/s · TTFT 1.0s')
+  expect(summary(s, 15000)).toBe('last 10s: 25 tok/s')
+})
