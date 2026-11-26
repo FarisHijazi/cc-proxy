@@ -222,6 +222,7 @@ test('turn result updates the band without changing or eagerly draining its stre
   on('session.model', () => ({ value: model }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('clock.every', () => ({ value: undefined }))
   let advances = 0
   const result = completedReply('glm-5.4')
   on('turn.step', async function* () {
@@ -237,6 +238,6 @@ test('turn result updates the band without changing or eagerly draining its stre
   expect(await stream.next()).toEqual({ done: true, value: result })
   expect(advances).toBe(2)
   const ui = await $.ui.mount({ plugin: 'cc-proxy-session', component: 'AbovePrompt', surface: 'terminal', requestId: 'metadata', props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 4, bodyColumns: 80, scroll: { offset: 0, bodyRows: 4 }, view: {} } })
-  expect((await ui.find({ type: 'Text' }))?.text).toBe(`Serving ⚠️ glm-5.4 · account unknown · requested ${model}`)
+  expect((await ui.find({ type: 'Text' }))?.text).toMatch(new RegExp(`^Serving ⚠️ glm-5\\.4 · account unknown · requested ${model} · last 10s: TTFT \\d+\\.\\ds$`))
   await ui.unmount()
 })

@@ -1,5 +1,5 @@
 import type { Hook, Register, Timer } from 'claude-code'
-import { registerMetadata, startMetadata, endMetadata, beginMetadata, completeMetadata, finishMetadata } from './metadata'
+import { registerMetadata, startMetadata, endMetadata, beginMetadata, completeMetadata, finishMetadata, streamMetadata } from './metadata'
 
 type API = Parameters<Hook<'session.start'>>[0]
 type Event = { kind: string; data: unknown }
@@ -247,6 +247,7 @@ export const register: Register = on => {
           completeMetadata($, e, part.value)
           return part.value
         }
+        streamMetadata(e, part.value)
         if (p && part.value.kind !== 'engine') {
           enqueue(p, 'turn.step', { turnId: e.turnId, index: e.index, agentId: e.agentId, chunk: part.value })
         }
