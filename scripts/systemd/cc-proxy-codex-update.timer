@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for upstream Codex CLI updates every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=cc-proxy-codex-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+codex="${CC_PROXY_CODEX_BIN:-$HOME/.local/bin/codex}"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/cc-proxy/codex-update"
+mkdir -p "$state"
+exec 9>"$state/lock"
+if ! flock -n 9; then
+    printf '%s\n' 'Codex update skipped: another updater is running.'
+    exit 0
+fi
+
+if [[ ! -x "$codex" ]]; then
+    printf 'Codex update failed: executable not found at %s\n' "$codex" >&2
+    exit 1
+fi
+resolved=$(readlink -f "$codex")
+case "$resolved" in
+    "${CODEX_HOME:-$HOME/.codex}/packages/standalone/releases/"*/bin/codex) ;;
+    *)
+        printf 'Codex update refused: %s is not a standalone Codex installation.\n' "$resolved" >&2
+        exit 1
+        ;;
+esac
+
+before=$("$codex" --version)
+printf 'Checking upstream Codex updates: %s\n' "$before"
+"$codex" update </dev/null
+after=$("$codex" --version)
+if [[ "$before" == "$after" ]]; then
+    printf 'Codex is current: %s\n' "$after"
+else
+    printf 'Codex updated: %s -> %s; running sessions were not restarted.\n' "$before" "$after"
+fi

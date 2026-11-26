@@ -940,7 +940,7 @@ def via(args, accounts, main_account, state, forwarded, extra_settings=None):
                     alias, found[alias], config, secure,
                     args.remote_control_account if main else None,
                     main and args.private_remote_control,
-                    chrome=getattr(args, "chrome_account", None) or main_account if main else None,
+                    chrome=(getattr(args, "chrome_account", None) or "*") if main else None,
                     pin=main and getattr(args, "pin_main", False),
                 )
             except (OSError, ValueError, KeyError) as error:

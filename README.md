@@ -744,9 +744,12 @@ pass `--accounts-file /path/to/accounts.json` containing:
 `--main-account personal` overrides that default for a new session. Each main
 account gets separate session state. Remote Control belongs to that account;
 selecting another browser does not change it. Browsers use only the built-in
-Chrome tools. Both direct and `--via` sessions use main's native browser roster by
-default, without merging other accounts. To explicitly choose a different
-account for the native picker, add `--chrome-account personal` before `--`:
+Chrome tools. `--via` sessions merge every configured account's reachable browsers into the
+native picker by default. A real `/login` on the shared proxy keeps that merged picker after
+the upstream bridge accepts the login for a configured account; the login itself is unchanged.
+An unavailable account cannot fail discovery when other browsers are reachable. Direct local
+snapshots still use main's roster. To explicitly choose just one account for the native picker,
+add `--chrome-account personal` before `--`:
 
 ```sh
 python scripts/claude-account-router --start-router \

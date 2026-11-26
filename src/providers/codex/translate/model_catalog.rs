@@ -20,7 +20,8 @@ use crate::providers::codex::auth::{
 const TTL: Duration = Duration::from_secs(300);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const BODY_LIMIT: u64 = 4 * 1024 * 1024;
-const CLIENT_VERSION: &str = "0.165.0";
+const FALLBACK_CLIENT_VERSION: &str = "0.165.0";
+const VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(super) struct ModelCatalog {
@@ -215,7 +216,9 @@ fn refresh_catalog() -> ModelCatalog {
             let base = crate::config::codex_base_url(CODEX_API_ENDPOINT);
             let base = base.trim_end_matches('/');
             let root = base.strip_suffix("/responses").unwrap_or(base);
-            discover_models(&format!("{root}/models"), &auth)
+            let version = installed_client_version(Path::new("codex"), VERSION_TIMEOUT)
+                .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_string());
+            discover_models(&format!("{root}/models"), &auth, &version)
         },
     );
     if snapshot
@@ -292,9 +295,54 @@ fn cached_catalog(
     catalog
 }
 
+fn installed_client_version(binary: &Path, timeout: Duration) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let result = stdout.take(256).read_to_string(&mut text).map(|_| text);
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let text = receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?
+        .ok()?;
+    let version = text.trim().strip_prefix("codex-cli ")?;
+    let parts: Vec<_> = version.split('.').collect();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
+    .then(|| version.to_string())
+}
+
 fn discover_models(
     url: &str,
     auth: &crate::providers::codex::auth::token_store::StoredAuth,
+    client_version: &str,
 ) -> Option<Vec<String>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(DISCOVERY_TIMEOUT)
@@ -303,12 +351,12 @@ fn discover_models(
         .ok()?;
     let mut request = client
         .get(url)
-        .query(&[("client_version", CLIENT_VERSION)])
+        .query(&[("client_version", client_version)])
         .bearer_auth(&auth.access)
         .header("originator", "codex_cli_rs")
         .header(
             reqwest::header::USER_AGENT,
-            format!("codex_cli_rs/{CLIENT_VERSION}"),
+            format!("codex_cli_rs/{client_version}"),
         );
     if let Some(account_id) = &auth.account_id {
         request = request.header("ChatGPT-Account-Id", account_id);
@@ -368,18 +416,75 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn toy_cli(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installed_version_tracks_cli_symlink_updates_and_rejects_failures() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let current = dir.path().join("codex");
+        toy_cli(&first, "echo codex-cli 0.165.0");
+        toy_cli(&second, "echo codex-cli 0.172.0");
+        symlink(&first, &current).unwrap();
+        assert_eq!(
+            installed_client_version(&current, VERSION_TIMEOUT).as_deref(),
+            Some("0.165.0")
+        );
+        std::fs::remove_file(&current).unwrap();
+        symlink(&second, &current).unwrap();
+        assert_eq!(
+            installed_client_version(&current, VERSION_TIMEOUT).as_deref(),
+            Some("0.172.0")
+        );
+        for body in [
+            "echo unrelated 0.172.0",
+            "echo codex-cli invalid",
+            "echo codex-cli 0.172.0; exit 1",
+        ] {
+            toy_cli(&second, body);
+            assert_eq!(installed_client_version(&current, VERSION_TIMEOUT), None);
+        }
+        assert_eq!(
+            installed_client_version(&dir.path().join("missing"), VERSION_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installed_version_kills_and_reaps_a_hung_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("codex");
+        toy_cli(&cli, "exec sleep 30");
+        let started = Instant::now();
+        assert_eq!(
+            installed_client_version(&cli, Duration::from_millis(60)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn discovery_uses_authenticated_get_and_native_schema_without_refreshing() {
         let (url, task) = mock_models(
             "200 OK",
-            r#"{"models":[{"slug":"gpt-6.1-astra","visibility":"list","supported_in_api":true,"context_window":272000}]}"#,
+            r#"{"models":[{"slug":"gpt-6.2-astra","visibility":"list","supported_in_api":true},{"slug":"gpt-6.2-sol","visibility":"list","supported_in_api":true}]}"#,
         );
         assert_eq!(
-            discover_models(&url, &toy_auth()).unwrap(),
-            ["gpt-6.1-astra"]
+            discover_models(&url, &toy_auth(), "0.172.0").unwrap(),
+            ["gpt-6.2-astra", "gpt-6.2-sol"]
         );
         let request = task.join().unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("get /models?client_version=0.165.0 http/1.1"));
+        assert!(request.starts_with("get /models?client_version=0.172.0 http/1.1"));
+        assert!(request.contains("user-agent: codex_cli_rs/0.172.0\r\n"));
         assert!(request.contains("authorization: bearer toy-access\r\n"));
         assert!(request.contains("chatgpt-account-id: toy-account\r\n"));
         assert!(request.contains("originator: codex_cli_rs\r\n"));
@@ -390,9 +495,55 @@ mod tests {
     fn discovery_does_not_retry_auth_errors_or_follow_redirects() {
         for status in ["401 Unauthorized", "302 Found", "500 Internal Server Error"] {
             let (url, task) = mock_models(status, "{}");
-            assert!(discover_models(&url, &toy_auth()).is_none());
+            assert!(discover_models(&url, &toy_auth(), "0.172.0").is_none());
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn catalog_ttl_bounds_cli_detection_and_picks_up_an_update() {
+        let _env = ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("codex");
+        let auth = dir.path().join("auth.json");
+        let path = dir.path().join("models_cache.json");
+        let now = Instant::now();
+        let mut cache = None;
+        toy_cli(&cli, "echo codex-cli 0.165.0");
+        let first = cached_catalog(&mut cache, auth.clone(), &path, now, || {
+            assert_eq!(
+                installed_client_version(&cli, VERSION_TIMEOUT).as_deref(),
+                Some("0.165.0")
+            );
+            Some(vec!["gpt-6-astra".into()])
+        });
+        assert_eq!(first.resolve("astra").model, "gpt-6-astra");
+        toy_cli(&cli, "echo codex-cli 0.172.0");
+        let cached = cached_catalog(&mut cache, auth.clone(), &path, now + TTL / 2, || {
+            panic!("cached catalog must not launch a version subprocess")
+        });
+        assert_eq!(cached.resolve("astra").model, "gpt-6-astra");
+        let updated = cached_catalog(&mut cache, auth, &path, now + TTL, || {
+            let version = installed_client_version(&cli, VERSION_TIMEOUT).unwrap();
+            let (url, task) = mock_models(
+                "200 OK",
+                r#"{"models":[{"slug":"gpt-6.2-astra","visibility":"list","supported_in_api":true}]}"#,
+            );
+            let models = discover_models(&url, &toy_auth(), &version);
+            assert!(
+                task.join()
+                    .unwrap()
+                    .starts_with("GET /models?client_version=0.172.0 ")
+            );
+            models
+        });
+        assert_eq!(updated.resolve("astra").model, "gpt-6.2-astra");
+        assert!(
+            updated
+                .selectable_models()
+                .contains(&"gpt-6.2-astra".to_string())
+        );
     }
 
     #[test]

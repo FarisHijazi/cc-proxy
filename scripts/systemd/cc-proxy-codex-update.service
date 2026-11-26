@@ -1,0 +1,11 @@
+[Unit]
+Description=Update upstream Codex CLI for cc-proxy
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/cc-proxy/codex-update
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=15min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cc-proxy-codex-update

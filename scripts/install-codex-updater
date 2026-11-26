@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+install -d "$HOME/.local/libexec/cc-proxy" "$unit_dir"
+install -m 0755 "$source_dir/codex-update" "$HOME/.local/libexec/cc-proxy/codex-update"
+install -m 0644 "$source_dir/systemd/cc-proxy-codex-update.service" "$unit_dir/cc-proxy-codex-update.service"
+install -m 0644 "$source_dir/systemd/cc-proxy-codex-update.timer" "$unit_dir/cc-proxy-codex-update.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now cc-proxy-codex-update.timer
+printf '%s\n' 'Hourly Codex updates enabled. Run systemctl --user start cc-proxy-codex-update.service for an immediate check.'

@@ -262,8 +262,11 @@ repository; their setup and smoke checks are recorded in that devlog.
 
 Browsers use only the built-in `claude-in-chrome` tools; there is no custom Chrome MCP (the `account-chrome`
 adapter was removed on 2026-11-02, see `docs/devlog/claude_20261102-native-chrome-only.md`). Direct and `--via`
-clients use main's native browser roster by default (`+chrome=<main>`, never default `+chromes`).
-Legacy explicit `+chromes` clients still use `account_chrome_bridge.py`; new sessions do not merge accounts.
+clients differ: direct snapshots use main's native roster, while `--via` clients default to all
+configured accounts (`+chromes`) through `account_chrome_bridge.py`. Own-login Chrome connections on the
+shared proxy pool only after upstream accepts the login for a configured account's UUID; inference,
+Remote Control and artifact ownership are unchanged. Partial discovery failures stay in flow metadata
+and cannot abort a roster containing healthy browsers.
 `--chrome-account` explicitly routes the native Chrome bridge to a selected login independently of main. The protocol
 boundary and live evidence are in `docs/devlog/claude_20261018-native-chrome-account.md`
 (plain path, read on demand).
@@ -371,7 +374,7 @@ See `docs/devlog/claude_20261019-launcher-shares-user-config.md` (plain path).
 
 `--serve` runs the proxy for other machines with logins injected from that box's cswap
 (`scripts/account_inject.py`); `--via` clients hold placeholder logins only, built from the
-proxy's profile endpoint. Chrome and artifacts stay on main, while inference pooling happens on the server.
+proxy's profile endpoint. Chrome pools configured accounts; artifacts stay on main, while inference pooling happens on the server.
 No proxy auth: bind `--serve` to a tailnet IP.
 Live on ftower; see `docs/devlog/claude_20261019-shared-account-proxy-serve-via.md` and
 `docs/devlog/claude_20261019-tailnet-only-proxy-and-chrome-for-both.md` (plain paths).
