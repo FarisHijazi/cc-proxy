@@ -388,7 +388,9 @@ metadata, no credentials; read with `scripts/claude-traffic`; `"traffic_days"` p
 `docs/devlog/claude_20261027-traffic-database.md` (plain path).
 ⚠️ **Nothing in a mitmproxy hook may touch the disk, a subprocess or the network**: every hook of every addon
 runs on ONE event loop shared by every connection of every account. `account_traffic.py` hooks only copy
-plain data into a bounded queue; its writer thread owns SQLite and drops rows when behind. Writing inline
+plain data into a bounded queue; its writer thread owns SQLite and drops rows when behind. Retention advances
+one 256-row rowid batch per flow or idle tick, with fixed sweep cutoff/upper bounds and autocommit
+between batches; never scan whole retention tables before recording the first flow. Writing inline
 stalled Remote Control for every machine once the DB reached 18 GB
 (`docs/devlog/claude_20261112-traffic-writer-off-event-loop.md`, plain path).
 Each model-call row also stores `input_tokens` (cache writes included)/`cache_read_tokens`/`output_tokens`/`cache_write_tokens`/`cache_write_1h_tokens` from the reply (parser:
