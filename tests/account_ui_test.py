@@ -94,6 +94,11 @@ def test_settings_are_saved_with_a_backup_and_other_keys_kept(tmp_path):
     {"fallback": {"chains": {"Claude models": ["accounts"]}}},
     {"fallback": {"chains": {"*": ["accounts", "kimi; rm"]}}},
     {"fallback": {"chains": {"*": ["accounts"] * 65}}},
+    {"failover_at": {"a": 0}},
+    {"failover_at": {"a": 101}},
+    {"failover_at": {"a": True}},
+    {"failover_at": {"a": "20"}},
+    {"failover_at": {"nobody": 20}},
 ])
 def test_invalid_settings_are_refused_and_nothing_is_written(tmp_path, change):
     board, accounts = dashboard(tmp_path)
@@ -119,6 +124,23 @@ def test_failover_settings_are_saved_and_cleared(tmp_path):
     assert "fallback" not in board.update({"fallback": None})
     assert list(json.loads(accounts.read_text())["accounts"]) == ["a", "b"]
 
+
+def test_failover_at_is_saved_per_account_cleared_and_never_applies_to_keys(tmp_path):
+    board, accounts = dashboard(tmp_path)
+    saved = board.update({"failover_at": {"a": 95, "b": 20}})
+    assert saved["failover_at"] == {"a": 95, "b": 20}
+    assert board.update({"failover_at": {"b": None}})["failover_at"] == {"a": 95}, "a patch touches only named accounts"
+    assert board.update({"failover_at": {"a": 100}})["failover_at"] == {"a": 100}
+    assert "failover_at" not in board.update({"failover_at": {"a": None}}), "no ceilings leaves the key out"
+    cfg = json.loads(accounts.read_text())
+    cfg["api_key_accounts"] = {"console": {"key": "fake"}}
+    accounts.write_text(json.dumps(cfg))
+    with pytest.raises(ValueError):
+        board.update({"failover_at": {"console": 50}})
+    before = accounts.read_text()
+    with pytest.raises(TypeError):
+        board.update({"failover_at": ["a"]})
+    assert accounts.read_text() == before
 
 def test_the_global_chain_names_any_provider_and_keeps_per_family_overrides(tmp_path):
     board, _ = dashboard(tmp_path)
@@ -379,3 +401,8 @@ def test_insights_handler_rejects_invalid_range_without_reading_database(hours):
     request.reply = lambda status, body: replies.append((status, body))
     request.do_GET()
     assert replies[0][0] == 400
+
+
+def test_reply_usage_rounds_like_the_proxy():
+    usage = ui["reply_usage"]([("anthropic-ratelimit-unified-5h-utilization", "0.29")])
+    assert usage["five_hour"]["utilization"] == 29, "0.29 * 100 is 28.999999999999996 unrounded"

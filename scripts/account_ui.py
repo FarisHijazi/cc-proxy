@@ -123,6 +123,23 @@ def checked_fallback(fallback, current=None):
     return result
 
 
+def checked_failover_at(current, change, aliases):
+    """Apply {subscription alias: utilization % from 1 to 100, or None to clear} to "failover_at"."""
+    if not isinstance(change, dict):
+        raise TypeError("failover_at maps account aliases to a percentage or null")
+    result = {a: p for a, p in current.items() if a in aliases}
+    for alias, pct in change.items():
+        if alias not in aliases:
+            raise ValueError(f"failover_at names {alias!r}, which is not a Claude subscription account")
+        if pct is None:
+            result.pop(alias, None)
+        elif not isinstance(pct, bool) and isinstance(pct, (int, float)) and 1 <= pct <= 100:
+            result[alias] = pct
+        else:
+            raise ValueError("failover_at must be a utilization percentage from 1 to 100, or null")
+    return result
+
+
 def checked_session_models(current, change):
     """Apply {session id: model id, or None to clear} to the "session_models" mapping."""
     if not isinstance(change, dict):
@@ -181,7 +198,7 @@ def reply_usage(headers):
         if used is not None:
             reset = h.get(f"anthropic-ratelimit-unified-{key}-reset")
             windows[name] = {
-                "utilization": float(used) * 100,
+                "utilization": round(float(used) * 100, 6),  # as account_inject.py rounds it
                 "resets_at": datetime.fromtimestamp(int(reset), timezone.utc).isoformat() if reset else None,
             }
     return windows
@@ -425,6 +442,7 @@ class Dashboard:
             "traffic_days": cfg.get("traffic_days"),
             "renamed": cfg.get("renamed", {}),
             "fallback": cfg.get("fallback", {}),
+            "failover_at": cfg.get("failover_at", {}),
             "session_models": cfg.get("session_models", {}),
             "api_base": self.api_base,
             "api_keys": [{k: v for k, v in key.items() if k != "sha256"} for key in cfg.get("api_keys", [])],
@@ -651,6 +669,12 @@ class Dashboard:
             if days is not None and (not isinstance(days, int) or days < 1):
                 raise ValueError("traffic_days must be a positive whole number or empty")
             cfg["traffic_days"] = days
+        if "failover_at" in change:
+            failover_at = checked_failover_at(cfg.get("failover_at", {}), change["failover_at"], aliases)
+            if failover_at:
+                cfg["failover_at"] = failover_at
+            else:
+                cfg.pop("failover_at", None)
         if "session_models" in change:
             session_models = checked_session_models(cfg.get("session_models", {}), change["session_models"])
             if session_models:

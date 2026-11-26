@@ -91,7 +91,7 @@ try {
     assert.deepEqual(posts[1].order, ["c@example.com", "b@example.com", "a@example.com"], `${label}: arrow POST`);
 
     // Toggle still usable (not swallowed by drag wiring).
-    await page.locator("#accounts .card").nth(0).locator(".switch span").click();
+    await page.locator("#accounts .card").nth(0).locator(".card-foot .switch span").click();
     assert.ok(posts[2].disabled.includes("c@example.com"), `${label}: toggle POST`);
     await page.locator('#accounts [data-prefer="a@example.com"]').click();
     assert.deepEqual(posts[3].balance, { strategy: "prefer", prefer: "a@example.com" }, `${label}: make preferred`);

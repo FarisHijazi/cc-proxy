@@ -312,7 +312,17 @@ has none. Built-in tier providers retain this meaning; other names that are also
 accounts; `accounts` = the rest; `on` = `rate_limit`/`auth`/`server_error`; `threshold` %).
 `account_inject` attaches it as `x-claude-codex-fallback` beside the pool (stripped the same way) and alone
 applies `threshold`, putting accounts whose last reply reported 5h/7d utilization at or over it last in
-the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`. Never relay the pool header upstream, never retry after
+the pool (primary marker unchanged). See `docs/devlog/claude_20261027-failover-config-ui.md`.
+Per subscription account, `failover_at` (`{alias: 1-100}`, the dashboard's "Fail over at" slider; absent = no ceiling)
+is a routing ceiling on the provider-reported 5h/7d utilization. `AccountInject.standing()` drops an account this
+proxy process has seen at or over it from that process's pools and from `_start` (pinned, preferred and sticky
+sessions included) until that window's reset passes; a starting account over it hands `primary` to the first account
+left. Readings are per proxy process (lost on restart, not shared between affinity workers) and merge per window;
+a reply without a reset header is assumed to last the full window. Reply headers carry only 5h/7d (measured);
+model-specific weekly windows are dashboard-only. "Unknown" (no reading, or a below-ceiling reading older than
+`USAGE_FRESH_S` with no reset since) demotes only accounts other than the session's own, never reads as 0%.
+It is not an exact budget: the crossing reply and in-flight requests overshoot. Console API keys keep their dollar budget only.
+Never relay the pool header upstream, never retry after
 output, and never send a thread delta to another account (refuse so Claude Code
 resends history). Attempts with a fallback after them run inside
 `retry::fail_fast`, including its explicit capture into the spawned HTTP SSE reader,
@@ -420,7 +430,7 @@ The Nix-pinned compiler still needs atomic `fetch_update`; keep its deprecation 
 Clients: `scripts/claude-accounts` reads `via` (tried in order by `reach()`, wstunnel `tunnel` entries) and `via_ca`
 from the accounts file; profiles are cached a day in `<state>/profiles.json`. Run Python tests with `uv run --no-project`.
 Dashboard: `scripts/account_ui.py` + `account_ui.html` (stdlib server, no build). It writes only `order`, `balance`,
-`disabled`, `traffic_days`, `fallback`, `session_models`, `api_keys`, and existing `api_key_accounts` members' `preferred` boolean in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. The Accounts view's Console API key priority selector changes ordering only; it never edits keys/budgets or implies upstream credit is available. `disabled` accounts are
+`disabled`, `traffic_days`, `fallback`, `failover_at`, `session_models`, `api_keys`, and existing `api_key_accounts` members' `preferred` boolean in the accounts file (privately: it may hold a Console key); usage comes through the proxy with placeholders. The Accounts view's Console API key priority selector changes ordering only; it never edits keys/budgets or implies upstream credit is available. `disabled` accounts are
 skipped by `AccountInject.pool()`/`start()`. See `docs/devlog/claude_20261027-dashboard.md` (plain path).
 The browser uses `/api/state?progressive=1`: config and controls arrive first; account usage, key spend,
 model catalog and vendor quota settle independently through the existing dashboard cache with one

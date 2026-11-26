@@ -74,7 +74,7 @@ try {
     }));
     assert(boxes.every(b => Math.abs(b.x - boxes[0].x) < 1 && Math.abs(b.width - boxes[0].width) < 1), "cards are one vertical column");
     assert(boxes.slice(1).every((b, i) => b.y >= boxes[i].bottom), "cards stack without overlap");
-    assert.equal(await page.locator("#accounts .card .switch").count(), 8, "every account and provider has an on/off switch");
+    assert.equal(await page.locator("#accounts .card .switch:not(.ceiling .switch)").count(), 8, "every account and provider has an on/off switch");
 
     const codex = await card(page, "codex").innerText();
     assert.match(codex, /signed in · 1 model/);
