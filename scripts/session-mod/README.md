@@ -77,19 +77,19 @@ can establish identity. Agent/parent-agent header presence excludes subagents;
 simultaneous same-model agents make attribution ambiguous. Title, count and
 tool-less requests do not establish identity. Public HTTP hooks expose no turn ID,
 and `turn.step.messageCount` is not the serialized wire message count: when
-correlation is absent or ambiguous the band honestly shows `Serving unknown`.
-A successful main response without the header (e.g. after `/login`, the proxy passes the
-session's own credential straight to Anthropic) shows `own login (not routed by cc-proxy)`;
-a present but unparseable header stays unknown.
-When the served model equals the requested one the band names it once (`Serving <model> · <provider/account>`);
-a different model is prefixed with ⚠️ and names the requested model.
-Pending requests, model changes and errors clear current attribution while retaining
-an explicitly labeled previous response. Reload/resume starts unknown. Metadata
-works independently of the HQ event connection and adds no poller or listener.
+correlation is absent or ambiguous the band is hidden rather than guessed.
+A missing or unparseable header, a pending request, an error, a model change, and a
+reload/resume all hide the band until the next attributed answer.
+The band names the served model once (`Serving <model> · <provider/account>`) when it
+is the requested one; aliases (`sol`, `opus`), `[1m]` hints, Codex `-fast` tiers, dated
+Claude ids, `kimi-` and route prefixes (`gemini:`, `cursor-cli-ask:`) count as the same
+model. Anything else is prefixed with ⚠️ and names the requested model, and only such a
+real model/account change toasts. Metadata works independently of the HQ event
+connection and adds no poller or listener.
 
 The native inference hook and band were verified interactively on Claude Code
-2.1.331/2.1.332. Builds that do not expose inference HTTP hooks remain unknown;
-the requested model is shown as served only for that header-less own-login case.
+2.1.331/2.1.332. Builds that do not expose inference HTTP hooks show no band;
+the requested model is never shown as served.
 The normal launcher opt-in above installs the band only for new interactive
 sessions. Development `--plugin-dir` reloads are tested only in throwaway sessions.
 

@@ -73,8 +73,8 @@ contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain link
 The same Mod owns the Actual Serving AbovePrompt band; saved `model_metadata: true`
 loads only its UI when event publishing is disabled. It uses authoritative response
 `x-claude-codex-served-by` only, never inferred from requested model or model text.
-Native HTTP hooks lack turn IDs: tool-less/ambiguous calls remain unknown, and
-pending/errors/model switches distinguish the previous confirmed response.
+Native HTTP hooks lack turn IDs: tool-less/ambiguous calls, pending requests, errors
+and model switches hide the band; aliases of the requested model never warn.
 Do not consume the inference stream, change prompts/transcripts, or add another
 metadata listener/registry/poller. Read the Mod README for correlation boundaries.
 

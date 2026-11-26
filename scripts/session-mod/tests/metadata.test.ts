@@ -7,7 +7,7 @@ const url = 'https://api.anthropic.com/v1/messages'
 const request = (overrides = {}): HttpInit => ({ method: 'POST', body: JSON.stringify({ model, messages: [{ role: 'user', content: 'native request' }], tools: [{ name: 'Bash' }], ...overrides }) })
 const response = (served?: string, status = 200): HttpResponse => ({ status, ok: status === 200, headers: served ? { 'x-claude-codex-served-by': served } : {}, text: '', isStreaming: true, sendIndex: 2 })
 
-test('native band renders without event transport and never appears in headless sessions', async ($, on) => {
+test('band is hidden until an actual answer and never appears in headless sessions', async ($, on) => {
   mock.env(on, {})
   on('session.model', () => ({ value: model }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -15,7 +15,7 @@ test('native band renders without event transport and never appears in headless 
   const band = { plugin: 'cc-proxy-session', component: 'AbovePrompt', surface: 'terminal', requestId: 'metadata', props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 4, bodyColumns: 80, scroll: { offset: 0, bodyRows: 4 }, view: {} } } as const
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount(band)
-  expect((await ui.find({ type: 'Text' }))?.text).toBe(`Requested ${model} → Serving unknown`)
+  expect(await ui.find({ type: 'Text' })).toBe(undefined)
   await ui.unmount()
   await $.session.start({ cwd: '/work', surface: null, isInteractive: false })
   const headless = await $.ui.mount(band)
@@ -23,13 +23,14 @@ test('native band renders without event transport and never appears in headless 
   await headless.unmount()
 })
 
-test('unknown before actual header; response/stream not consumed or modified', () => {
+test('hidden while pending; response/stream not consumed or modified', () => {
   const state = tracker(), init = request(), reply = response('codex/gpt-6.1-sol')
-  expect(display(state)).toContain('Serving unknown')
+  expect(display(state)).toBe(undefined)
   begin(state, step)
-  expect(display(state)).toContain('pending')
   expect(isMainRequest(state, url, init)).toBe(true)
-  expect(answered(state, sent(state), reply)).toBe(undefined)
+  const ticket = sent(state)
+  expect(display(state)).toBe(undefined)
+  expect(answered(state, ticket, reply)).toBe(undefined)
   finish(state, step)
   expect(display(state)).toBe('Serving ⚠️ gpt-6.1-sol · codex · requested claude-opus-5-5')
   expect(init).toEqual(request())
@@ -62,37 +63,36 @@ test('title, count, no-tools, malformed and subagent calls cannot establish main
   finish(state, step)
   begin(state, { ...step, agentId: 'child' })
   expect(isMainRequest(state, url, request())).toBe(false)
-  expect(display(state)).toContain('Serving unknown')
+  expect(display(state)).toBe(undefined)
 })
 
-test('missing/malformed metadata is unknown with explicitly historical last confirmation', () => {
+test('missing, malformed and failed answers hide the band instead of guessing', () => {
   const state = tracker()
   begin(state, step)
   answered(state, sent(state), response('codex/gpt-6.1-sol'))
-  answered(state, sent(state), response('garbage'))
-  expect(display(state)).toContain('Serving unknown')
-  expect(display(state)).toContain('previous response')
-  for (const value of ['bad\nheader/forged', 'codex/', '/model', 'account/model/extra', 'x'.repeat(513)]) {
+  answered(state, sent(state), response())
+  expect(display(state)).toBe(undefined)
+  for (const value of ['garbage', 'bad\nheader/forged', 'codex/', '/model', 'account/model/extra', 'x'.repeat(513)]) {
     expect(parseServing(value)).toBe(undefined)
+    answered(state, sent(state), response('codex/gpt-6.1-sol'))
     answered(state, sent(state), response(value))
-    expect(display(state)).toContain('Serving unknown')
+    expect(display(state)).toBe(undefined)
   }
-})
-
-test('retry HTTP/network failures clear current; successful retry wins; late sends ignored', () => {
-  const state = tracker()
-  begin(state, step)
   answered(state, sent(state), response('codex/gpt-6.1-sol'))
   answered(state, sent(state), response(undefined, 429))
-  expect(display(state)).toContain('HTTP 429')
-  expect(display(state)).toContain('Serving unknown')
+  expect(display(state)).toBe(undefined)
+  answered(state, sent(state))
+  expect(display(state)).toBe(undefined)
+})
+
+test('late answers are ignored; the current answer wins', () => {
+  const state = tracker()
+  begin(state, step)
   const old = sent(state), current = sent(state)
   answered(state, old, response('codex/stale'))
-  expect(display(state)).toContain('Serving unknown')
+  expect(display(state)).toBe(undefined)
   answered(state, current, response('kimi/kimi-k3.1-pro'))
-  expect(display(state)).toContain('Serving ⚠️ kimi-k3.1-pro · kimi')
-  answered(state, sent(state))
-  expect(display(state)).toContain('request failed')
+  expect(display(state)).toBe('Serving ⚠️ kimi-k3.1-pro · kimi · requested claude-opus-5-5')
 })
 
 test('simultaneous same-model agent/main is ambiguous even without lineage headers', () => {
@@ -106,43 +106,49 @@ test('simultaneous same-model agent/main is ambiguous even without lineage heade
   expect(isMainRequest(state, url, request())).toBe(false)
 })
 
-test('opaque requested aliases are routed, not falsely declared fallbacks', () => {
+test('aliases, context hints, tiers and route prefixes are the requested model, not a fallback', () => {
+  const cases: [string, string, string][] = [
+    ['sol[1m]', 'codex/gpt-6.1-sol', 'Serving gpt-6.1-sol · codex'],
+    ['gpt-6.1-sol-fast', 'codex/gpt-6.1-sol', 'Serving gpt-6.1-sol · codex'],
+    ['opus', 'user@example.com/claude-opus-5-5', 'Serving claude-opus-5-5 · Anthropic · account '],
+    ['claude-opus-5-5-20260101', 'user@example.com/claude-opus-5-5', 'Serving claude-opus-5-5 · Anthropic · account '],
+    ['kimi-k3.1-pro', 'kimi/k3.1-pro', 'Serving k3.1-pro · kimi'],
+    ['gemini:gemini-3-pro', 'gemini/gemini-3-pro', 'Serving gemini-3-pro · gemini'],
+    ['cursor-cli-ask:gpt-6', 'cursor-cli/gpt-6', 'Serving gpt-6 · cursor-cli'],
+  ]
+  for (const [requested, served, shown] of cases) {
+    const state = tracker()
+    begin(state, { ...step, model: requested })
+    answered(state, sent(state), response(served))
+    expect(display(state)?.startsWith(shown)).toBe(true)
+    expect(display(state)).not.toContain('⚠️')
+  }
   const state = tracker()
-  begin(state, { ...step, model: 'sol[1m]' })
-  answered(state, sent(state), response('codex/gpt-6.1-sol'))
-  expect(display(state)).toBe('Serving gpt-6.1-sol (sol) · codex')
+  begin(state, { ...step, model: 'sol' })
+  answered(state, sent(state), response('codex/gpt-6.1-luna'))
+  expect(display(state)).toBe('Serving ⚠️ gpt-6.1-luna · codex · requested sol')
 })
 
-test('model switch invalidates in-flight answers but preserves labeled last actual answer', () => {
+test('an alias resolving to its model is not a model change', () => {
+  const state = tracker()
+  begin(state, { ...step, model: 'sol' })
+  answered(state, sent(state), response('codex/gpt-6.1-sol'))
+  reset(state, 'gpt-6.1-sol')
+  begin(state, { ...step, model: 'gpt-6.1-sol' })
+  expect(answered(state, sent(state), response('codex/gpt-6.1-sol'))).toBe(undefined)
+})
+
+test('model switch invalidates in-flight answers; reload clears history', () => {
   const state = tracker()
   begin(state, step)
   answered(state, sent(state), response('codex/gpt-6.1-sol'))
   const ticket = sent(state)
-  expect(display(state)).toContain('pending')
-  expect(display(state)).toContain('previous response')
   reset(state, 'glm-5.4')
   answered(state, ticket, response('codex/stale'))
-  expect(display(state)).toContain('Requested glm-5.4 → Serving unknown')
-  expect(display(state)).not.toContain('stale')
-  expect(display(state)).toContain('previous response')
+  expect(display(state)).toBe(undefined)
   reset(state, 'unknown', true)
-  expect(display(state)).not.toContain('previous response')
-})
-
-test('ok response without served-by header is the session own login, not unknown or fallback', () => {
-  const state = tracker()
   begin(state, step)
-  expect(answered(state, sent(state), response())).toBe(undefined)
-  expect(display(state)).toBe(`Serving ${model} · Anthropic · own login (not routed by cc-proxy)`)
-  expect(answered(state, sent(state), response('garbage'))).toBe(undefined)
-  expect(display(state)).toContain('Serving unknown')
-  expect(answered(state, sent(state), response())).toBe(undefined)
-  expect(answered(state, sent(state), response('codex/gpt-6.1-sol'))).toBe('Serving changed: ⚠️ gpt-6.1-sol · codex · requested claude-opus-5-5')
-  expect(display(state)).toBe('Serving ⚠️ gpt-6.1-sol · codex · requested claude-opus-5-5')
-  expect(answered(state, sent(state), response())).toBe(`Serving changed: ${model} · Anthropic · own login (not routed by cc-proxy)`)
-  answered(state, sent(state), response(undefined, 500))
-  expect(display(state)).toContain('Serving unknown')
-  expect(display(state)).toContain('HTTP 500')
+  expect(answered(state, sent(state), response('zai/glm-5.4'))).toBe(undefined)
 })
 
 test('same model shows the name once; a different model gets a warning', () => {
@@ -150,8 +156,7 @@ test('same model shows the name once; a different model gets a warning', () => {
   begin(state, step)
   answered(state, sent(state), response('user@example.com/' + model))
   expect(display(state)).toMatch(new RegExp(`^Serving ${model} · Anthropic · account account-[0-9a-f]+$`))
-  expect(display(state)).not.toContain('⚠️')
-  expect(display(state).split(model).length).toBe(2)
+  expect(display(state)?.split(model).length).toBe(2)
   answered(state, sent(state), response('zai/glm-5.4'))
   expect(display(state)).toBe(`Serving ⚠️ glm-5.4 · zai · requested ${model}`)
 })

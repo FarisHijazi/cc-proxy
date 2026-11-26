@@ -28,8 +28,10 @@ export function registerMetadata(on: On) {
   })
   on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
     if (!interactive || e.props.hasSurvey) return next(e)
+    const text = display(state)
+    if (!text) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    return <Box><Text dimColor>{display(state)}</Text></Box>
+    return <Box><Text dimColor>{text}</Text></Box>
   })
 }
 export async function startMetadata($: API, isInteractive: boolean) {
