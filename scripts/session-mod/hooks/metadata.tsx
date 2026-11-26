@@ -1,5 +1,5 @@
-import type { Hook, On, TurnStepInput } from 'claude-code'
-import { tracker, reset, begin, finish, isMainRequest, sent, answered, display } from './identity'
+import type { Hook, On, TurnStepInput, TurnStepResult } from 'claude-code'
+import { tracker, reset, begin, finish, isMainRequest, sent, answered, completed, display } from './identity'
 type API = Parameters<Hook<'session.start'>>[0]
 const state = tracker()
 let interactive = false
@@ -28,8 +28,10 @@ export function registerMetadata(on: On) {
   })
   on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
     if (!interactive || e.props.hasSurvey) return next(e)
+    const text = display(state)
+    if (!text) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    return <Box><Text dimColor>{display(state)}</Text></Box>
+    return <Box><Text dimColor>{text}</Text></Box>
   })
 }
 export async function startMetadata($: API, isInteractive: boolean) {
@@ -42,6 +44,12 @@ export async function startMetadata($: API, isInteractive: boolean) {
 export function endMetadata($: API) { reset(state, 'unknown', true); $.ui.invalidate('ui.render') }
 export function beginMetadata($: API, e: TurnStepInput) {
   if (interactive) { begin(state, e); $.ui.invalidate('ui.render') }
+}
+export function completeMetadata($: API, e: TurnStepInput, result: TurnStepResult) {
+  if (!interactive) return
+  const toast = completed(state, e, result)
+  if (toast) $.ui.toast(toast)
+  $.ui.invalidate('ui.render')
 }
 export function finishMetadata($: API, e: TurnStepInput) {
   if (interactive) { finish(state, e); $.ui.invalidate('ui.render') }
