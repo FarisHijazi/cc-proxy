@@ -985,7 +985,7 @@ def test_private_session_marks_only_the_main_placeholder(tmp_path, monkeypatch, 
     )
     assert launcher["main"]() == 0
     suffix = "+private" if private else ""
-    assert launched == [f"proxy-account-work+rc=personal{suffix}+chrome=work"]
+    assert launched == [f"proxy-account-work+rc=personal{suffix}+chromes"]
     assert sorted(filter(None, seen)) == ["Bearer proxy-account-personal", "Bearer proxy-account-work"]
 
 
@@ -1032,7 +1032,7 @@ def test_via_native_chrome_is_opted_in_without_broadening_mcp_children(tmp_path,
         "--via", "http://127.0.0.1:18790", "--via-ca", str(tmp_path / "ca.pem"), *selection,
     ])
     assert launcher["main"]() == 0
-    suffix = f"+chrome={selected or 'work'}"
+    suffix = f"+chrome={selected}" if selected else "+chromes"
     assert captured["main"] == "proxy-account-work+rc=personal" + suffix
     assert captured["children"] == {"work": "proxy-account-work+chrome=work"}
     assert captured["servers"] == {"account-artifacts"}

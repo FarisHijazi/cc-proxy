@@ -176,7 +176,7 @@ def bridge_frame(inject, token, *, url=None, client_type="claude-code"):
     return flow, message
 
 
-def test_native_aggregation_is_opt_in_and_preserves_legacy_clients(monkeypatch):
+def test_placeholder_aggregation_respects_explicit_selection(monkeypatch):
     from types import SimpleNamespace
 
     inject = addon(monkeypatch, [])
@@ -990,3 +990,118 @@ def test_a_budget_without_a_traffic_database_leaves_the_key_out_but_the_proxy_se
     # deploy-main.py's canary drops traffic_db; refusing the file there (or on a restart) took mitmdump down.
     inject = with_key(monkeypatch, tmp_path, {"key": FAKE_KEY, "preferred": True, "monthly_budget_usd": 180})
     assert [e["alias"] for e in pool_of(inject)[1]] == ["a", "b"]
+
+
+def bridge_reply(inject, flow, kind, *, from_client=False, injected=False):
+    message = websocket.WebSocketMessage(
+        1, from_client, json.dumps({"type": kind}).encode(), injected=injected
+    )
+    flow.websocket.messages.append(message)
+    inject.websocket_message(flow)
+    return message
+
+
+@pytest.mark.parametrize("accepted", ["paired", "waiting"])
+def test_own_login_pools_only_after_upstream_accepts_it(monkeypatch, accepted):
+    from types import SimpleNamespace
+
+    calls, starts, forwarded = [], [], []
+    inject = addon(monkeypatch, calls)
+    mux = SimpleNamespace(start=lambda *args: starts.append(args), message=lambda flow: forwarded.append(flow))
+    monkeypatch.setattr(inject, "bridge", lambda: mux)
+    flow, original = bridge_frame(inject, "own-real-token")
+    assert not starts and not calls
+    assert json.loads(original.text)["oauth_token"] == "own-real-token"
+    assert "own-real-token" not in json.dumps(flow.metadata)
+    assert flow.metadata["chrome_pending_alias"] == "personal"
+    bridge_reply(inject, flow, "ping")
+    bridge_reply(inject, flow, accepted, from_client=True)
+    bridge_reply(inject, flow, accepted, injected=True)
+    assert not starts
+    message = bridge_reply(inject, flow, accepted)
+    assert starts == [(flow, "personal")]
+    assert forwarded == [flow]
+    assert flow.metadata["chrome_authenticated"]
+    assert "chrome_pending_alias" not in flow.metadata
+    assert not message.dropped and not calls
+    bridge_reply(inject, flow, accepted)
+    assert len(starts) == 1
+
+
+def test_rejected_own_login_does_not_reach_other_accounts(monkeypatch):
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "bridge", lambda: pytest.fail("unauthenticated pooling"))
+    flow, original = bridge_frame(inject, "rejected-token")
+    bridge_reply(inject, flow, "error")
+    assert "chrome_pending_alias" not in flow.metadata
+    bridge_reply(inject, flow, "paired")
+    assert not flow.metadata.get("chrome_authenticated")
+    assert json.loads(original.text)["oauth_token"] == "rejected-token"
+    assert inject.chrome is None
+
+
+@pytest.mark.parametrize("client,token,path", [
+    ("extension", "own-real-token", "/chrome/11111111-1111-4111-8111-111111111111"),
+    ("claude-code", "", "/chrome/11111111-1111-4111-8111-111111111111"),
+    ("claude-code", None, "/chrome/11111111-1111-4111-8111-111111111111"),
+    ("claude-code", "own-real-token", "/chrome/22222222-2222-4222-8222-222222222222"),
+    ("claude-code", "own-real-token", "/chrome/11111111-1111-4111-8111-111111111111?query=1"),
+])
+def test_unrelated_own_login_connections_never_pool(monkeypatch, client, token, path):
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "bridge", lambda: pytest.fail("unexpected pooling"))
+    flow, original = bridge_frame(
+        inject, token, url="https://bridge.claudeusercontent.com" + path, client_type=client
+    )
+    bridge_reply(inject, flow, "paired")
+    assert "chrome_pending_alias" not in flow.metadata
+    assert not flow.metadata.get("chrome_authenticated")
+    assert not original.dropped and not flow.error
+    assert json.loads(original.text)["oauth_token"] == token
+
+
+def test_own_login_without_connect_frame_cannot_pool(monkeypatch):
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "bridge", lambda: pytest.fail("unexpected pooling"))
+    flow = tflow.tflow()
+    flow.request = http.Request.make(
+        "GET", "https://bridge.claudeusercontent.com/chrome/11111111-1111-4111-8111-111111111111",
+        headers={"Upgrade": "websocket"},
+    )
+    flow.websocket = websocket.WebSocketData()
+    bridge_reply(inject, flow, "paired")
+    assert not flow.metadata.get("chrome_authenticated")
+
+
+def test_missing_account_snapshot_does_not_hide_valid_own_login(monkeypatch):
+    from types import SimpleNamespace
+
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"missing": "0", "personal": "1"}
+    def identity(alias):
+        if alias == "missing":
+            raise FileNotFoundError("no snapshot")
+        return "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(inject, "identity", identity)
+    starts = []
+    mux = SimpleNamespace(start=lambda *args: starts.append(args), message=lambda flow: None)
+    monkeypatch.setattr(inject, "bridge", lambda: mux)
+    flow, _ = bridge_frame(inject, "own-real-token")
+    bridge_reply(inject, flow, "paired")
+    assert starts == [(flow, "personal")]
+
+
+@pytest.mark.parametrize("frame", [
+    {"type": "connect", "client_type": "extension", "oauth_token": "other-token"},
+    {"type": "connect", "client_type": "claude-code", "oauth_token": ""},
+    {"type": "connect", "client_type": "claude-code", "oauth_token": "proxy-account-personal+chrome=personal"},
+])
+def test_repeated_connect_clears_pending_own_login(monkeypatch, frame):
+    inject = addon(monkeypatch, [])
+    monkeypatch.setattr(inject, "bridge", lambda: pytest.fail("unexpected pooling"))
+    flow, _ = bridge_frame(inject, "own-real-token")
+    flow.websocket.messages.append(websocket.WebSocketMessage(1, True, json.dumps(frame).encode()))
+    inject.websocket_message(flow)
+    assert "chrome_pending_alias" not in flow.metadata
+    bridge_reply(inject, flow, "paired")
+    assert inject.chrome is None

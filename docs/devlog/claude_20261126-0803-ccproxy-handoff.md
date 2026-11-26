@@ -1,0 +1,18 @@
+# cc-proxy handoff — 2026-11-26 (UTC)
+
+This branch records the changes deployed from `bf889b4`. It is a snapshot of the proxy work, not of any account configuration or session transcript.
+
+| Request | What changed | Evidence from rollout |
+|---|---|---|
+| See all reachable Chrome extensions in the native picker | Shared-proxy discovery pools configured accounts instead of defaulting to the main account. A failed account no longer turns a nonempty roster into a discovery error. Direct local mode and explicitly single-account sessions are separate cases. | The running session listed six devices after reconnecting, versus two before. No browser action was needed. |
+| Make GPT-6.2 selectable | The catalog now asks the installed Codex CLI for its version at cache refresh instead of always reporting 0.165.0. With the same login, upstream returned both 6.2 variants for 0.172.0 but neither for 0.165.0. | Live `/v1/models` contained `gpt-6.2-astra` and `gpt-6.2-sol`. Picker sync added both and their fast variants on four clients; repeating the sync changed nothing. This verified discovery, not inference. |
+| Update Codex hourly | A systemd user timer on the shared Linux proxy host runs the official standalone updater. No client-side timer or hourly proxy restart. | First service run exited 0 on version 0.172.0; timer enabled. Operations and disable instructions: `docs/codex-updater.md`. |
+| Remove misleading model status | The mod renders no row without confirmed current-response metadata. Equivalent aliases display the serving model once; an actual mismatch gets a warning with both names. | 34 native mod tests passed. Runtime files were copied to the proxy host and four clients; at least one already-running pane still showed its old renderer. No Claude sessions were restarted for this change. |
+
+**Test record:** 1,248 Rust tests passed; Rust formatting and Clippy passed. The combined Chrome/routing/updater Python suites passed 250 tests. Strict mod validation passed. These counts describe the suites exercised during implementation, not a single end-to-end run.
+
+**Operations:** The browser/catalog rollout restarted only the shared proxy. Its pre-deploy source archive and previous binary are in `~/.local/state/cc-proxy/reach-models-20261126/rollback/` on that host. The updater is independent of that rollback. The mod's remote pre-change hooks are in `~/.local/state/cc-proxy/model-band-20261126/original/`. Do not overwrite unrelated working-tree changes to roll back one component.
+
+**Known boundaries:** Browser pooling broadens visibility across accounts on the shared proxy. A successful upstream login authenticates the connecting account; it does not by itself prove entitlement to every other account's browsers. Do not treat this deployment as tenant-isolated. Existing explicit single-account browser selections stay scoped. A running CLI that pinned its picker at startup may still need relaunch to see new picker rows. For interactive recovery use `tcc -r <uuid>`; verify the conversation is not already running. Boot restore already uses the detached form.
+
+**Related work, not part of this commit:** the Remote Control watchdog and hub capacity fixes landed in `cc-tmux-api` (PRs 12 and 13); live conversation ID capture and boot restore landed in `dotclaude` (PR 3) and `dotfiles` (PR 1). VM placement, bridge and Tailscale port changes landed in `infra` (PRs 24–26). The two migrated VMs kept their old disks as rollback copies; do not remove them until a day has elapsed and a successful post-move backup of each VM is confirmed. No deletion or restore drill is recorded here.

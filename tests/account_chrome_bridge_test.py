@@ -286,10 +286,7 @@ def test_failed_account_is_not_an_empty_account_and_never_receives_calls():
                 harness.flow.metadata["chrome_account_statuses"]["work"]
                 == "unavailable"
             )
-            assert any(
-                frame.get("error") == "Chrome accounts unavailable: work"
-                for _, frame in harness.sent
-            )
+            assert not any(frame.get("type") == "error" for _, frame in harness.sent)
             harness.session.outgoing(
                 {
                     "type": "tool_call",
@@ -654,6 +651,34 @@ def test_a_refused_account_is_remembered_and_costs_later_discoveries_nothing(mon
             harness.session.channels["work"].refused_at -= bridge["CONNECT_RETRY_S"]
             harness.fail = False
             assert len(await harness.discover()) == 2, "retried after the window"
+        finally:
+            await harness.close()
+
+    asyncio.run(run())
+
+
+def test_empty_roster_with_unavailable_account_reports_discovery_failure():
+    async def run():
+        harness = Harness(source=[], fail=True)
+        try:
+            assert await harness.discover() == []
+            assert any(
+                frame.get("error") == "Chrome accounts unavailable: work"
+                for _, frame in harness.sent
+            )
+        finally:
+            await harness.close()
+
+    asyncio.run(run())
+
+
+def test_healthy_empty_rosters_are_not_failures():
+    async def run():
+        harness = Harness(source=[], side=[])
+        try:
+            assert await harness.discover() == []
+            assert not any(frame.get("type") == "error" for _, frame in harness.sent)
+            assert set(harness.flow.metadata["chrome_account_statuses"].values()) == {"available"}
         finally:
             await harness.close()
 

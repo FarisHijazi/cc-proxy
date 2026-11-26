@@ -278,7 +278,7 @@ class BridgeSession:
                     rows.extend(channel.rows.values())
                 channel.discovery = None
             self.status()
-            if failures:
+            if failures and not rows:
                 self.emit(
                     {
                         "type": "error",

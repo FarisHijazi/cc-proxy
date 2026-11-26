@@ -747,12 +747,40 @@ class AccountInject:
             return
         if self.chrome is not None and self.chrome.message(flow):
             return
-        if not message.from_client or not message.is_text:
+        if not message.is_text:
             return
         try:
             frame = json.loads(message.text)
-            supplied = frame.get("oauth_token") if isinstance(frame, dict) else None
-            if not str(supplied).startswith("proxy-account-") or self.cascades(supplied):
+            if not isinstance(frame, dict):
+                return
+            if not message.from_client:
+                alias = flow.metadata.get("chrome_pending_alias")
+                if alias is not None and frame.get("type") in {"paired", "waiting", "error"}:
+                    del flow.metadata["chrome_pending_alias"]
+                    if frame["type"] != "error":
+                        flow.metadata["chrome_authenticated"] = True
+                        mux = self.bridge()
+                        mux.start(flow, alias)
+                        mux.message(flow)
+                return
+            if frame.get("type") == "connect":
+                flow.metadata.pop("chrome_pending_alias", None)
+            supplied = frame.get("oauth_token")
+            if not str(supplied).startswith("proxy-account-"):
+                if (frame.get("type") == "connect" and frame.get("client_type") == "claude-code"
+                        and isinstance(supplied, str) and supplied
+                        and not flow.metadata.get("chrome_authenticated")):
+                    for alias in self.accounts:
+                        try:
+                            identity = self.identity(alias)
+                        except (OSError, ValueError, KeyError, TypeError):
+                            continue
+                        if request.path == f"/chrome/{identity}":
+                            # The URL is only a candidate; the upstream must accept the original login first.
+                            flow.metadata["chrome_pending_alias"] = alias
+                            break
+                return
+            if self.cascades(supplied):
                 return
             alias = self.name(parse(supplied)[0])
             selected = chrome_selection(supplied)
