@@ -597,6 +597,195 @@ def test_fallback_section_is_read_and_a_bad_threshold_is_refused(monkeypatch, tm
         inject.read_accounts(path)
 
 
+def replied(inject, alias, five_h, seven_d):
+    """A pooled reply served by `alias`, each window as (fraction used, reset epoch) the way Anthropic sends it."""
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    headers = {module.SERVED_BY_HEADER: f"{alias}/claude-opus-5-5"}
+    for key, (used, reset) in (("5h", five_h), ("7d", seven_d)):
+        headers[f"anthropic-ratelimit-unified-{key}-utilization"] = str(used)
+        headers[f"anthropic-ratelimit-unified-{key}-reset"] = str(reset)
+    flow.response = http.Response.make(200, b"", headers)
+    inject.responseheaders(flow)
+
+
+def ceiling_addon(monkeypatch, ceilings):
+    inject = addon(monkeypatch, [])
+    inject.accounts = {"a": "1", "b": "2", "c": "3"}
+    inject.failover_at = {k: float(v) for k, v in ceilings.items()}
+    return inject
+
+
+LATER = int(time.time()) + 3600
+
+
+def test_an_account_leaves_the_pool_at_its_ceiling_not_below_it(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 29})
+    replied(inject, "a", five_h=(0.28, LATER), seven_d=(0.1, LATER))
+    assert session_pool(inject, None) == ["a", "b", "c"], "below the ceiling: unchanged"
+    replied(inject, "a", five_h=(0.29, LATER), seven_d=(0.1, LATER))
+    assert session_pool(inject, None) == ["b", "c"], "exactly at the ceiling (0.29 * 100 is not 28.99...)"
+    replied(inject, "a", five_h=(0.5, LATER), seven_d=(0.1, LATER))
+    assert session_pool(inject, None) == ["b", "c"], "above the ceiling"
+
+
+def test_any_window_at_the_ceiling_counts(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 80})
+    replied(inject, "a", five_h=(0.1, LATER), seven_d=(0.8, LATER + 86400))
+    assert session_pool(inject, None) == ["b", "c"], "the weekly window alone crosses it"
+
+
+def test_an_account_rejoins_once_the_window_that_crossed_resets(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 20})
+    now = time.time()
+    replied(inject, "a", five_h=(0.25, now + 60), seven_d=(0.1, now + 86400))
+    assert session_pool(inject, None) == ["b", "c"]
+    monkeypatch.setattr(module.time, "time", lambda: now + 61)
+    assert session_pool(inject, None) == ["a", "b", "c"], "5h reset; 7d at 10% is still a fresh reading"
+
+
+def test_a_crossed_ceiling_outlives_staleness_but_an_old_clear_reading_does_not(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 20, "b": 20})
+    now = time.time()
+    replied(inject, "a", five_h=(0.3, now + 7200), seven_d=(0.1, now + 86400))
+    replied(inject, "b", five_h=(0.1, now + 7200), seven_d=(0.1, now + 86400))
+    later = now + module.USAGE_FRESH_S + 1
+    monkeypatch.setattr(module.time, "time", lambda: later)
+    assert inject.standing("a") == "over", "utilization only grows inside a window"
+    assert inject.standing("b") == "unknown", "others may have spent it since"
+    assert session_pool(inject, None, "c") == ["c", "b"], "unknown goes after accounts known to be clear"
+    assert session_pool(inject, None, "b") == ["b", "c"], "except the session's own account: one reply re-reads it"
+
+
+def test_unknown_usage_is_never_read_as_zero_but_still_reachable(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 50})
+    assert inject.standing("a") == "unknown"
+    assert inject.standing("b") == "clear", "no ceiling: today's behaviour"
+    assert session_pool(inject, None, "b") == ["b", "c", "a"], "another session's unknown account goes after"
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [(e["alias"], e["primary"]) for e in pool] == [("a", True), ("b", False), ("c", False)], \
+        "the session's own unknown account stays first and keeps the thread"
+    inject.accounts = {"a": "1"}
+    assert session_pool(inject, None) == ["a"], "the only way to learn its usage is to use it"
+
+
+def test_pin_preference_and_affinity_cannot_bypass_a_ceiling(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"c": 20})
+    replied(inject, "c", five_h=(0.2, LATER), seven_d=(0.1, LATER))
+    flow = inference("Bearer proxy-account-c+pin")
+    inject.requestheaders(flow)
+    pool = json.loads(flow.request.headers[module.POOL_HEADER])
+    assert [(e["alias"], e["primary"]) for e in pool] == [("a", True), ("b", False)], "the first survivor owns the thread"
+    assert flow.request.headers["authorization"] == "Bearer real-1"
+    inject.strategy, inject.prefer = "prefer", "c"
+    assert session_pool(inject, "s1", "a") == ["a", "b"], "a preferred account over its ceiling starts nothing"
+    inject.strategy = "least-sessions"
+    inject.sticky = {"s2": ("c", time.time())}
+    assert session_pool(inject, "s2", "a")[0] == "a", "a session stuck on it moves"
+    assert inject.sticky["s2"][0] == "a"
+    inject.strategy, inject.turn = "round-robin", 1
+    assert session_pool(inject, "s3", "a")[0] in {"a", "b"}, "round robin skips it"
+
+
+def pool_primaries(inject, placeholder, session=None):
+    flow = inference(f"Bearer {placeholder}")
+    if session:
+        flow.request.headers[module.SESSION_HEADER] = session
+    inject.requestheaders(flow)
+    return [(e["alias"], e["primary"]) for e in json.loads(flow.request.headers[module.POOL_HEADER])]
+
+
+def test_an_idle_pinned_or_preferred_account_is_not_starved(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 90})
+    now = time.time()
+    replied(inject, "a", five_h=(0.05, now + 18000), seven_d=(0.05, now + 5 * 86400))
+    monkeypatch.setattr(module.time, "time", lambda: now + module.USAGE_FRESH_S + 1)
+    assert inject.standing("a") == "unknown"
+    assert pool_primaries(inject, "proxy-account-a+pin")[0] == ("a", True)
+    inject.strategy, inject.prefer = "prefer", "a"
+    assert pool_primaries(inject, "proxy-account-b", "s1")[0] == ("a", True)
+
+
+def test_an_observed_reset_makes_the_account_clear_again(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 20})
+    now = time.time()
+    replied(inject, "a", five_h=(0.25, now + 60), seven_d=(0.1, now + 86400))
+    monkeypatch.setattr(module.time, "time", lambda: now + 3600)
+    assert inject.standing("a") == "clear", "its other window was under; the one that crossed has reset"
+    assert session_pool(inject, None, "b") == ["b", "a", "c"]
+
+
+def test_an_over_start_account_hands_the_thread_to_the_first_survivor(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 50})
+    replied(inject, "a", five_h=(0.6, LATER), seven_d=(0.1, LATER))
+    assert pool_primaries(inject, "proxy-account-a", "s1") == [("b", True), ("c", False)], "session strategy"
+    inject.strategy, inject.prefer = "prefer", "a"
+    assert pool_primaries(inject, "proxy-account-a", "s1") == [("b", True), ("c", False)], "prefer falls back to an over alias"
+
+
+def test_a_reply_missing_one_window_keeps_the_other_reading(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 80})
+    replied(inject, "a", five_h=(0.1, LATER), seven_d=(0.9, LATER + 86400))
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {
+        module.SERVED_BY_HEADER: "a/claude-opus-5-5",
+        "anthropic-ratelimit-unified-5h-utilization": "0.11",
+        "anthropic-ratelimit-unified-5h-reset": str(LATER),
+    })
+    inject.responseheaders(flow)
+    assert inject.standing("a") == "over", "the 7d reading still stands"
+
+
+def test_an_over_reading_without_a_reset_lasts_the_window_length(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 80})
+    now = time.time()
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    flow.response = http.Response.make(200, b"", {
+        module.SERVED_BY_HEADER: "a/claude-opus-5-5",
+        "anthropic-ratelimit-unified-7d-utilization": "0.95",
+    })
+    inject.responseheaders(flow)
+    monkeypatch.setattr(module.time, "time", lambda: now + 6 * 86400)
+    assert inject.standing("a") == "over", "no reset header: assume the full 7 days"
+    monkeypatch.setattr(module.time, "time", lambda: now + 7 * 86400 + 1)
+    assert inject.standing("a") == "clear"
+
+def test_every_account_at_its_ceiling_leaves_an_empty_claude_pool(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 50, "b": 50, "c": 50})
+    for alias in "abc":
+        replied(inject, alias, five_h=(0.9, LATER), seven_d=(0.1, LATER))
+    flow = inference("Bearer proxy-account-a")
+    inject.requestheaders(flow)
+    assert json.loads(flow.request.headers[module.POOL_HEADER]) == [], "the router walks on to other backends"
+    assert "authorization" not in flow.request.headers
+
+
+def test_ceilings_never_touch_api_key_accounts(monkeypatch):
+    inject = ceiling_addon(monkeypatch, {"a": 20})
+    inject.keys = {"console": "sk-ant-fake"}
+    replied(inject, "a", five_h=(0.5, LATER), seven_d=(0.1, LATER))
+    assert session_pool(inject, None) == ["b", "c", "console"]
+
+
+def test_failover_at_is_read_and_bad_values_are_refused(monkeypatch, tmp_path):
+    inject = addon(monkeypatch, [])
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"accounts": {"a": 1}}))
+    inject.read_accounts(path)
+    assert inject.failover_at == {}, "absent means no ceiling anywhere"
+    path.write_text(json.dumps({"accounts": {"a": 1}, "failover_at": {"a": 95, "gone": 50}}))
+    inject.read_accounts(path)
+    assert inject.failover_at == {"a": 95.0, "gone": 50.0}
+    for bad in ({"a": 0}, {"a": 101}, {"a": True}, {"a": "20"}, ["a"]):
+        path.write_text(json.dumps({"accounts": {"a": 1}, "failover_at": bad}))
+        with pytest.raises(ValueError):
+            inject.read_accounts(path)
+
+
 def test_counts_carry_the_same_pool_as_messages(monkeypatch):
     """A model one login lacks 404s its count too, so counts fall back like messages."""
     inject = addon(monkeypatch, [])

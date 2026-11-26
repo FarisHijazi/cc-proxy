@@ -87,6 +87,12 @@ month_spend = runpy.run_path(str(Path(__file__).with_name("account_key_spend.py"
 # SPEND_STALE_S (or never read) leaves the key out of the pool, because unknown spend is not zero.
 SPEND_EVERY_S = 10
 SPEND_STALE_S = 60
+# A below-ceiling reading older than this no longer proves the account is under its "failover_at" ceiling:
+# other clients of the same subscription keep spending it. A reading at or over the ceiling stays valid
+# until its window resets, because utilization only grows inside a window.
+USAGE_FRESH_S = 900
+# Reply header window -> its length, the reset assumed when a reply omits that window's reset.
+QUOTA_WINDOWS = {"5h": 5 * 3600, "7d": 7 * 86400}
 
 
 class StillFetching(GrantsUnavailable):
@@ -301,6 +307,15 @@ def key_accounts(section, accounts):
     return keys, preferred, budgets
 
 
+def failover_ceilings(section):
+    """The accounts file's "failover_at": {subscription alias: utilization % from 1 to 100}."""
+    if not isinstance(section, dict) or not all(
+            isinstance(alias, str) and not isinstance(pct, bool) and isinstance(pct, (int, float)) and 1 <= pct <= 100
+            for alias, pct in section.items()):
+        raise ValueError("failover_at maps account aliases to a utilization percentage from 1 to 100")
+    return {alias: float(pct) for alias, pct in section.items()}
+
+
 def codex_cli_auth_file():
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
 
@@ -345,8 +360,10 @@ class AccountInject:
         self.keys, self.preferred = {}, []
         # alias -> monthly USD cap, and alias -> (USD spent this month, when it was read).
         self.budgets, self.spend, self.spend_thread = {}, {}, None
-        # alias -> [(utilization %, window reset epoch)] from that account's latest reply.
+        # alias -> {window: (utilization %, reset epoch, seen epoch)}, each window from the latest reply carrying it.
         self.usage = {}
+        # alias -> utilization % at which a subscription account leaves the pool ("failover_at").
+        self.failover_at = {}
         self.chrome_profiles_file = Path.home() / ".claude/chrome-profiles.json"
         dsn = os.environ.get("CCP_AFFINITY_DSN")
         namespace = os.environ.get("CCP_AFFINITY_NAMESPACE")
@@ -434,6 +451,7 @@ class AccountInject:
         if threshold is not None and not 0 < float(threshold) <= 100:
             raise ValueError("fallback.threshold must be a percentage")
         self.fallback = fallback
+        self.failover_at = failover_ceilings(data.get("failover_at", {}))
         session_models = data.get("session_models", {})
         if not all(isinstance(s, str) and SESSION_ID.fullmatch(s) and isinstance(m, str) and MODEL_ID.fullmatch(m)
                    for s, m in session_models.items()):
@@ -569,14 +587,15 @@ class AccountInject:
         if pinned:
             return alias
         if self.strategy == "prefer":
-            return alias if self.prefer in self.disabled else self.prefer
+            return alias if self.prefer in self.disabled or self.standing(self.prefer) == "over" else self.prefer
         if self.strategy == "session" or not session:
             return alias
         now = time.time() if now is None else now
         self.sticky = {s: e for s, e in self.sticky.items() if e[1] > now - STICKY_IDLE_S}
         entry = self.sticky.get(session)
-        if entry is None or entry[0] not in self.accounts:
+        if entry is None or entry[0] not in self.accounts or self.standing(entry[0]) == "over":
             names = [n for n in self.accounts if n not in self.disabled] or list(self.accounts)
+            names = [n for n in names if self.standing(n) != "over"] or names
             if self.strategy == "round-robin":
                 self.turn = (self.turn + 1) % len(names)
                 chosen = names[self.turn]
@@ -595,21 +614,30 @@ class AccountInject:
         A preferred Console key goes before them all (except when pinned), other keys after."""
         alias = self.start(alias, session, pinned)
         names = [alias, *(a for a in self.accounts if a != alias and a not in self.disabled)]
-        # Accounts at the usage threshold go last: still a fallback, never a first choice.
+        # An account at its own "failover_at" ceiling is not offered at all, pinned or preferred alike.
+        # One whose standing is unknown goes after those known to be under it, and accounts at the
+        # global usage threshold go last: still a fallback, never a first choice.
         # The starting account keeps "primary", so its thread deltas never move.
-        names = [n for n in names if not self.hot(n)] + [n for n in names if self.hot(n)]
+        # Unknown only demotes other accounts: the session's own one answers and is re-read.
+        standing = {n: self.standing(n) for n in names}
+        names = sorted((n for n in names if standing[n] != "over"),
+                       key=lambda n: (self.hot(n), standing[n] == "unknown" and n != alias))
         members = [m for k in self.keys if k not in self.disabled and (m := self.key_member(k))]
         lead = [] if pinned else [m["alias"] for m in members if m["alias"] in self.preferred]
         pool = [m for m in members if m["alias"] in lead]
         tail = [m for m in members if m["alias"] not in lead]
         if lead:
             pool[0]["primary"], alias = True, None  # the key starts the thread, so it owns it
+        # A starting account over its ceiling hands the thread to the first account that stays.
+        inherit = alias is not None and alias not in names
         fetching = None
         for name in names:
             if self.unusable.get(name, 0) > time.time():
                 continue
             try:
-                pool.append({"alias": name, "authorization": "Bearer " + self.token(name), "primary": name == alias})
+                pool.append({"alias": name, "authorization": "Bearer " + self.token(name),
+                             "primary": name == alias or inherit})
+                inherit = False
             except StillFetching as error:
                 fetching = error  # not broken: it joins the pool once its fetch lands
             except Exception:  # noqa: BLE001 - one broken slot must not block the rest
@@ -623,8 +651,23 @@ class AccountInject:
         threshold = self.fallback.get("threshold")
         now = time.time()
         return bool(threshold) and any(
-            used >= float(threshold) and reset > now for used, reset in self.usage.get(alias, [])
-        )
+            used >= float(threshold) and reset > now for used, reset, _ in self.usage.get(alias, {}).values())
+
+    def standing(self, alias):
+        """Against the account's own "failover_at" ceiling: "over", "unknown" or "clear" (also when it has none).
+        Over means a provider-reported window is at or above it; the reply that crossed it, and requests
+        already in flight, still went through, so this is a ceiling on routing, not an exact budget."""
+        ceiling = self.failover_at.get(alias)
+        if ceiling is None:
+            return "clear"
+        now = time.time()
+        readings = list(self.usage.get(alias, {}).values())
+        active = [(used, seen) for used, reset, seen in readings if reset > now]
+        if any(used >= ceiling for used, _ in active):
+            return "over"
+        if len(active) < len(readings):
+            return "clear"  # a window it was read in has reset since: an observed reset
+        return "clear" if active and all(now - seen <= USAGE_FRESH_S for _, seen in active) else "unknown"
 
     def responseheaders(self, flow):
         if flow.response is None:
@@ -639,16 +682,17 @@ class AccountInject:
         alias = headers.get(SERVED_BY_HEADER, "").split("/")[0]
         if alias not in self.accounts:
             return
-        windows = []
-        for key in ("5h", "7d"):
+        now = time.time()
+        readings = dict(self.usage.get(alias, {}))
+        for key, length in QUOTA_WINDOWS.items():
             used = headers.get(f"anthropic-ratelimit-unified-{key}-utilization")
             reset = headers.get(f"anthropic-ratelimit-unified-{key}-reset")
             try:
-                windows.append((float(used) * 100, float(reset) if reset else time.time() + UNUSABLE_RETRY_S))
+                # The header is a 0-1 fraction; rounding keeps 0.29 at exactly 29 for the ceiling comparison.
+                readings[key] = (round(float(used) * 100, 6), float(reset) if reset else now + length, now)
             except (TypeError, ValueError):
                 continue
-        if windows:
-            self.usage[alias] = windows
+        self.usage[alias] = readings
 
     def cascades(self, placeholder, path=""):
         """True when the next proxy, not this one, holds the login a placeholder names."""

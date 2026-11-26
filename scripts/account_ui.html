@@ -481,6 +481,27 @@ function accountBody(a) {
       ${windows.length && a.usage_at ? `<div class="small muted">from its last reply, ${ago(a.usage_at)} ago</div>` : ""}`;
 }
 
+const pendingCeilings = {};
+// The proxy routes on the 5h and 7d windows every reply reports; the model-specific weekly ones are shown only.
+const CEILING_WINDOWS = ["five_hour", "seven_day"];
+function ceilingStatus(a, pct) {
+  if (a.loading) return "";
+  const active = CEILING_WINDOWS.filter((n) => a.usage[n] && (!a.usage[n].resets_at || new Date(a.usage[n].resets_at) > Date.now()));
+  const hit = active.filter((n) => a.usage[n].utilization >= pct);
+  if (hit.length) return `<span style="color:var(--warn)">At its ceiling: skipped until ${hit.map((n) => `${esc(WINDOW[n])} ${esc(until(a.usage[n].resets_at) || "resets")}`).join(" and ")}.</span>`;
+  if (!active.length) return "Usage unknown: tried only after accounts known to be under their ceiling.";
+  return `Under it: ${active.map((n) => `${esc(WINDOW[n])} ${Math.round(a.usage[n].utilization)}%`).join(", ")}.`;
+}
+function ceilingRow(a) {
+  const pct = state.failover_at?.[a.alias] ?? null, on = pct != null;
+  return `<div class="ceiling" style="margin-top:8px">
+    <div class="row"><span class="small">Fail over at <strong data-ceiling-label="${esc(a.alias)}">${on ? pct + "%" : "off"}</strong></span><span class="spacer"></span>
+      <label class="switch" title="${on ? "Leaves the pool at this usage" : "No ceiling: used until Anthropic refuses it"}"><input type="checkbox" data-ceiling-on="${esc(a.alias)}" ${on ? "checked" : ""}><span></span></label></div>
+    <input type="range" min="1" max="100" step="1" value="${pct ?? 90}" data-ceiling="${esc(a.alias)}" aria-label="Fail over at percentage for ${esc(a.email || a.alias)}" ${on ? "" : "disabled"}>
+    <div class="small muted">${on ? `Skipped, even when pinned or preferred, once Anthropic reports its 5-hour or 7-day usage at or above ${pct}%; it rejoins when that window resets. Replies report usage after the fact, so requests in flight can carry it past. ${ceilingStatus(a, pct)} This card reads the dashboard's usage; the proxy routes on its own last reply, so the two can briefly differ.`
+      : "Off: used until Anthropic refuses it."}</div></div>`;
+}
+
 function renderAccounts() {
   const b = state.balance, threshold = state.fallback.threshold ?? null, items = fallbackItems();
   const live = items.filter((x) => !x.off).length;
@@ -516,6 +537,7 @@ function renderAccounts() {
         ${a.token_only ? `<span class="badge" title="claude setup-token: model calls only, no usage or profile API">setup-token</span>` : ""}
       </div>
       ${accountBody(a)}
+      ${ceilingRow(a)}
       <div class="card-foot">
         <span class="small muted">${off ? "off: never tried" : `#${n} of ${live}`} · Claude slot ${esc(a.slot)}</span><span class="spacer"></span>
         <button data-up="${i}" ${i === 0 ? "disabled" : ""} title="Try earlier">↑</button>
@@ -564,6 +586,23 @@ function renderAccounts() {
     const off = new Set(state.accounts.filter((a) => a.disabled).map((a) => a.alias));
     x.checked ? off.delete(x.dataset.alias) : off.add(x.dataset.alias);
     save({disabled: [...off]});
+  });
+  const saveCeiling = async (alias, pct) => {
+    // save() refuses while another save is in flight; keep the newest value per account and send it after.
+    pendingCeilings[alias] = pct;
+    while (saving) await new Promise((resolve) => setTimeout(resolve, 50));
+    if (!Object.keys(pendingCeilings).length) return;
+    const change = {...pendingCeilings};
+    Object.keys(change).forEach((k) => delete pendingCeilings[k]);
+    await save({failover_at: change});
+  };
+  $("accounts").querySelectorAll("[data-ceiling-on]").forEach((x) => x.onchange = () => {
+    const slider = $("accounts").querySelector(`[data-ceiling="${CSS.escape(x.dataset.ceilingOn)}"]`);
+    saveCeiling(x.dataset.ceilingOn, x.checked ? +slider.value : null);
+  });
+  $("accounts").querySelectorAll("[data-ceiling]").forEach((x) => {
+    x.oninput = () => { $("accounts").querySelector(`[data-ceiling-label="${CSS.escape(x.dataset.ceiling)}"]`).textContent = x.value + "%"; };
+    x.onchange = () => saveCeiling(x.dataset.ceiling, +x.value);
   });
   $("accounts").querySelectorAll("[data-backend]").forEach((x) => x.onchange = () => {
     const i = +x.dataset.backend, next = items.filter((_, j) => j !== i);
