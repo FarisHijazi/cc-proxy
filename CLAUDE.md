@@ -76,6 +76,9 @@ loads only its UI when event publishing is disabled. It uses authoritative respo
 (account unknown); never inferred from the requested model or model text.
 Native HTTP hooks lack turn IDs: tool-less/ambiguous calls, pending requests, errors
 and model switches hide the band; aliases of the requested model never warn.
+The band also shows the main loop's output tok/s and mean TTFT over the last 10 s
+(`hooks/speed.ts`: live: visible chunks at 4 chars/token; finished: the stop's `output_tokens` spread over first chunk to stop, so hidden thinking does not spike it; TTFT = step start to
+first non-engine chunk; tool time between steps is excluded; subagents ignored).
 Do not consume the inference stream, change prompts/transcripts, or add another
 metadata listener/registry/poller. Read the Mod README for correlation boundaries.
 
