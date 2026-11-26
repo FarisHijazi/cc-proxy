@@ -33,9 +33,11 @@ test('a cancelled step stops counting generation time', () => {
   expect(summary(s, 8000)).toBe('last 10s: 40 tok/s · TTFT 1.0s')
 })
 
-test('the exact token count rescales the live estimate instead of piling onto the end', () => {
+test('hidden thinking is spread over the whole generation, not counted at the end', () => {
   const s = speed()
-  stepStarted(s, 0); streamed(s, text(50), 1000); streamed(s, text(50), 9000); streamed(s, stop(200), 9000)
-  expect(summary(s, 9000)).toBe('last 10s: 25 tok/s · TTFT 1.0s')
-  expect(summary(s, 15000)).toBe('last 10s: 25 tok/s')
+  stepStarted(s, 0); streamed(s, { kind: 'thinking', index: 0, text: '' } as never, 1000)
+  expect(summary(s, 9000)).toBe('last 10s: TTFT 1.0s')
+  streamed(s, text(50), 10000); streamed(s, stop(900), 10000)
+  expect(summary(s, 10000)).toBe('last 10s: 100 tok/s · TTFT 1.0s')
+  expect(summary(s, 15000)).toBe('last 10s: 100 tok/s')
 })
