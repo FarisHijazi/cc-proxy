@@ -357,6 +357,7 @@ fn validate_request(req: &MessagesRequest) -> Result<(), anyhow::Error> {
                             | "server_tool_use"
                             | "web_search_tool_result"
                             | "x_search_tool_result"
+                            | "advisor_tool_result"
                     )
                 }
                 "user" => matches!(kind, "text" | "image" | "tool_result"),
@@ -517,6 +518,9 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
     };
     let mut out = Vec::new();
     for tool in tools_arr {
+        if crate::providers::translate_shared::is_anthropic_advisor_tool(tool) {
+            continue;
+        }
         let kind = tool.get("type").and_then(Value::as_str).unwrap_or("custom");
         anyhow::ensure!(
             matches!(kind, "custom" | "function"),
@@ -1234,6 +1238,32 @@ mod tests {
             translated.tool_choice,
             Some(KimiToolChoice::Required)
         ));
+    }
+
+    #[test]
+    fn anthropic_advisor_tool_is_left_out_not_refused() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3.1-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name":"Bash","input_schema":{"type":"object"}},
+                {"type":"advisor_20260301","name":"advisor","model":"claude-opus-5-5","defer_loading":true}
+            ]
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request(&req, TranslateOptions { session_id: None }).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 1, "{wire}");
+        assert_eq!(wire["tools"][0]["function"]["name"], "Bash");
+        let hosted: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3.1-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type":"code_execution_20250825","name":"code_execution"}]
+        }))
+        .unwrap();
+        assert!(translate_request(&hosted, TranslateOptions { session_id: None }).is_err());
     }
 
     #[test]

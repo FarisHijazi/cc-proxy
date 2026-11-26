@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
     ContentBlock, ImageInput, InputSupport, ProxyReasoning, flatten_system_text,
-    image_block_to_url, image_source_to_url, normalize_content, parallel_tool_calls,
-    tool_reference_text,
+    image_block_to_url, image_source_to_url, is_anthropic_advisor_tool, normalize_content,
+    parallel_tool_calls, tool_reference_text,
 };
 
 /// Anthropic allows an unbounded reply; OpenAI wants a number. Large enough not
@@ -292,6 +292,7 @@ fn translate_tools(tools: Option<&Value>) -> Option<Vec<GeminiTool>> {
     let tools = tools?.as_array()?;
     let mapped: Vec<GeminiTool> = tools
         .iter()
+        .filter(|tool| !is_anthropic_advisor_tool(tool))
         .filter_map(|tool| {
             // Anthropic server-side tools (web_search, computer, ...) have no
             // OpenAI function equivalent; dropping them is better than sending
