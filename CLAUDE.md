@@ -72,7 +72,8 @@ do not reload or stop existing sessions to enable it. SDK/API and configuration
 contracts: `docs/session-sdk.md` and `scripts/session-mod/README.md` (plain links).
 The same Mod owns the Actual Serving AbovePrompt band; saved `model_metadata: true`
 loads only its UI when event publishing is disabled. It uses authoritative response
-`x-claude-codex-served-by` only, never inferred from requested model or model text.
+`x-claude-codex-served-by`, else the main step's completed native `usage.model`
+(account unknown); never inferred from the requested model or model text.
 Native HTTP hooks lack turn IDs: tool-less/ambiguous calls, pending requests, errors
 and model switches hide the band; aliases of the requested model never warn.
 Do not consume the inference stream, change prompts/transcripts, or add another

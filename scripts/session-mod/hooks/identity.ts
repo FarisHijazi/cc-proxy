@@ -1,4 +1,4 @@
-import type { HttpInit, HttpResponse, TurnStepInput } from 'claude-code'
+import type { HttpInit, HttpResponse, TurnStepInput, TurnStepResult } from 'claude-code'
 export type Serving = { model: string; account: string; provider: string }
 const backends = new Set(['codex', 'gemini', 'cursor', 'cursor-cli', 'kimi', 'grok', 'zai', 'local', 'agy'])
 export function parseServing(value: string | undefined): Serving | undefined {
@@ -54,13 +54,24 @@ export function answered(state: Tracker, ticket: Ticket, response?: HttpResponse
   state.actual = undefined
   if (!response?.ok) return
   const header = response.headers['x-claude-codex-served-by']
-  state.actual = parseServing(header)
-  if (!state.actual) return
-  const changed = state.last && (state.last.account !== state.actual.account || !sameModel(state.last.model, state.actual))
-  state.last = state.actual
-  return changed ? `Serving changed: ${served(state, state.actual)}` : undefined
+  return confirm(state, parseServing(header))
 }
-function sameModel(requested: string, actual: Serving) {
+export function completed(state: Tracker, step: TurnStepInput, result: TurnStepResult): string | undefined {
+  if (step.agentId || state.active !== step || state.actual || !result.stopReason) return
+  const model = result.usage?.model
+  if (!model || model === 'unknown' || !/^[a-zA-Z0-9._:[\]-]{1,128}$/.test(model)) return
+  return confirm(state, { model, account: 'unknown', provider: 'unknown' })
+}
+function confirm(state: Tracker, actual: Serving | undefined) {
+  state.actual = actual
+  if (!actual) return
+  const changed = state.last && (state.last.account !== actual.account || !sameModel(state.last.model, actual))
+  state.last = actual
+  return changed ? `Serving changed: ${served(state, actual)}` : undefined
+}
+const providers = ['codex', 'Anthropic', 'kimi', 'agy', 'gemini', 'cursor', 'cursor-cli']
+function sameModel(requested: string, actual: Serving): boolean {
+  if (actual.provider === 'unknown') return providers.some(provider => sameModel(requested, { ...actual, provider }))
   const clean = (id: string) => id.replace(/\[1m\]$/i, '')
   let want = clean(requested), got = clean(actual.model)
   if (want === got) return true
@@ -82,7 +93,8 @@ function sameModel(requested: string, actual: Serving) {
   return !!route && want.replace(route, '') === got.replace(route, '')
 }
 export function served(state: Tracker, actual: Serving) {
-  const where = actual.provider === 'Anthropic' ? `Anthropic · account ${actual.account}` : actual.provider
+  const where = actual.provider === 'unknown' ? 'account unknown' :
+    actual.provider === 'Anthropic' ? `Anthropic · account ${actual.account}` : actual.provider
   return sameModel(state.requested, actual) ? `${actual.model} · ${where}` :
     `⚠️ ${actual.model} · ${where} · requested ${state.requested}`
 }

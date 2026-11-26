@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { tracker, reset, begin, finish, isMainRequest, sent, answered, display, parseServing } from '../hooks/identity'
-import type { HttpInit, HttpResponse } from 'claude-code'
+import { tracker, reset, begin, finish, isMainRequest, sent, answered, completed, display, parseServing } from '../hooks/identity'
+import type { HttpInit, HttpResponse, TurnStepResult } from 'claude-code'
 const model = 'claude-opus-5-5'
 const step = { turnId: 'turn-1', index: 0, model, messageCount: 59 }
 const url = 'https://api.anthropic.com/v1/messages'
@@ -159,4 +159,84 @@ test('same model shows the name once; a different model gets a warning', () => {
   expect(display(state)?.split(model).length).toBe(2)
   answered(state, sent(state), response('zai/glm-5.4'))
   expect(display(state)).toBe(`Serving ⚠️ glm-5.4 · zai · requested ${model}`)
+})
+
+const completedReply = (model: string): TurnStepResult => ({ turnId: step.turnId, index: step.index,
+  answer: '', toolUses: [], stopReason: 'end_turn', usage: {
+    model, input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+  } })
+
+test('own-login completion shows the API-reported model with an unknown account', () => {
+  const state = tracker()
+  begin(state, step)
+  const reply = response()
+  Object.defineProperty(reply, 'text', { get() { throw new Error('must not read inference body') } })
+  answered(state, sent(state), reply)
+  expect(display(state)).toBe(undefined)
+  expect(completed(state, step, completedReply(model))).toBe(undefined)
+  expect(display(state)).toBe(`Serving ${model} · account unknown`)
+  begin(state, step)
+  expect(completed(state, step, completedReply(model))).toBe(undefined)
+  begin(state, step)
+  expect(completed(state, step, completedReply('glm-5.4'))).toBe(`Serving changed: ⚠️ glm-5.4 · account unknown · requested ${model}`)
+  expect(display(state)).toBe(`Serving ⚠️ glm-5.4 · account unknown · requested ${model}`)
+})
+
+test('completion accepts aliases of the requested model without a warning', () => {
+  for (const [requested, reported] of <[string, string][]>[['opus', model], ['opus[1m]', `${model}-20260101`], ['sol', 'gpt-6.1-sol']]) {
+    const state = tracker(), current = { ...step, model: requested }
+    begin(state, current)
+    completed(state, current, completedReply(reported))
+    expect(display(state)).toBe(`Serving ${reported} · account unknown`)
+  }
+})
+
+test('completion rejects subagents, stale steps, failures and synthetic model IDs', () => {
+  const state = tracker(), child = { ...step, agentId: 'child' }
+  begin(state, step)
+  begin(state, child)
+  completed(state, child, completedReply('glm-5.4'))
+  expect(state.actual).toBe(undefined)
+  for (const invalid of ['', 'unknown', '<synthetic>', 'bad\nmodel']) {
+    completed(state, step, completedReply(invalid))
+    expect(state.actual).toBe(undefined)
+  }
+  completed(state, step, { ...completedReply(model), usage: null })
+  completed(state, step, { ...completedReply(model), stopReason: null })
+  expect(state.actual).toBe(undefined)
+  reset(state, 'glm-5.4')
+  completed(state, step, completedReply(model))
+  expect(display(state)).toBe(undefined)
+})
+
+test('served-by header takes precedence over the completion usage model', () => {
+  const state = tracker()
+  begin(state, step)
+  answered(state, sent(state), response('codex/gpt-6.1-sol'))
+  completed(state, step, completedReply(model))
+  expect(display(state)).toBe(`Serving ⚠️ gpt-6.1-sol · codex · requested ${model}`)
+})
+
+test('turn result updates the band without changing or eagerly draining its stream', async ($, on) => {
+  mock.env(on, {})
+  on('session.model', () => ({ value: model }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  let advances = 0
+  const result = completedReply('glm-5.4')
+  on('turn.step', async function* () {
+    advances++
+    yield { kind: 'text', index: 0, text: 'unchanged' }
+    advances++
+    return result
+  })
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  const stream = $.turn.step(step)
+  expect(await stream.next()).toMatchObject({ done: false, value: { kind: 'text', text: 'unchanged' } })
+  expect(advances).toBe(1)
+  expect(await stream.next()).toEqual({ done: true, value: result })
+  expect(advances).toBe(2)
+  const ui = await $.ui.mount({ plugin: 'cc-proxy-session', component: 'AbovePrompt', surface: 'terminal', requestId: 'metadata', props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 4, bodyColumns: 80, scroll: { offset: 0, bodyRows: 4 }, view: {} } })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe(`Serving ⚠️ glm-5.4 · account unknown · requested ${model}`)
+  await ui.unmount()
 })

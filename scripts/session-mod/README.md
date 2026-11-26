@@ -80,6 +80,11 @@ and `turn.step.messageCount` is not the serialized wire message count: when
 correlation is absent or ambiguous the band is hidden rather than guessed.
 A missing or unparseable header, a pending request, an error, a model change, and a
 reload/resume all hide the band until the next attributed answer.
+Sessions on their own login get no header; there the existing `turn.step` observer
+reads the completed main step's native `usage.model` (the API-reported model) and
+shows it with `account unknown`. The header wins when present; subagent, stale,
+interrupted, `unknown` and synthetic results are ignored. The observer forwards every
+chunk and the final result unchanged and reads no HTTP body.
 The band names the served model once (`Serving <model> · <provider/account>`) when it
 is the requested one; aliases (`sol`, `opus`), `[1m]` hints, Codex `-fast` tiers, dated
 Claude ids, `kimi-` and route prefixes (`gemini:`, `cursor-cli-ask:`) count as the same
@@ -88,8 +93,7 @@ real model/account change toasts. Metadata works independently of the HQ event
 connection and adds no poller or listener.
 
 The native inference hook and band were verified interactively on Claude Code
-2.1.331/2.1.332. Builds that do not expose inference HTTP hooks show no band;
-the requested model is never shown as served.
+2.1.331/2.1.332. The requested model is never shown as served.
 The normal launcher opt-in above installs the band only for new interactive
 sessions. Development `--plugin-dir` reloads are tested only in throwaway sessions.
 
