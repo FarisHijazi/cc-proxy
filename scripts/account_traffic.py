@@ -189,6 +189,8 @@ def clean_headers(items):
 
 
 PRUNE_EVERY_S = 3600
+PRUNE_BATCH_ROWS = 256
+PRUNE_TABLES = (("flows", "started"), ("websocket_messages", "at"), ("blobs", "last_seen"))
 QUEUE_MAX = 5000
 LIVE_EVERY_S = 5
 INFLIGHT_MAX_S = 3600
@@ -200,6 +202,7 @@ class TrafficDB:
         self.days_of = days_of  # its "traffic_days": keep this many days, unset keeps all
         self.path = self.db = None
         self.pruned = 0.0
+        self.prune_state = None
         self.index_pending, self.index_retry_at = False, 0.0
         self.dropped = 0
         self.jobs = queue.Queue(QUEUE_MAX)
@@ -227,6 +230,8 @@ class TrafficDB:
             try:
                 if job is not None and self.connection(path) is not None:
                     job(*args)
+                if job is None and self.connection() is not None:
+                    self.prune()
                 if self.db is not None and self.jobs.empty():
                     self.maintain_index()
                 if time.time() - self.live_at >= LIVE_EVERY_S and self.connection() is not None:
@@ -260,6 +265,7 @@ class TrafficDB:
             if self.db is not None:
                 self.db.close()
             self.path, self.db = path, None
+            self.pruned, self.prune_state = 0.0, None
             if path:
                 Path(path).expanduser().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 self.db = sqlite3.connect(Path(path).expanduser(), isolation_level=None)
@@ -288,15 +294,37 @@ class TrafficDB:
                 print("traffic-db: account index deferred: maintenance exceeded three seconds", flush=True)
 
     def prune(self):
-        """Drop what is older than traffic_days. A blob a kept flow uses was seen after that cutoff."""
+        """Advance retention by one bounded rowid batch, never a whole-table startup scan."""
         days = self.days_of()
-        if not days or time.time() - self.pruned < PRUNE_EVERY_S:
+        if not days:
+            self.prune_state = None
             return
-        self.pruned = time.time()
-        cutoff = self.pruned - float(days) * 86400
-        self.db.execute("DELETE FROM flows WHERE started < ?", (cutoff,))
-        self.db.execute("DELETE FROM websocket_messages WHERE at < ?", (cutoff,))
-        self.db.execute("DELETE FROM blobs WHERE last_seen < ?", (cutoff,))
+        if self.prune_state is None:
+            if time.time() - self.pruned < PRUNE_EVERY_S:
+                return
+            cutoff = time.time() - float(days) * 86400
+            upper = [self.db.execute(f"SELECT coalesce(max(rowid), 0) FROM {table}").fetchone()[0]
+                     for table, _ in PRUNE_TABLES]
+            self.prune_state = (cutoff, upper, 0, 0)
+        cutoff, upper, index, cursor = self.prune_state
+        table, column = PRUNE_TABLES[index]
+        rows = self.db.execute(
+            f"SELECT rowid FROM {table} WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
+            (cursor, upper[index], PRUNE_BATCH_ROWS),
+        ).fetchall()
+        if rows:
+            end = rows[-1][0]
+            # Recheck age at deletion: a deduplicated blob may have been reused since the sweep began.
+            self.db.execute(
+                f"DELETE FROM {table} NOT INDEXED WHERE rowid > ? AND rowid <= ? AND {column} < ?",
+                (cursor, end, min(cutoff, time.time() - float(days) * 86400)),
+            )
+            self.prune_state = (cutoff, upper, index, end)
+        else:
+            index += 1
+            self.prune_state = (cutoff, upper, index, 0) if index < len(PRUNE_TABLES) else None
+            if self.prune_state is None:
+                self.pruned = time.time()
 
     def requestheaders(self, flow):
         path = self.path_of()

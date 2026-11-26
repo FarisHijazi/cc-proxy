@@ -6,6 +6,7 @@ import sqlite3
 import zlib
 from pathlib import Path
 
+import pytest
 from mitmproxy import http, websocket
 from mitmproxy.test import tflow
 
@@ -265,6 +266,9 @@ def test_rows_and_unused_blobs_older_than_traffic_days_are_dropped(tmp_path, mon
     flow.response = http.Response.make(200, b"{}")
     traffic.response(flow)
     traffic.flush()
+    for _ in range(12):
+        traffic.enqueue(traffic.path, traffic.prune)
+        traffic.flush()
     now[0] += 31 * 86400
     flow = inference_flow()
     flow.request.content = json.dumps({"model": "m", "messages": [{"role": "user", "content": "new"}]}).encode()
@@ -272,9 +276,133 @@ def test_rows_and_unused_blobs_older_than_traffic_days_are_dropped(tmp_path, mon
     flow.response = http.Response.make(200, b"{}")
     traffic.response(flow)
     traffic.flush()
+    for _ in range(12):
+        traffic.enqueue(traffic.path, traffic.prune)
+        traffic.flush()
     db = sqlite3.connect(tmp_path / "traffic.sqlite3")
     assert db.execute("SELECT count(*) FROM flows").fetchone()[0] == 1
     assert db.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1  # only the new message
+
+
+PRUNE_COLUMNS = (("flows", "id", "started"), ("websocket_messages", "flow_id", "at"),
+                 ("blobs", "hash", "last_seen"))
+
+
+@pytest.fixture
+def pruning_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(module.threading.Thread, "start", lambda self: None)
+    config = {"path": str(tmp_path / "traffic.sqlite3"), "days": 1, "now": 1_000_000_000.0}
+    monkeypatch.setattr(module.time, "time", lambda: config["now"])
+    traffic = module.TrafficDB(lambda: config["path"], lambda: config["days"])
+    traffic.connection()
+    yield traffic, config
+    if traffic.db is not None:
+        traffic.db.close()
+
+
+def seed_prune_rows(db, timestamps, prefix="row"):
+    for table, key, timestamp in PRUNE_COLUMNS:
+        db.executemany(f"INSERT INTO {table} ({key}, {timestamp}) VALUES (?, ?)",
+                       [(f"{prefix}-{i}", at) for i, at in enumerate(timestamps)])
+
+
+def prune_counts(db):
+    return [db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table, _, _ in PRUNE_COLUMNS]
+
+
+def run_prune_ticks(traffic, count=30):
+    for _ in range(count):
+        traffic.prune()
+
+
+def test_prune_bounds_each_call_and_preserves_fresh_null_and_cutoff_rows(pruning_db):
+    traffic, config = pruning_db
+    batch = module.PRUNE_BATCH_ROWS
+    cutoff = config["now"] - 86400
+    timestamps = [cutoff + 1] * batch + [None] * batch
+    timestamps += [cutoff - 1, cutoff, cutoff + 1, None] * (batch + 1)
+    seed_prune_rows(traffic.db, timestamps)
+    expected = [(f"row-{i}", at) for i, at in enumerate(timestamps) if at is None or at >= cutoff]
+
+    for _ in range(40):
+        before = prune_counts(traffic.db)
+        traffic.prune()
+        deleted = [a - b for a, b in zip(before, prune_counts(traffic.db))]
+        assert sum(value > 0 for value in deleted) <= 1, "one table chunk per call"
+        assert 0 <= sum(deleted) <= batch
+    for table, key, timestamp in PRUNE_COLUMNS:
+        assert traffic.db.execute(f"SELECT {key}, {timestamp} FROM {table} ORDER BY rowid").fetchall() == expected
+
+
+def test_prune_finishes_empty_tables_and_waits_for_next_cadence(pruning_db):
+    traffic, config = pruning_db
+    run_prune_ticks(traffic)
+    seed_prune_rows(traffic.db, [config["now"] - 86401])
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [1, 1, 1]
+    config["now"] += module.PRUNE_EVERY_S - 1
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [1, 1, 1]
+    config["now"] += 1
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [0, 0, 0]
+
+
+def test_prune_holds_cutoff_fixed_and_cadence_starts_at_completion(pruning_db):
+    traffic, config = pruning_db
+    cutoff = config["now"] - 86400
+    seed_prune_rows(traffic.db, [cutoff + 1] * (module.PRUNE_BATCH_ROWS + 1))
+    traffic.prune()
+    config["now"] += module.PRUNE_EVERY_S + 10
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [module.PRUNE_BATCH_ROWS + 1] * 3
+    config["now"] += module.PRUNE_EVERY_S - 1
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [module.PRUNE_BATCH_ROWS + 1] * 3
+    config["now"] += 1
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [0, 0, 0]
+
+
+def test_prune_defers_rows_appended_beyond_sweep_upper_bound(pruning_db):
+    traffic, config = pruning_db
+    cutoff = config["now"] - 86400
+    seed_prune_rows(traffic.db, [cutoff - 1] * (module.PRUNE_BATCH_ROWS + 1))
+    traffic.prune()
+    seed_prune_rows(traffic.db, [cutoff - 1], prefix="appended")
+    run_prune_ticks(traffic)
+    for table, key, _ in PRUNE_COLUMNS:
+        assert traffic.db.execute(f"SELECT {key} FROM {table}").fetchall() == [("appended-0",)]
+    config["now"] += module.PRUNE_EVERY_S
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [0, 0, 0]
+
+
+@pytest.mark.parametrize("finish_first_sweep", [False, True])
+def test_prune_resets_sweep_and_cadence_when_database_path_changes(pruning_db, tmp_path, finish_first_sweep):
+    traffic, config = pruning_db
+    seed_prune_rows(traffic.db, [config["now"] - 86401] * (module.PRUNE_BATCH_ROWS + 1))
+    run_prune_ticks(traffic, 30 if finish_first_sweep else 1)
+    config["path"] = str(tmp_path / "other.sqlite3")
+    traffic.connection()
+    seed_prune_rows(traffic.db, [config["now"] - 86401])
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [0, 0, 0]
+
+
+def test_prune_disabled_retention_cancels_in_progress_sweep(pruning_db):
+    traffic, config = pruning_db
+    cutoff = config["now"] - 86400
+    seed_prune_rows(traffic.db, [cutoff + 1] * (module.PRUNE_BATCH_ROWS + 1))
+    traffic.prune()
+    config["days"] = 0
+    config["now"] += 2
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [module.PRUNE_BATCH_ROWS + 1] * 3
+    config["days"] = 1
+    run_prune_ticks(traffic)
+    assert prune_counts(traffic.db) == [0, 0, 0]
 
 
 def test_reply_token_counts_are_stored_on_the_row(tmp_path):
